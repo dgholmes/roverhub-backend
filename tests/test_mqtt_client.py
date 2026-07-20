@@ -2,6 +2,7 @@ import json
 
 from realtime.mqtt_client import BackendMqttClient
 from robots.registry import RobotRegistry
+from shared.schemas.commands import Command
 
 
 class _FakeMqttClient:
@@ -9,6 +10,7 @@ class _FakeMqttClient:
         self.on_message = None
         self.on_connect = None
         self.subscriptions = []
+        self.published = []
         self.connected_to = None
 
     def connect(self, host, port):
@@ -25,6 +27,9 @@ class _FakeMqttClient:
 
     def subscribe(self, topic, qos=0):
         self.subscriptions.append((topic, qos))
+
+    def publish(self, topic, payload, qos=0):
+        self.published.append((topic, payload, qos))
 
 
 def test_handle_message_registers_robot_from_admin_topic():
@@ -109,3 +114,41 @@ def test_on_connect_subscribes_to_state_and_heartbeat():
     client._on_connect(fake, None, None, 0)
     assert ("roverhub/+/+/state", 1) in fake.subscriptions
     assert ("roverhub/+/+/heartbeat", 0) in fake.subscriptions
+
+
+def test_publish_command_uses_registry_site_id():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    fake = _FakeMqttClient()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, lambda: fake)
+    command = Command(command_id="cmd-1", robot_id="robot-dev-01", type="ESTOP", label="E-Stop", initiated_by="operator-1")
+
+    client.publish_command("robot-dev-01", command)
+
+    topic, payload, qos = fake.published[-1]
+    assert topic == "roverhub/site-dev/robot-dev-01/commands"
+    assert qos == 1
+
+
+def test_handle_message_applies_ack_via_callback():
+    registry = RobotRegistry()
+    acks = []
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient, on_ack=acks.append)
+    payload = json.dumps({
+        "command_id": "cmd-1", "robot_id": "robot-dev-01", "type": "ESTOP",
+        "label": "E-Stop", "current_stage": "execution_completed",
+        "stages": [], "initiated_by": "operator-1",
+    }).encode()
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/ack", payload)
+
+    assert len(acks) == 1
+    assert acks[0].current_stage == "execution_completed"
+
+
+def test_on_connect_subscribes_to_ack():
+    registry = RobotRegistry()
+    fake = _FakeMqttClient()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, lambda: fake)
+    client._on_connect(fake, None, None, 0)
+    assert ("roverhub/+/+/ack", 1) in fake.subscriptions

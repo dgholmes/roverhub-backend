@@ -4,15 +4,20 @@ import os
 
 from fastapi import FastAPI
 
+from control.commands import CommandStore
+from control.router import build_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
 
 registry = RobotRegistry()
+command_store = CommandStore()
 mqtt_client = BackendMqttClient(
     os.environ.get("CLOUD_MQTT_URL", "mqtt://localhost:1883"), registry, real_mqtt_client_factory,
+    on_ack=command_store.apply_ack,
 )
 
 app = FastAPI(title="RoverHub Backend (dev)")
+app.include_router(build_router(command_store, mqtt_client))
 
 
 @app.on_event("startup")
@@ -39,6 +44,7 @@ def list_robots():
             "robot_type": r.robot_type,
             "name": r.name,
             "online": r.online,
+            "abstract_state": r.abstract_state,
             "last_seen": r.last_seen.isoformat() if r.last_seen else None,
         }
         for r in registry.list_all()
