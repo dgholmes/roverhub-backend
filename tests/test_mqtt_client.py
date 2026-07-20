@@ -68,3 +68,44 @@ def test_on_connect_subscribes_to_register_and_telemetry():
     client._on_connect(fake, None, None, 0)
     assert ("roverhub/admin/+/register", 1) in fake.subscriptions
     assert ("roverhub/+/+/telemetry", 0) in fake.subscriptions
+
+
+def test_handle_message_updates_state_on_state_topic():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    payload = json.dumps({
+        "robot_id": "robot-dev-01", "site_id": "site-dev",
+        "abstract_state": "STAND", "sdk_state": "balance_stand",
+        "updated_at": "2026-07-20T00:00:00Z",
+    }).encode()
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/state", payload)
+
+    record = registry.get("robot-dev-01")
+    assert record.abstract_state == "STAND"
+
+
+def test_handle_message_marks_seen_on_heartbeat_topic():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    registry.mark_offline("robot-dev-01")
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    payload = json.dumps({
+        "bridge_id": "bridge-dev-01", "robot_id": "robot-dev-01", "site_id": "site-dev",
+        "timestamp": "2026-07-20T00:00:00Z", "sdk_connected": True, "dds_connected": False,
+        "cloud_connected": True, "battery_pct": 80.0, "mission_active": False,
+    }).encode()
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/heartbeat", payload)
+
+    assert registry.get("robot-dev-01").online is True
+
+
+def test_on_connect_subscribes_to_state_and_heartbeat():
+    registry = RobotRegistry()
+    fake = _FakeMqttClient()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, lambda: fake)
+    client._on_connect(fake, None, None, 0)
+    assert ("roverhub/+/+/state", 1) in fake.subscriptions
+    assert ("roverhub/+/+/heartbeat", 0) in fake.subscriptions

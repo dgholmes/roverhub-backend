@@ -16,8 +16,9 @@ def real_mqtt_client_factory():
 
 
 class BackendMqttClient:
-    """Subscribes to bridge registration and telemetry topics, updating the
-    in-memory RobotRegistry as messages arrive. No persistence this round."""
+    """Subscribes to bridge registration, telemetry, state, and heartbeat
+    topics, updating the in-memory RobotRegistry as messages arrive. No
+    persistence this round."""
 
     def __init__(self, broker_url: str, registry, mqtt_client_factory: MqttClientFactory):
         self._broker_url = broker_url
@@ -38,6 +39,8 @@ class BackendMqttClient:
     def _on_connect(self, client, userdata, flags, rc) -> None:
         client.subscribe("roverhub/admin/+/register", qos=1)
         client.subscribe("roverhub/+/+/telemetry", qos=0)
+        client.subscribe("roverhub/+/+/state", qos=1)
+        client.subscribe("roverhub/+/+/heartbeat", qos=0)
 
     def _on_message(self, client, userdata, message) -> None:
         self.handle_message(message.topic, message.payload)
@@ -56,7 +59,19 @@ class BackendMqttClient:
             self._registry.upsert_from_registration(
                 robot_id=data["robot_id"], site_id=data["site_id"], robot_type=data["robot_type"],
             )
-        elif len(parts) == 4 and parts[0] == "roverhub" and parts[3] == "telemetry":
+            return
+
+        if len(parts) != 4 or parts[0] != "roverhub":
+            return
+        message_kind = parts[3]
+
+        if message_kind == "telemetry":
+            self._registry.mark_seen(data["robot_id"])
+        elif message_kind == "state":
+            self._registry.update_state(
+                data["robot_id"], abstract_state=data["abstract_state"], sdk_state=data["sdk_state"],
+            )
+        elif message_kind == "heartbeat":
             self._registry.mark_seen(data["robot_id"])
 
     @staticmethod

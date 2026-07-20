@@ -13,6 +13,8 @@ class RobotRecord:
     name: str
     last_seen: Optional[datetime] = None
     online: bool = False
+    abstract_state: Optional[str] = None
+    sdk_state: Optional[str] = None
 
 
 class RobotRegistry:
@@ -40,6 +42,12 @@ class RobotRegistry:
         record = self._robots.get(robot_id)
         if record is not None:
             record.online = False
+
+    def update_state(self, robot_id: str, abstract_state: str, sdk_state: str) -> None:
+        record = self._robots.get(robot_id)
+        if record is not None:
+            record.abstract_state = abstract_state
+            record.sdk_state = sdk_state
 
     def get(self, robot_id: str) -> Optional[RobotRecord]:
         return self._robots.get(robot_id)
