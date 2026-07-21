@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+.venv/
+venv/
+.pytest_cache/
+
+# Env
+.env
+.env.local
+
+# OS/editor
+.DS_Store
+.superpowers/
