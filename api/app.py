@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import os
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from control.commands import CommandStore
 from control.router import build_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
+
+load_dotenv()  # loads .env in the working directory, if present; real env vars still win
 
 registry = RobotRegistry()
 command_store = CommandStore()
