@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from control.commands import CommandStore
-from control.media import build_media_router
+from control.media import MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router
 from control.router import build_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
@@ -23,6 +23,10 @@ mqtt_client = BackendMqttClient(
 app = FastAPI(title="RoverHub Backend (dev)")
 app.include_router(build_router(command_store, mqtt_client))
 app.include_router(build_media_router(clips_dir=os.environ.get("AUDIO_CLIPS_DIR", "/tmp/roverhub-audio-clips")))
+# Rejects oversized audio-clip uploads by Content-Length before Starlette's
+# multipart parser spools the body -- see ContentLengthLimitMiddleware's
+# docstring in control/media.py for why this can't live in the handler alone.
+app.add_middleware(ContentLengthLimitMiddleware, max_bytes=MAX_AUDIO_CLIP_BYTES)
 
 
 @app.on_event("startup")
