@@ -4,6 +4,7 @@ import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from control.commands import CommandStore
 from control.media import MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router
@@ -27,6 +28,23 @@ app.include_router(build_media_router(clips_dir=os.environ.get("AUDIO_CLIPS_DIR"
 # multipart parser spools the body -- see ContentLengthLimitMiddleware's
 # docstring in control/media.py for why this can't live in the handler alone.
 app.add_middleware(ContentLengthLimitMiddleware, max_bytes=MAX_AUDIO_CLIP_BYTES)
+# Without this, the browser's CORS preflight (an OPTIONS request, sent
+# automatically because the frontend's fetch() calls carry a
+# Content-Type: application/json body) gets a bare 405 from FastAPI's
+# routing -- since no route ever declares an OPTIONS handler -- and the
+# browser blocks the real POST/request from ever being sent. This isn't
+# reproducible via FastAPI's TestClient (it calls the ASGI app directly and
+# never enforces real browser CORS), which is why it went unnoticed in
+# tests. No auth/cookies exist on this backend this round, so
+# allow_credentials stays False and an explicit dev-origin allowlist is
+# sufficient rather than needing wildcard-with-credentials gymnastics.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get("FRONTEND_ORIGINS", "http://localhost:5173").split(","),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
