@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from control.commands import CommandStore
+from control.media import build_media_router
 from control.router import build_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
@@ -21,6 +22,7 @@ mqtt_client = BackendMqttClient(
 
 app = FastAPI(title="RoverHub Backend (dev)")
 app.include_router(build_router(command_store, mqtt_client))
+app.include_router(build_media_router(clips_dir=os.environ.get("AUDIO_CLIPS_DIR", "/tmp/roverhub-audio-clips")))
 
 
 @app.on_event("startup")
