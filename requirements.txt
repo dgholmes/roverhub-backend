@@ -18,15 +18,18 @@ python-multipart>=0.0.9
 # repo isn't checked out as a sibling -- with an ImportError at startup, not a
 # clear dependency error.
 #
-# Installed editable from the sibling checkout, matching how roverhub-edge's
-# robot_bridge does it (`pip install -e ../../shared`).
+# shared/ is its own repo as of 2026-08-11: github.com/dgholmes/roverhub-shared
+# It's cloned as a sibling of this one (see the root repo's .gitignore), so the
+# relative editable install below is unchanged by that extraction.
 #
-# A relative path rather than a URL because editable-from-sibling is what makes
-# local schema edits take effect immediately in both services -- the whole point
-# of the current layout. The root repo does now have a remote
-# (github.com/dgholmes/roverhub), so `pip install -e "git+https://...#subdirectory=shared"`
-# is possible if this service is ever containerised and can't have the sibling
-# checkout; it would cost the live-edit loop.
+# A relative path rather than the git URL because editable-from-sibling is what
+# makes a local schema edit take effect immediately in both services -- valuable
+# while the schema surface is still being designed. For a container or any host
+# without the sibling checkout, use the URL form instead and pin it:
+#
+#     pip install "roverhub-shared @ git+https://github.com/dgholmes/roverhub-shared.git@<tag-or-sha>"
+#
+# Note that repo is private, so a URL install needs a PAT or SSH deploy key.
 #
 # NOTE: this path is resolved against pip's working directory, not this file's
 # location, so `pip install -r requirements.txt` must be run from
