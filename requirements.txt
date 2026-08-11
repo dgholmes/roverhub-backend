@@ -7,3 +7,28 @@ paho-mqtt>=1.6,<2
 pydantic>=2
 python-dotenv>=1.0
 python-multipart>=0.0.9
+
+# The shared wire-contract schemas (shared/schemas/), imported throughout this
+# service -- e.g. `from shared.schemas.commands import Command` in
+# realtime/mqtt_client.py and control/router.py.
+#
+# This was previously undeclared and worked only because `shared/` happens to be
+# resolvable on sys.path when running from the repo's parent directory. That
+# breaks the moment this service is containerised or deployed anywhere the root
+# repo isn't checked out as a sibling -- with an ImportError at startup, not a
+# clear dependency error.
+#
+# Installed editable from the sibling checkout, matching how roverhub-edge's
+# robot_bridge does it (`pip install -e ../../shared`).
+#
+# A relative path rather than a URL because editable-from-sibling is what makes
+# local schema edits take effect immediately in both services -- the whole point
+# of the current layout. The root repo does now have a remote
+# (github.com/dgholmes/roverhub), so `pip install -e "git+https://...#subdirectory=shared"`
+# is possible if this service is ever containerised and can't have the sibling
+# checkout; it would cost the live-edit loop.
+#
+# NOTE: this path is resolved against pip's working directory, not this file's
+# location, so `pip install -r requirements.txt` must be run from
+# roverhub-backend/. That's already the convention for every component here.
+-e ../shared

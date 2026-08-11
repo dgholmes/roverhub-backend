@@ -4,6 +4,8 @@ import json
 import logging
 from typing import Callable, Optional, Tuple
 
+from shared.schemas.version import SCHEMA_VERSION
+
 logger = logging.getLogger("backend.realtime.mqtt_client")
 
 MqttClientFactory = Callable[[], object]
@@ -69,6 +71,7 @@ class BackendMqttClient:
 
         parts = topic.split("/")
         if topic.startswith("roverhub/admin/") and topic.endswith("/register"):
+            self._check_schema_version(data)
             self._registry.upsert_from_registration(
                 robot_id=data["robot_id"], site_id=data["site_id"], robot_type=data["robot_type"],
             )
@@ -88,6 +91,45 @@ class BackendMqttClient:
             from shared.schemas.commands import Command
 
             self._on_ack(Command(**data))
+
+    def _check_schema_version(self, data: dict) -> None:
+        """Compare the bridge's wire-contract version against ours.
+
+        An edge device can silently run a different schema revision than the
+        cloud. That does not fail loudly on its own -- it surfaces as missing or
+        None fields and validation errors that look like data bugs, with no
+        indication that deployment is the actual cause. This turns it into an
+        explicit log line at the one moment we can detect it: the handshake.
+
+        Devices provisioned before the root repo had a remote (the Jetson) carry
+        an scp'd copy of shared/ that no `git pull` updates, so drift there is
+        especially easy. Newer devices clone it, which narrows the window but
+        doesn't close it -- someone can still forget to pull, or edit on-device.
+
+        Deliberately does NOT reject the registration. A version skew usually
+        still leaves most fields working, and refusing to register would take a
+        robot fully offline over what may be a benign additive change. Warn
+        loudly, keep running, let a human decide.
+        """
+        reported = data.get("schema_version")
+        if reported == SCHEMA_VERSION:
+            return
+        robot_id = data.get("robot_id", "<unknown>")
+        if reported is None:
+            logger.warning(
+                "robot %s registered without a schema_version. Its edge bridge predates "
+                "the version handshake (cloud is on %s). Redeploy shared/ to that device "
+                "-- see roverhub-edge/scripts/check_edge_sync.sh",
+                robot_id, SCHEMA_VERSION,
+            )
+        else:
+            logger.error(
+                "SCHEMA VERSION MISMATCH for robot %s: edge reports %s, cloud has %s. "
+                "The two ends disagree on the wire contract; expect missing or malformed "
+                "telemetry/command fields. Redeploy shared/ to the edge device and restart "
+                "the bridge -- see roverhub-edge/scripts/check_edge_sync.sh",
+                robot_id, reported, SCHEMA_VERSION,
+            )
 
     @staticmethod
     def _parse_broker_url(url: str) -> Tuple[str, int]:

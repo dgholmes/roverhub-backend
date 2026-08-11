@@ -14,3 +14,4 @@ venv/
 # OS/editor
 .DS_Store
 .superpowers/
+.idea/
