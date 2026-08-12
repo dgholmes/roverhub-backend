@@ -1,8 +1,15 @@
 import json
 
-from realtime.mqtt_client import BackendMqttClient
+import pytest
+
+from realtime.mqtt_client import BackendMqttClient, CommandPublishError
 from robots.registry import RobotRegistry
 from shared.schemas.commands import Command
+
+
+class _FakeMessageInfo:
+    def __init__(self, rc):
+        self.rc = rc
 
 
 class _FakeMqttClient:
@@ -12,6 +19,11 @@ class _FakeMqttClient:
         self.subscriptions = []
         self.published = []
         self.connected_to = None
+        self.on_disconnect = None
+        self.reconnect_delay = None
+        # paho returns MQTT_ERR_SUCCESS (0) from publish(); override to simulate
+        # a publish that the client could not hand to the broker.
+        self.publish_rc = 0
 
     def connect(self, host, port):
         self.connected_to = (host, port)
@@ -30,6 +42,10 @@ class _FakeMqttClient:
 
     def publish(self, topic, payload, qos=0):
         self.published.append((topic, payload, qos))
+        return _FakeMessageInfo(self.publish_rc)
+
+    def reconnect_delay_set(self, min_delay=1, max_delay=120):
+        self.reconnect_delay = (min_delay, max_delay)
 
 
 def test_handle_message_registers_robot_from_admin_topic():
@@ -152,3 +168,126 @@ def test_on_connect_subscribes_to_ack():
     client = BackendMqttClient("mqtt://localhost:1883", registry, lambda: fake)
     client._on_connect(fake, None, None, 0)
     assert ("roverhub/+/+/ack", 1) in fake.subscriptions
+
+
+def _message(topic, payload):
+    """Minimal stand-in for paho's MQTTMessage, which is what paho hands the
+    on_message callback."""
+
+    class _M:
+        pass
+
+    m = _M()
+    m.topic = topic
+    m.payload = payload
+    return m
+
+
+# --- The paho callback boundary must never raise -----------------------------
+#
+# paho 1.6 re-raises whatever escapes on_message, and its network thread dies
+# with the exception -- taking message ingestion AND command publishing down
+# permanently, with no reconnect and no error anywhere. Observed in production
+# 2026-08-11: the backend went silent at 23:55:42, mosquitto dropped it 90s
+# later for "exceeded timeout", and every command afterwards sat at "Sending..."
+# forever while the REST API kept happily returning 200.
+
+
+def test_on_message_does_not_propagate_exceptions_from_bad_ack():
+    registry = RobotRegistry()
+    client = BackendMqttClient(
+        "mqtt://localhost:1883", registry, _FakeMqttClient, on_ack=lambda c: None,
+    )
+    # Fails Command validation -- the real trigger shape.
+    payload = json.dumps({"not": "a command"}).encode()
+
+    client._on_message(None, None, _message("roverhub/site-dev/robot-dev-01/ack", payload))
+
+
+def test_on_message_does_not_propagate_missing_field_errors():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+
+    for topic in (
+        "roverhub/site-dev/robot-dev-01/telemetry",
+        "roverhub/site-dev/robot-dev-01/heartbeat",
+        "roverhub/site-dev/robot-dev-01/state",
+        "roverhub/admin/bridge-dev-01/register",
+    ):
+        client._on_message(None, None, _message(topic, json.dumps({}).encode()))
+
+
+def test_one_poisonous_message_does_not_stop_later_good_ones():
+    """The property that actually matters: ingestion survives a bad payload."""
+    registry = RobotRegistry()
+    registry.upsert_from_registration(
+        robot_id="robot-dev-01", site_id="site-dev", robot_type="wheel",
+    )
+    client = BackendMqttClient(
+        "mqtt://localhost:1883", registry, _FakeMqttClient, on_ack=lambda c: None,
+    )
+
+    client._on_message(None, None, _message(
+        "roverhub/site-dev/robot-dev-01/ack", json.dumps({"bad": True}).encode()))
+    client._on_message(None, None, _message(
+        "roverhub/site-dev/robot-dev-01/state",
+        json.dumps({"robot_id": "robot-dev-01", "abstract_state": "STAND",
+                    "sdk_state": "balance_stand"}).encode()))
+
+    assert registry.get("robot-dev-01").abstract_state == "STAND"
+
+
+# --- A command that cannot be published must not look accepted ---------------
+
+
+def test_publish_command_raises_when_the_client_cannot_publish():
+    registry = RobotRegistry()
+    registry.upsert_from_registration(
+        robot_id="robot-dev-01", site_id="site-dev", robot_type="wheel",
+    )
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    client._client.publish_rc = 4  # MQTT_ERR_NO_CONN
+
+    command = Command(
+        command_id="c1", robot_id="robot-dev-01", type="ESTOP", label="E-Stop",
+        initiated_by="operator-dev",
+    )
+
+    with pytest.raises(CommandPublishError):
+        client.publish_command("robot-dev-01", command)
+
+
+def test_publish_command_succeeds_on_rc_zero():
+    registry = RobotRegistry()
+    registry.upsert_from_registration(
+        robot_id="robot-dev-01", site_id="site-dev", robot_type="wheel",
+    )
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    command = Command(
+        command_id="c1", robot_id="robot-dev-01", type="ESTOP", label="E-Stop",
+        initiated_by="operator-dev",
+    )
+
+    client.publish_command("robot-dev-01", command)
+
+    assert len(client._client.published) == 1
+
+
+# --- Recovery ----------------------------------------------------------------
+
+
+def test_connect_registers_disconnect_handler_and_reconnect_backoff():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+
+    client.connect()
+
+    assert client._client.on_disconnect is not None
+    assert client._client.reconnect_delay is not None
+
+
+def test_on_disconnect_does_not_raise_on_unexpected_rc():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+
+    client._on_disconnect(None, None, 7)

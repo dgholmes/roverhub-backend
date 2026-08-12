@@ -10,6 +10,21 @@ logger = logging.getLogger("backend.realtime.mqtt_client")
 
 MqttClientFactory = Callable[[], object]
 
+# paho's MQTT_ERR_SUCCESS. Hardcoded rather than imported because paho is
+# deliberately imported lazily (see real_mqtt_client_factory) so the tests can
+# run against a fake without the dependency.
+MQTT_ERR_SUCCESS = 0
+
+
+class CommandPublishError(RuntimeError):
+    """The command could not be handed to the broker.
+
+    Callers must surface this rather than swallow it: a command that never
+    reached the broker will never be acknowledged, so reporting success leaves
+    the operator watching "Sending..." forever with no indication that nothing
+    was ever sent.
+    """
+
 
 def real_mqtt_client_factory():
     import paho.mqtt.client as mqtt
@@ -36,9 +51,14 @@ class BackendMqttClient:
         self._client = mqtt_client_factory()
         self._client.on_message = self._on_message
         self._client.on_connect = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
 
     def connect(self) -> None:
         host, port = self._parse_broker_url(self._broker_url)
+        # Bound paho's own reconnect backoff. Its network thread reconnects on
+        # its own as long as it is alive -- keeping it alive is what _on_message
+        # below is about.
+        self._client.reconnect_delay_set(min_delay=1, max_delay=30)
         self._client.connect(host, port)
         self._client.loop_start()
 
@@ -50,7 +70,21 @@ class BackendMqttClient:
         record = self._registry.get(robot_id)
         site_id = record.site_id if record is not None else "unknown"
         topic = f"roverhub/{site_id}/{robot_id}/commands"
-        self._client.publish(topic, command.model_dump_json(), qos=1)
+        info = self._client.publish(topic, command.model_dump_json(), qos=1)
+        # publish() never raises -- it reports failure through the returned
+        # MQTTMessageInfo. Discarding it (as this did) means a command that was
+        # never sent is indistinguishable from one that was, which is how a dead
+        # MQTT client turned into commands stuck at "Sending..." indefinitely.
+        rc = getattr(info, "rc", MQTT_ERR_SUCCESS)
+        if rc != MQTT_ERR_SUCCESS:
+            logger.error(
+                "could not publish command %s (%s) for robot %s to %s: paho rc=%s. "
+                "The command was NOT sent to the edge bridge.",
+                command.command_id, command.type, robot_id, topic, rc,
+            )
+            raise CommandPublishError(
+                f"could not publish command to the broker (rc={rc}); the robot was not sent this command"
+            )
 
     def _on_connect(self, client, userdata, flags, rc) -> None:
         client.subscribe("roverhub/admin/+/register", qos=1)
@@ -59,8 +93,44 @@ class BackendMqttClient:
         client.subscribe("roverhub/+/+/heartbeat", qos=0)
         client.subscribe("roverhub/+/+/ack", qos=1)
 
+    def _on_disconnect(self, client, userdata, rc) -> None:
+        if rc == MQTT_ERR_SUCCESS:
+            logger.info("MQTT client disconnected cleanly")
+            return
+        logger.error(
+            "unexpected MQTT disconnect (rc=%s). Commands cannot reach any bridge until "
+            "the connection is restored; paho will keep retrying.", rc,
+        )
+
     def _on_message(self, client, userdata, message) -> None:
-        self.handle_message(message.topic, message.payload)
+        """paho's callback boundary -- this must never raise.
+
+        paho 1.6 re-raises whatever escapes this callback, and the exception
+        propagates out of its network thread, which then dies. That takes down
+        message ingestion *and* publishing permanently: nothing reconnects,
+        nothing logs, and the REST API keeps returning 200 for commands that are
+        silently dropped, because publish() on a dead client still "succeeds"
+        from the caller's point of view.
+
+        This is not hypothetical. On 2026-08-11 the backend went silent at
+        23:55:42; mosquitto dropped it 90s later (1.5x the 60s keepalive) for
+        "exceeded timeout", the robot registry froze at that exact second, and
+        every command afterwards sat at "Sending..." forever while telemetry
+        kept flowing in the UI -- because the browser subscribes to the broker
+        directly and never noticed the backend was gone. Only a restart cleared
+        it.
+
+        One malformed message must therefore cost us that message, not the whole
+        MQTT subsystem. handle_message stays strict and directly testable; the
+        containment lives here, at the boundary paho actually calls.
+        """
+        try:
+            self.handle_message(message.topic, message.payload)
+        except Exception:
+            logger.exception(
+                "dropping MQTT message on %s: handling it raised. The client stays "
+                "connected; this message is lost.", message.topic,
+            )
 
     def handle_message(self, topic: str, payload: bytes) -> None:
         try:
