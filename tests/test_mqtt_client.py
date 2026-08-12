@@ -291,3 +291,62 @@ def test_on_disconnect_does_not_raise_on_unexpected_rc():
     client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
 
     client._on_disconnect(None, None, 7)
+
+
+# --- schema skew advice ----------------------------------------------------
+#
+# The remedy depends on which side is behind, and the original message always said
+# "redeploy shared/ to the edge device" -- exactly backwards right after a schema
+# bump reaches the devices while this backend still runs the version it imported
+# at startup. That wording sent someone to fix the wrong machine.
+
+
+def test_skew_advice_when_the_cloud_is_behind():
+    advice = BackendMqttClient._skew_remedy("0.0.3", "0.0.2")
+
+    assert "CLOUD is the older side" in advice
+    assert "restart" in advice.lower()
+    # Must not send the operator to the device, which is already current.
+    assert "update_edge" not in advice
+
+
+def test_skew_advice_when_the_edge_is_behind():
+    advice = BackendMqttClient._skew_remedy("0.0.1", "0.0.2")
+
+    assert "EDGE is the older side" in advice
+    assert "update_edge.sh" in advice
+
+
+def test_skew_advice_compares_numerically_not_lexically():
+    # "0.0.10" < "0.0.9" as strings, which would invert the advice.
+    assert "EDGE is the older side" in BackendMqttClient._skew_remedy("0.0.9", "0.0.10")
+    assert "CLOUD is the older side" in BackendMqttClient._skew_remedy("0.0.10", "0.0.9")
+
+
+def test_skew_advice_falls_back_when_a_version_is_unparseable():
+    advice = BackendMqttClient._skew_remedy("weird", "0.0.2")
+
+    assert "disagree on the wire contract" in advice
+    assert "check_edge_sync.sh" in advice
+
+
+def test_unparseable_version_does_not_raise():
+    # This runs inside the MQTT callback; raising there killed the whole client.
+    assert BackendMqttClient._parse_version(None) is None
+    assert BackendMqttClient._parse_version("1.2.x") is None
+    assert BackendMqttClient._parse_version("0.0.3") == (0, 0, 3)
+
+
+def test_a_mismatched_registration_still_registers_the_robot():
+    """Version skew must warn, not reject: refusing the registration would take a
+    robot fully offline over what is usually an additive change."""
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    payload = json.dumps({
+        "bridge_id": "bridge-pi-01", "site_id": "site-dev",
+        "robot_id": "robot-dev-02", "robot_type": "quad", "schema_version": "9.9.9",
+    }).encode()
+
+    client.handle_message("roverhub/admin/bridge-pi-01/register", payload)
+
+    assert registry.get("robot-dev-02") is not None

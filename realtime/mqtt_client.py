@@ -194,13 +194,54 @@ class BackendMqttClient:
                 robot_id, SCHEMA_VERSION,
             )
         else:
+            # Which side is behind decides the remedy, and getting this wrong sends
+            # someone to fix the wrong machine. The original message always said
+            # "redeploy shared/ to the edge device", which is exactly backwards
+            # when the edge is the newer one -- as it is right after a schema bump
+            # is deployed to devices while the cloud process is still running the
+            # version it imported at startup. Python caches modules for the life of
+            # a process, so an editable install of shared/ can be correct on disk
+            # and stale in memory at the same time.
             logger.error(
-                "SCHEMA VERSION MISMATCH for robot %s: edge reports %s, cloud has %s. "
-                "The two ends disagree on the wire contract; expect missing or malformed "
-                "telemetry/command fields. Redeploy shared/ to the edge device and restart "
-                "the bridge -- see roverhub-edge/scripts/check_edge_sync.sh",
+                "SCHEMA VERSION MISMATCH for robot %s: edge reports %s, cloud has %s. %s",
                 robot_id, reported, SCHEMA_VERSION,
+                self._skew_remedy(reported, SCHEMA_VERSION),
             )
+
+    @staticmethod
+    def _parse_version(value: str):
+        """Dotted version as a tuple of ints, or None if it isn't one. Returning
+        None rather than raising keeps an unparseable version a logging problem
+        instead of killing the MQTT callback."""
+        try:
+            return tuple(int(part) for part in str(value).split("."))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _skew_remedy(cls, edge: str, cloud: str) -> str:
+        edge_v, cloud_v = cls._parse_version(edge), cls._parse_version(cloud)
+
+        if edge_v is not None and cloud_v is not None and edge_v > cloud_v:
+            return (
+                "The CLOUD is the older side, so redeploying the edge device will not help. "
+                "Usually this backend is simply running a version of shared/ it imported at "
+                "startup: restart it. If it persists after a restart, reinstall shared/ here "
+                "(pip install -e ../shared). Until then, commands added in the newer schema "
+                "are rejected as unwired, and newer fields the edge sends are ignored."
+            )
+        if edge_v is not None and cloud_v is not None and edge_v < cloud_v:
+            return (
+                "The EDGE is the older side. Redeploy shared/ to the device and restart the "
+                "bridge -- roverhub-edge/scripts/update_edge.sh does both, and "
+                "check_edge_sync.sh verifies it. Until then the edge will not understand "
+                "commands or fields added in the newer schema."
+            )
+        return (
+            "The two ends disagree on the wire contract; expect missing or malformed "
+            "telemetry/command fields. Compare shared/ on both sides -- "
+            "roverhub-edge/scripts/check_edge_sync.sh."
+        )
 
     @staticmethod
     def _parse_broker_url(url: str) -> Tuple[str, int]:
