@@ -5,7 +5,10 @@ import re
 import uuid
 
 from fastapi import APIRouter, HTTPException, UploadFile
-from starlette.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+from control.tts import MAX_TTS_CHARS, TtsError, TtsUnavailable, available_engine, synthesize_wav
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 # MVP cap for a short voice clip; generous but bounds memory/disk use from an
@@ -116,6 +119,12 @@ class ContentLengthLimitMiddleware:
         return None
 
 
+class TtsRequest(BaseModel):
+    # Bounded at the model so an oversized body is rejected before synthesis is
+    # attempted; tts.py enforces the same limit for non-HTTP callers.
+    text: str = Field(min_length=1, max_length=MAX_TTS_CHARS)
+
+
 def build_media_router(clips_dir: str) -> APIRouter:
     router = APIRouter()
     os.makedirs(clips_dir, exist_ok=True)
@@ -164,6 +173,33 @@ def build_media_router(clips_dir: str) -> APIRouter:
         # `file_path` stays in the response for the mock provider's shape and for
         # debugging, but nothing downstream should route on it.
         return {"clip_id": clip_id, "file_path": file_path, "size_bytes": len(contents)}
+
+    @router.get("/tts/capability")
+    def tts_capability():
+        """Lets the UI hide or explain the Say tab instead of offering a button
+        that can only fail on a host with no engine."""
+        engine = available_engine()
+        return {"available": engine is not None, "engine": engine, "max_chars": MAX_TTS_CHARS}
+
+    @router.post("/tts")
+    async def synthesize_speech(request: TtsRequest):
+        """Text in, WAV out.
+
+        Deliberately does not store anything or create a clip. The browser decodes
+        this WAV to the robot's PCM through exactly the same path an uploaded file
+        takes and then posts it to the audio-clips endpoint, so a spoken
+        announcement and an uploaded file are the same thing downstream -- one clip
+        store, one edge cache, one volume control, one streaming path.
+        """
+        try:
+            wav = synthesize_wav(request.text)
+        except TtsUnavailable as exc:
+            # 501: the request is fine, this deployment cannot serve it.
+            raise HTTPException(status_code=501, detail=str(exc))
+        except TtsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        return Response(content=wav, media_type="audio/wav")
 
     @router.get("/audio-clips/{clip_id}")
     def get_audio_clip(clip_id: str):
