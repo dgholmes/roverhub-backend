@@ -5,7 +5,7 @@ import re
 import uuid
 
 from fastapi import APIRouter, HTTPException, UploadFile
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 # MVP cap for a short voice clip; generous but bounds memory/disk use from an
@@ -23,6 +23,13 @@ ROBOT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # disk under the caller's control. Formats match the edge voice pipeline
 # (see e7_voice_pub.py: .wav / .flac), plus common audio/mpeg and audio/ogg.
 CONTENT_TYPE_EXTENSIONS = {
+    # Raw PCM at the robot's required 24kHz/16-bit/mono, decoded in the browser.
+    # This is the format SPEAK actually uses: the robot's DDS voice topic takes
+    # PCM in streaming mode, and neither edge device has ffmpeg to decode
+    # anything else (verified 2026-08-12) -- so decoding happens where a decoder
+    # already exists, in the browser. See roverhub-frontend/src/lib/audioPcm.ts.
+    "audio/pcm": ".pcm",
+    "audio/l16": ".pcm",
     "audio/wav": ".wav",
     "audio/x-wav": ".wav",
     "audio/wave": ".wav",
@@ -38,6 +45,11 @@ CONTENT_TYPE_EXTENSIONS = {
 # constant so ContentLengthLimitMiddleware can target exactly this endpoint
 # without hardcoding the route string in two places.
 AUDIO_CLIP_PATH_RE = re.compile(r"^/robots/[^/]+/audio-clips$")
+
+# Exactly the shape upload_audio_clip generates: "{robot_id}-{uuid4}{ext}".
+# Anchored and character-restricted so no separator or ".." can reach
+# os.path.join when a clip is fetched back.
+CLIP_ID_RE = re.compile(r"^[A-Za-z0-9_-]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[A-Za-z0-9]{1,5}$")
 
 
 class ContentLengthLimitMiddleware:
@@ -137,10 +149,48 @@ def build_media_router(clips_dir: str) -> APIRouter:
                 detail=f"audio clip exceeds maximum size of {MAX_AUDIO_CLIP_BYTES} bytes",
             )
 
-        file_path = os.path.join(clips_dir, f"{robot_id}-{uuid.uuid4()}{extension}")
+        clip_id = f"{robot_id}-{uuid.uuid4()}{extension}"
+        file_path = os.path.join(clips_dir, clip_id)
         with open(file_path, "wb") as f:
             f.write(contents)
 
-        return {"file_path": file_path}
+        # `clip_id` is what SPEAK carries, not `file_path`. A filesystem path is
+        # meaningless to the two machines that come after this one: the edge
+        # bridge has no access to the cloud's disk, and the robot resolves
+        # `VoiceCmd(type="file")` paths against its OWN disk. Sending a path was
+        # why uploaded clips silently never played -- the bytes never left this
+        # host. The bridge now GETs the clip below and streams the PCM instead.
+        #
+        # `file_path` stays in the response for the mock provider's shape and for
+        # debugging, but nothing downstream should route on it.
+        return {"clip_id": clip_id, "file_path": file_path, "size_bytes": len(contents)}
+
+    @router.get("/audio-clips/{clip_id}")
+    def get_audio_clip(clip_id: str):
+        """Serves a stored clip so the edge bridge can fetch its bytes.
+
+        Deliberately not scoped under /robots/{robot_id}: the bridge knows the
+        clip_id from the command and nothing is gained by making it re-derive a
+        robot id, while an extra path segment is another place to get validation
+        wrong.
+
+        clip_id is validated against exactly the shape upload produces. It is
+        concatenated into a filesystem path, so anything permitting '/', '\' or
+        '..' would be arbitrary file read on a backend that has no auth at all.
+        """
+        if not CLIP_ID_RE.match(clip_id):
+            raise HTTPException(status_code=400, detail="invalid clip_id")
+
+        file_path = os.path.join(clips_dir, clip_id)
+        # realpath both sides: even with the regex, resolve and confirm the result
+        # is inside clips_dir rather than trusting the pattern alone.
+        clips_root = os.path.realpath(clips_dir)
+        resolved = os.path.realpath(file_path)
+        if resolved != clips_root and not resolved.startswith(clips_root + os.sep):
+            raise HTTPException(status_code=400, detail="invalid clip_id")
+        if not os.path.isfile(resolved):
+            raise HTTPException(status_code=404, detail="clip not found")
+
+        return FileResponse(resolved, media_type="application/octet-stream")
 
     return router
