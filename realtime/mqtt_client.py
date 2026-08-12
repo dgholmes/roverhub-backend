@@ -101,7 +101,8 @@ class BackendMqttClient:
         indication that deployment is the actual cause. This turns it into an
         explicit log line at the one moment we can detect it: the handshake.
 
-        Devices provisioned before the root repo had a remote (the Jetson) carry
+        Devices provisioned before shared/ was extracted into its own repo (the
+        Jetson, 2026-08-11) carry
         an scp'd copy of shared/ that no `git pull` updates, so drift there is
         especially easy. Newer devices clone it, which narrows the window but
         doesn't close it -- someone can still forget to pull, or edit on-device.
