@@ -38,9 +38,24 @@ app.add_middleware(ContentLengthLimitMiddleware, max_bytes=MAX_AUDIO_CLIP_BYTES)
 # tests. No auth/cookies exist on this backend this round, so
 # allow_credentials stays False and an explicit dev-origin allowlist is
 # sufficient rather than needing wildcard-with-credentials gymnastics.
+#
+# FRONTEND_ORIGIN_REGEX additionally allows the console to be opened from
+# another device on the LAN (`vite --host`) for demos. An exact allowlist cannot
+# cover that: the dev machine's address is handed out by DHCP, so the origin
+# changes without warning, and the failure mode is a silent one -- preflight
+# 400, POST never sent, commands that appear to do nothing. The default below is
+# restricted to RFC1918 private ranges, so it admits the office LAN but never a
+# public origin. Tighten it to a fixed origin once auth exists.
+_PRIVATE_LAN_ORIGIN_REGEX = (
+    r"^http://(10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+    r"|[a-zA-Z0-9-]+\.local):\d+$"
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("FRONTEND_ORIGINS", "http://localhost:5173").split(","),
+    allow_origin_regex=os.environ.get("FRONTEND_ORIGIN_REGEX", _PRIVATE_LAN_ORIGIN_REGEX),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
