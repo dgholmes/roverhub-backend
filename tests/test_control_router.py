@@ -39,15 +39,38 @@ def test_issue_command_accepts_wired_type_and_publishes():
 
 
 def test_issue_command_rejects_unwired_type():
+    # PAUSE, not DRIVE: DRIVE became wired on 2026-08-13 for continuous manual
+    # control. PAUSE stays unwired because it depends on mission_executor, which
+    # is still an empty placeholder.
     app, _, _ = _make_app()
     client = TestClient(app)
 
     response = client.post(
         "/robots/robot-dev-01/commands",
-        json={"type": "DRIVE", "label": "Drive", "initiated_by": "operator-1"},
+        json={"type": "PAUSE", "label": "Pause", "initiated_by": "operator-1"},
     )
 
     assert response.status_code == 400
+
+
+def test_issue_command_accepts_drive():
+    """DRIVE carries a held velocity setpoint for continuous manual control --
+    the bridge holds the resulting sequence. See
+    robot_bridge/velocity_driver.py."""
+    app, _, _ = _make_app()
+    client = TestClient(app)
+
+    response = client.post(
+        "/robots/robot-dev-01/commands",
+        json={
+            "type": "DRIVE",
+            "label": "Drive",
+            "initiated_by": "operator-1",
+            "params": {"vx": 0.8, "vy": 0.0, "vyaw": 0.0},
+        },
+    )
+
+    assert response.status_code == 200
 
 
 def test_get_command_returns_stored_record():
