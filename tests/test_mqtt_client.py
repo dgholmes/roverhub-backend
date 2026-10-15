@@ -350,3 +350,61 @@ def test_a_mismatched_registration_still_registers_the_robot():
     client.handle_message("roverhub/admin/bridge-pi-01/register", payload)
 
     assert registry.get("robot-dev-02") is not None
+
+
+# --- Edge host info / metrics (schema 0.0.9) --------------------------------
+
+HOST = {"hostname": "jetson", "os": "Ubuntu 22.04.4 LTS", "arch": "aarch64",
+        "bridge_version": "6d949c8", "booted_at": "2026-10-15T00:00:00Z"}
+
+
+def _register(client, **extra):
+    client.handle_message("roverhub/admin/bridge-dev-01/register", json.dumps({
+        "bridge_id": "bridge-dev-01", "site_id": "site-dev",
+        "robot_id": "robot-dev-01", "robot_type": "quad", **extra,
+    }).encode())
+
+
+def test_registration_carries_host_info_bridge_id_and_schema_version():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+
+    _register(client, schema_version="0.0.9", host=HOST)
+
+    record = registry.get("robot-dev-01")
+    assert record.bridge_id == "bridge-dev-01"
+    assert record.schema_version == "0.0.9"
+    assert record.host["hostname"] == "jetson"
+    assert record.host["device_model"] is None  # filled to the full schema shape
+
+
+def test_registration_from_an_old_bridge_has_no_host():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    _register(client)
+    assert registry.get("robot-dev-01").host is None
+
+
+def test_invalid_host_info_is_dropped_without_losing_the_registration():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    _register(client, host={"hostname": ["not", "a", "string"]})
+    record = registry.get("robot-dev-01")
+    assert record is not None and record.online is True
+    assert record.host is None
+
+
+def test_heartbeat_carries_host_metrics():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    _register(client)
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/heartbeat", json.dumps({
+        "robot_id": "robot-dev-01", "timestamp": "2026-10-15T00:00:05Z",
+        "host_metrics": {"cpu_percent": 12.5, "soc_temp_c": 51.0},
+    }).encode())
+
+    record = registry.get("robot-dev-01")
+    assert record.host_metrics["cpu_percent"] == 12.5
+    assert record.host_metrics["memory_percent"] is None
+    assert record.host_metrics_at == "2026-10-15T00:00:05Z"

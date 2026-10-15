@@ -4,6 +4,9 @@ import json
 import logging
 from typing import Callable, Optional, Tuple
 
+from pydantic import ValidationError
+
+from shared.schemas.bridge_status import EdgeHostInfo, EdgeHostMetrics
 from shared.schemas.version import SCHEMA_VERSION
 
 logger = logging.getLogger("backend.realtime.mqtt_client")
@@ -144,6 +147,9 @@ class BackendMqttClient:
             self._check_schema_version(data)
             self._registry.upsert_from_registration(
                 robot_id=data["robot_id"], site_id=data["site_id"], robot_type=data["robot_type"],
+                bridge_id=data.get("bridge_id"),
+                schema_version=data.get("schema_version"),
+                host=self._validated(EdgeHostInfo, data.get("host"), data["robot_id"], "host"),
             )
             return
 
@@ -153,6 +159,12 @@ class BackendMqttClient:
 
         if message_kind in ("telemetry", "heartbeat"):
             self._registry.mark_seen(data["robot_id"])
+            if message_kind == "heartbeat":
+                self._registry.update_host_metrics(
+                    data["robot_id"],
+                    self._validated(EdgeHostMetrics, data.get("host_metrics"), data["robot_id"], "host_metrics"),
+                    at=data.get("timestamp"),
+                )
         elif message_kind == "state":
             self._registry.update_state(
                 data["robot_id"], abstract_state=data["abstract_state"], sdk_state=data["sdk_state"],
@@ -161,6 +173,23 @@ class BackendMqttClient:
             from shared.schemas.commands import Command
 
             self._on_ack(Command(**data))
+
+    @staticmethod
+    def _validated(model, value, robot_id: str, label: str) -> Optional[dict]:
+        """Edge host info/metrics, validated, as a plain dict -- or None.
+
+        Absent (a bridge predating schema 0.0.9) is the ordinary case and is
+        silent. Present-but-invalid is logged and dropped: it is display data,
+        so it must never cost the registration or heartbeat that carried it --
+        a dropped registration takes the robot off GET /robots entirely.
+        """
+        if value is None:
+            return None
+        try:
+            return model.model_validate(value).model_dump(mode="json")
+        except ValidationError as exc:
+            logger.warning("ignoring invalid %s from robot %s: %s", label, robot_id, exc)
+            return None
 
     def _check_schema_version(self, data: dict) -> None:
         """Compare the bridge's wire-contract version against ours.

@@ -12,10 +12,18 @@ from control.snapshots import DEFAULT_SNAPSHOTS_DIR, build_snapshot_router
 from control.router import build_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
+from robots.router import build_robots_router
 
 load_dotenv()  # loads .env in the working directory, if present; real env vars still win
 
-registry = RobotRegistry()
+# Device acceptance is informational and defaults to "auto" -- every bridge
+# that registers is accepted, as before. See robots/registry.py for why it is
+# not (and cannot yet be) a gate. DEVICE_ACCEPTANCE=manual makes unknown
+# devices arrive "pending"; ACCEPTED_DEVICES pre-accepts robot or bridge ids.
+registry = RobotRegistry(
+    acceptance_mode=os.environ.get("DEVICE_ACCEPTANCE", "auto").strip().lower() or "auto",
+    preaccepted=os.environ.get("ACCEPTED_DEVICES", "").split(","),
+)
 command_store = CommandStore()
 mqtt_client = BackendMqttClient(
     os.environ.get("CLOUD_MQTT_URL", "mqtt://localhost:1883"), registry, real_mqtt_client_factory,
@@ -24,6 +32,7 @@ mqtt_client = BackendMqttClient(
 
 app = FastAPI(title="RoverHub Backend (dev)")
 app.include_router(build_router(command_store, mqtt_client))
+app.include_router(build_robots_router(registry))
 app.include_router(build_media_router(clips_dir=os.environ.get("AUDIO_CLIPS_DIR", "/tmp/roverhub-audio-clips")))
 # Camera snapshots travel the other way from audio clips -- edge to cloud. Unlike
 # clips they are kept as a small media library (JPEG + JSON sidecar, listed by
@@ -88,19 +97,3 @@ def _on_shutdown() -> None:
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
-
-
-@app.get("/robots")
-def list_robots():
-    return [
-        {
-            "robot_id": r.robot_id,
-            "site_id": r.site_id,
-            "robot_type": r.robot_type,
-            "name": r.name,
-            "online": r.online,
-            "abstract_state": r.abstract_state,
-            "last_seen": r.last_seen.isoformat() if r.last_seen else None,
-        }
-        for r in registry.list_all()
-    ]
