@@ -190,3 +190,11 @@ def test_app_with_middleware_rejects_upload_exceeding_content_length_limit(tmp_p
 
     assert response.status_code == 413
     assert list(tmp_path.iterdir()) == []
+
+
+def test_default_clips_dir_is_persistent_not_tmp():
+    from pathlib import Path
+    from control.media import DEFAULT_AUDIO_CLIPS_DIR
+    p = Path(DEFAULT_AUDIO_CLIPS_DIR)
+    assert p.parts[-2:] == ("data", "audio-clips")
+    assert "tmp" not in [part.lower() for part in p.parts]

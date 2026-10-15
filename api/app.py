@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from control.commands import CommandStore
-from control.media import MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router
+from control.media import DEFAULT_AUDIO_CLIPS_DIR, MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router
 from control.snapshots import DEFAULT_SNAPSHOTS_DIR, build_snapshot_router
 from control.router import build_router
 from missions.router import DEFAULT_MISSIONS_DIR, build_missions_router
@@ -34,7 +34,7 @@ mqtt_client = BackendMqttClient(
 app = FastAPI(title="RoverHub Backend (dev)")
 app.include_router(build_router(command_store, mqtt_client))
 app.include_router(build_robots_router(registry))
-app.include_router(build_media_router(clips_dir=os.environ.get("AUDIO_CLIPS_DIR", "/tmp/roverhub-audio-clips")))
+app.include_router(build_media_router(clips_dir=os.environ.get("AUDIO_CLIPS_DIR", DEFAULT_AUDIO_CLIPS_DIR)))
 # Camera snapshots travel the other way from audio clips -- edge to cloud. Unlike
 # clips they are kept as a small media library (JPEG + JSON sidecar, listed by
 # GET /snapshots) in a persistent directory. See control/snapshots.py.

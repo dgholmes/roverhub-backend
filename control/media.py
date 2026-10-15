@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -14,6 +15,11 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 # MVP cap for a short voice clip; generous but bounds memory/disk use from an
 # unauthenticated caller (this backend has no auth by design at this stage).
 MAX_AUDIO_CLIP_BYTES = 10 * 1024 * 1024  # 10MB
+
+# Persistent by default, like DEFAULT_SNAPSHOTS_DIR: mission announcements
+# reference clips for weeks, and /tmp is wiped on reboot. AUDIO_CLIPS_DIR
+# overrides it.
+DEFAULT_AUDIO_CLIPS_DIR = str(Path(__file__).resolve().parents[1] / "data" / "audio-clips")
 
 # robot_id is concatenated straight into a filesystem path -- allowlist it so
 # path-traversal-style separators (including backslashes, which FastAPI's
