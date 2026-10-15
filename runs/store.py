@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -43,6 +44,15 @@ class RunStore:
     def __init__(self, runs_dir: str):
         self.root = runs_dir
         os.makedirs(runs_dir, exist_ok=True)
+        self._locks: dict = {}
+        self._locks_guard = threading.Lock()
+
+    def lock(self, run_id: str) -> threading.RLock:
+        """Per-run lock. Endpoints are sync, so FastAPI runs them on a threadpool;
+        read-modify-write of a run's files must hold this. Re-entrant so a caller
+        holding it can still call put/add_events."""
+        with self._locks_guard:
+            return self._locks.setdefault(run_id, threading.RLock())
 
     def run_dir(self, run_id: str) -> str:
         if not RUN_ID_RE.match(run_id):
@@ -66,8 +76,9 @@ class RunStore:
 
     def put(self, run: MissionRun) -> None:
         directory = self.run_dir(run.run_id)
-        os.makedirs(directory, exist_ok=True)
-        _atomic_write(os.path.join(directory, RUN_FILE), run.model_dump_json(indent=2))
+        with self.lock(run.run_id):
+            os.makedirs(directory, exist_ok=True)
+            _atomic_write(os.path.join(directory, RUN_FILE), run.model_dump_json(indent=2))
 
     def list(self, site_id=None, robot_id=None, mission_id=None, since=None) -> List[MissionRun]:
         runs = []
@@ -109,15 +120,17 @@ class RunStore:
         return [out[k] for k in sorted(out)]
 
     def add_events(self, run_id: str, events: Iterable[RunEvent]) -> int:
-        existing = {e.seq: e for e in self.events(run_id)}
-        added = 0
-        for event in events:
-            if event.seq not in existing:
-                existing[event.seq] = event
-                added += 1
-        if added:
-            text = "".join(existing[k].model_dump_json() + "\n" for k in sorted(existing))
-            _atomic_write(os.path.join(self.run_dir(run_id), EVENTS_FILE), text)
+        path = os.path.join(self.run_dir(run_id), EVENTS_FILE)
+        with self.lock(run_id):
+            existing = {e.seq: e for e in self.events(run_id)}
+            added = 0
+            for event in events:
+                if event.seq not in existing:
+                    existing[event.seq] = event
+                    added += 1
+            if added:
+                text = "".join(existing[k].model_dump_json() + "\n" for k in sorted(existing))
+                _atomic_write(path, text)
         return added
 
     def files(self, run_id: str) -> List[dict]:

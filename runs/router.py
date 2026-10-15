@@ -41,10 +41,11 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
         store.run_dir(run_id)
         if run.run_id != run_id:
             raise HTTPException(status_code=400, detail="body run_id does not match the path")
-        previous = store.get(run_id)
-        if previous is not None and previous.bucket_copied_at and not run.bucket_copied_at:
-            run = run.model_copy(update={"bucket_copied_at": previous.bucket_copied_at})
-        store.put(run)
+        with store.lock(run_id):
+            previous = store.get(run_id)
+            if previous is not None and previous.bucket_copied_at and not run.bucket_copied_at:
+                run = run.model_copy(update={"bucket_copied_at": previous.bucket_copied_at})
+            store.put(run)
         on_change(run_id, None)
         return run.model_dump(mode="json")
 

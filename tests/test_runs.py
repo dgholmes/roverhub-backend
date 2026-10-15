@@ -89,3 +89,48 @@ def test_corrupt_run_json_is_skipped_in_list(tmp_path):
     (tmp_path / "r-bad").mkdir()
     (tmp_path / "r-bad" / "run.json").write_text("{not json", encoding="utf-8")
     assert [i["run_id"] for i in client.get("/runs").json()["items"]] == ["r-ok"]
+
+
+def test_concurrent_event_posts_lose_nothing(tmp_path):
+    import threading
+    client = _client(tmp_path)
+    rid = "20261016-060000-m-1-rvr-01"
+    client.put(f"/runs/{rid}", json=_run())
+    def post(base):
+        events = [{"run_id": rid, "seq": base + i, "at": "2026-10-16T06:00:00Z", "kind": "arrived"} for i in range(5)]
+        assert client.post(f"/runs/{rid}/events", json={"events": events}).status_code == 200
+    threads = [threading.Thread(target=post, args=(n * 5,)) for n in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    seqs = [e["seq"] for e in client.get(f"/runs/{rid}/events").json()["items"]]
+    assert seqs == list(range(60))
+
+
+def test_run_dir_rejects_traversal_and_bad_ids(tmp_path):
+    import pytest
+    from fastapi import HTTPException
+    from runs.store import RunStore
+    store = RunStore(str(tmp_path / "runs"))
+    for bad in [".", "..", "a/b", "a\b", "a:b", "x\n", ""]:
+        with pytest.raises(HTTPException) as exc:
+            store.run_dir(bad)
+        assert exc.value.status_code == 400, bad
+
+
+def test_run_dir_rejects_symlink_escaping_root(tmp_path):
+    import os
+    import pytest
+    from fastapi import HTTPException
+    from runs.store import RunStore
+    store = RunStore(str(tmp_path / "runs"))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        os.symlink(outside, tmp_path / "runs" / "evil", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not permitted")
+    with pytest.raises(HTTPException) as exc:
+        store.run_dir("evil")
+    assert exc.value.status_code == 400
