@@ -2,14 +2,16 @@
 or write any run, like every endpoint today."""
 from __future__ import annotations
 
+import os
 from typing import Callable, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from shared.schemas.runs import MissionRun, RunEvent
 
-from .store import RunStore
+from .store import CONTENT_TYPES, RunStore
 
 OnChange = Callable[[str, Optional[str]], None]
 
@@ -77,5 +79,58 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
     def get_events(run_id: str):
         _require(run_id)
         return {"items": [e.model_dump(mode="json") for e in store.events(run_id)]}
+
+    @router.put("/runs/{run_id}/files/{rel:path}")
+    async def put_file(run_id: str, rel: str, request: Request):
+        store.file_path(run_id, rel)  # validate before reading the body
+        _require(run_id)
+        declared = request.headers.get("content-length")
+        size = await store.write_file(run_id, rel, request.stream(),
+                                      int(declared) if declared and declared.isdigit() else None)
+        on_change(run_id, rel)
+        return {"path": rel, "size_bytes": size}
+
+    @router.get("/runs/{run_id}/files/{rel:path}")
+    def get_file(run_id: str, rel: str, request: Request):
+        path = store.file_path(run_id, rel)
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="file not found")
+        size = os.path.getsize(path)
+        media_type = CONTENT_TYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+        # Starlette 0.36's FileResponse ignores Range; a <video> can't seek
+        # without it, so single ranges are served by hand.
+        header = request.headers.get("range")
+        start, end = 0, size - 1
+        status = 200
+        if header and header.startswith("bytes="):
+            first, _, last = header[6:].split(",")[0].partition("-")
+            try:
+                if first:
+                    start = int(first)
+                    end = int(last) if last else size - 1
+                else:
+                    start = max(0, size - int(last))
+            except ValueError:
+                raise HTTPException(status_code=416, detail="bad range")
+            end = min(end, size - 1)
+            if start > end or start >= size:
+                return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+            status = 206
+
+        def _iter():
+            with open(path, "rb") as handle:
+                handle.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk = handle.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        headers = {"Accept-Ranges": "bytes", "Content-Length": str(end - start + 1)}
+        if status == 206:
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        return StreamingResponse(_iter(), status_code=status, media_type=media_type, headers=headers)
 
     return router

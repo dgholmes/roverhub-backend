@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import AsyncIterator, Iterable, List, Optional
 
 from fastapi import HTTPException
 
@@ -23,6 +24,16 @@ DEFAULT_RUNS_DIR = str(Path(__file__).resolve().parents[1] / "data" / "runs")
 RUN_FILE = "run.json"
 EVENTS_FILE = "events.jsonl"
 MEDIA_DIRS = ("photos", "video", "audio", "detections")
+FILE_NAME_RE = re.compile(r"^(?!\.)[A-Za-z0-9_.-]{1,160}$")
+MAX_FILE_BYTES = {
+    "photos": 20 * 1024 * 1024,
+    "detections": 20 * 1024 * 1024,
+    "audio": 50 * 1024 * 1024,
+    "video": 2 * 1024 * 1024 * 1024,
+}
+CONTENT_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                 ".mp4": "video/mp4", ".wav": "audio/wav", ".webm": "audio/webm",
+                 ".ogg": "audio/ogg", ".mp3": "audio/mpeg"}
 
 
 def _atomic_write(path: str, text: str) -> None:
@@ -145,3 +156,41 @@ class RunStore:
                 if os.path.isfile(full) and not name.startswith("."):
                     out.append({"path": f"{media_dir}/{name}", "size_bytes": os.path.getsize(full)})
         return out
+
+    def file_path(self, run_id: str, rel: str) -> str:
+        """Only `<media_dir>/<name>`: never run.json, events.jsonl, nested
+        folders or anything outside the run."""
+        parts = rel.split("/")
+        if len(parts) != 2 or parts[0] not in MEDIA_DIRS or not FILE_NAME_RE.match(parts[1]):
+            raise HTTPException(status_code=400, detail="invalid file path")
+        base = self.run_dir(run_id)
+        folder = os.path.realpath(os.path.join(base, parts[0]))
+        resolved = os.path.realpath(os.path.join(folder, parts[1]))
+        if os.path.dirname(folder) != base or os.path.dirname(resolved) != folder:
+            raise HTTPException(status_code=400, detail="invalid file path")
+        return resolved
+
+    async def write_file(self, run_id: str, rel: str, chunks: AsyncIterator[bytes],
+                         declared: Optional[int]) -> int:
+        path = self.file_path(run_id, rel)
+        limit = MAX_FILE_BYTES[rel.split("/")[0]]
+        if declared is not None and declared > limit:
+            raise HTTPException(status_code=413, detail=f"file exceeds {limit} bytes")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".", suffix=".tmp")
+        size = 0
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                async for chunk in chunks:
+                    size += len(chunk)
+                    if size > limit:
+                        raise HTTPException(status_code=413, detail=f"file exceeds {limit} bytes")
+                    handle.write(chunk)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return size
