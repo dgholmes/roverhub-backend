@@ -10,6 +10,7 @@ from control.commands import CommandStore
 from control.media import MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router
 from control.snapshots import DEFAULT_SNAPSHOTS_DIR, build_snapshot_router
 from control.router import build_router
+from missions.router import DEFAULT_MISSIONS_DIR, build_missions_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
 from robots.router import build_robots_router
@@ -45,6 +46,11 @@ def _site_for(robot_id: str):
 app.include_router(build_snapshot_router(
     snapshots_dir=os.environ.get("SNAPSHOTS_DIR", DEFAULT_SNAPSHOTS_DIR),
     site_lookup=_site_for,
+))
+# Missions authored in the console, stored as one JSON file each so they
+# survive a refresh and are shared between browsers. See missions/router.py.
+app.include_router(build_missions_router(
+    missions_dir=os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR),
 ))
 # Rejects oversized audio-clip uploads by Content-Length before Starlette's
 # multipart parser spools the body -- see ContentLengthLimitMiddleware's

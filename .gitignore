@@ -16,5 +16,5 @@ venv/
 .superpowers/
 .idea/
 
-# Snapshot library (SNAPSHOTS_DIR default)
+# Snapshot and mission libraries (SNAPSHOTS_DIR, MISSIONS_DIR defaults)
 data/
