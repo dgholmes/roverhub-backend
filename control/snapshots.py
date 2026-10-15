@@ -25,12 +25,21 @@ directory survives -- which is why the default moved from `/tmp` to
 filesystem store, not the storage layer docs/07-tracker.md says is missing: no
 retention, no replication, one process.
 
-What the sidecar can and cannot say: today's bridge (robot_bridge/snapshots.py)
-uploads the bare JPEG and nothing else. `robot_id` comes from the URL, `site_id`
-from the registry if the robot is registered, `received_at` from this server's
-clock. `camera` and `captured_at` are accepted as optional form fields so a
-future bridge can send them, and are null until one does. `position` is always
-null: the upload carries no pose and this backend keeps no pose to look up.
+What the sidecar says: `robot_id` comes from the URL, `site_id` from the
+registry if the robot is registered, `received_at` from this server's clock.
+`camera`, `captured_at` and `position` are optional form fields the bridge
+sends from 2026-10-15 (roverhub-edge robot_bridge/snapshots.py); a bridge from
+before then uploads the bare JPEG and all three stay null. That is the whole
+backward-compatibility story in both directions: every field is optional here,
+and FastAPI ignores form fields it was not told about.
+
+- `captured_at` is when the bridge received the frame off DDS -- the SDK gives
+  no camera-side stamp -- falling back to when the capture ran.
+- `position` is a `RobotPosition` (shared/schemas/robot_state.py) as JSON,
+  carrying provider ("dead_reckoning" today), quality ("estimated"/"lost";
+  never "localized" without SLAM) and freshness. Stored as validated, never
+  raw. Consumers must check `quality` before plotting it: dead reckoning
+  drifts without bound and "lost" coordinates are not a location at all.
 """
 from __future__ import annotations
 
@@ -45,9 +54,11 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Form, HTTPException, Query, UploadFile
+from pydantic import ValidationError
 from starlette.responses import FileResponse
 
 from control.media import ROBOT_ID_RE
+from shared.schemas.robot_state import RobotPosition
 
 # A JPEG frame off the robot's camera measures ~45KB at the resolution the robot
 # chooses to send. 4MB is generous enough to survive a firmware that starts
@@ -91,6 +102,9 @@ _ID_SUFFIX_LEN = 1 + 36 + len(".jpg")
 # so it is allowlisted rather than trusted.
 CAMERA_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
+# A RobotPosition serialises to ~250 bytes; anything far beyond that is not one.
+MAX_POSITION_CHARS = 4096
+
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 500
 
@@ -113,7 +127,29 @@ def _parse_iso(value) -> Optional[datetime]:
         return None
 
 
-def _metadata(*, snapshot_id, robot_id, site_id, camera, captured_at, received_at, size_bytes) -> dict:
+def _parse_position(raw: Optional[str], robot_id: str) -> Optional[dict]:
+    """The bridge's RobotPosition, validated and re-serialised, or None.
+
+    Unlike `camera` and `captured_at`, an unusable position is dropped rather
+    than rejected with a 400. The photo is what the operator asked for; the
+    position is annotation, and the likeliest cause of a mismatch is schema
+    skew between an edge device and this backend -- which must cost the
+    annotation, not the capture.
+    """
+    if raw is None or raw == "":
+        return None
+    if len(raw) > MAX_POSITION_CHARS:
+        logger.warning("dropping oversized snapshot position from %s (%d chars)", robot_id, len(raw))
+        return None
+    try:
+        return RobotPosition.model_validate_json(raw).model_dump(mode="json")
+    except ValidationError as exc:
+        logger.warning("dropping invalid snapshot position from %s: %s", robot_id, exc)
+        return None
+
+
+def _metadata(*, snapshot_id, robot_id, site_id, camera, captured_at, received_at, size_bytes,
+              position=None) -> dict:
     return {
         "snapshot_id": snapshot_id,
         "robot_id": robot_id,
@@ -122,10 +158,9 @@ def _metadata(*, snapshot_id, robot_id, site_id, camera, captured_at, received_a
         "captured_at": _iso(captured_at) if captured_at else None,
         "received_at": _iso(received_at),
         "size_bytes": size_bytes,
-        # Always null today: the bridge's upload carries no pose, and this
-        # backend keeps none to look up. Present so consumers need no change
-        # once one of those exists.
-        "position": None,
+        # RobotPosition as JSON (provider/quality/freshness included), or null
+        # when the bridge predates position reporting or sent nothing usable.
+        "position": position,
     }
 
 
@@ -236,6 +271,7 @@ def build_snapshot_router(
         file: UploadFile,
         camera: Optional[str] = Form(None),
         captured_at: Optional[str] = Form(None),
+        position: Optional[str] = Form(None),
     ):
         if not ROBOT_ID_RE.match(robot_id):
             raise HTTPException(status_code=400, detail="robot_id contains invalid characters")
@@ -283,6 +319,7 @@ def build_snapshot_router(
             snapshot_id=snapshot_id, robot_id=robot_id, site_id=site_id,
             camera=camera, captured_at=captured,
             received_at=clock(), size_bytes=len(contents),
+            position=_parse_position(position, robot_id),
         ))
 
         return {"snapshot_id": snapshot_id, "size_bytes": len(contents)}

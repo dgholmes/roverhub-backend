@@ -297,3 +297,61 @@ def test_a_failing_site_lookup_does_not_lose_the_snapshot(tmp_path):
     snapshot_id = _upload(client)
 
     assert client.get("/snapshots").json()["items"][0]["snapshot_id"] == snapshot_id
+
+
+# --- Position metadata (bridge from 2026-10-15) -----------------------------
+
+import json  # noqa: E402
+
+POSITION = {
+    "x_m": 1.5, "y_m": -2.0, "z_m": 0.3, "heading_deg": 90.0,
+    "provider": "dead_reckoning", "quality": "estimated", "accuracy_m": None,
+    "freshness": "live", "updated_at": "2026-10-13T08:59:59Z",
+}
+
+
+def test_position_is_stored_and_listed_with_its_quality(tmp_path):
+    client = _library(tmp_path)
+    _upload(client, camera="back", captured_at="2026-10-13T08:59:59Z",
+            position=json.dumps(POSITION))
+
+    item = client.get("/snapshots").json()["items"][0]
+
+    assert item["camera"] == "back"
+    assert item["position"] == POSITION
+    assert item["position"]["provider"] == "dead_reckoning"
+    assert item["position"]["quality"] == "estimated"
+
+
+def test_position_survives_a_restart(tmp_path):
+    _upload(_library(tmp_path), position=json.dumps(POSITION))
+
+    item = _library(tmp_path).get("/snapshots").json()["items"][0]
+
+    assert item["position"] == POSITION
+
+
+def test_an_unusable_position_is_dropped_but_the_snapshot_kept(tmp_path):
+    """Schema skew between an edge device and this backend must cost the
+    annotation, never the photo."""
+    client = _library(tmp_path)
+    bad = [
+        "not json",
+        json.dumps({**POSITION, "quality": "perfect"}),
+        json.dumps({"x_m": 1}),
+        json.dumps({**POSITION, "padding": "x" * 5000}),
+    ]
+    for raw in bad:
+        _upload(client, position=raw)
+
+    items = client.get("/snapshots").json()["items"]
+    assert len(items) == len(bad)
+    assert all(i["position"] is None for i in items)
+
+
+def test_unknown_form_fields_are_ignored(tmp_path):
+    """Forward compatibility: a newer bridge sending a field this backend does
+    not know yet must still have its snapshot stored."""
+    client = _library(tmp_path)
+    _upload(client, camera="front", some_future_field="x")
+    assert client.get("/snapshots").json()["items"][0]["camera"] == "front"
