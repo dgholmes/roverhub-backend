@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from shared.schemas.runs import MissionRun, RunEvent
 
@@ -90,7 +91,7 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
         declared = request.headers.get("content-length")
         size = await store.write_file(run_id, rel, request.stream(),
                                       int(declared) if declared and declared.isdigit() else None)
-        on_change(run_id, rel)
+        await run_in_threadpool(on_change, run_id, rel)
         return {"path": rel, "size_bytes": size}
 
     @router.get("/runs/{run_id}/files/{rel:path}")

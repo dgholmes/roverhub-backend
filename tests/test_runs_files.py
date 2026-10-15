@@ -62,3 +62,25 @@ def test_range_request_returns_206(tmp_path):
     assert tail.content == b"789"
     bad = c.get(f"/runs/{RID}/files/video/run_front.mp4", headers={"Range": "bytes=20-30"})
     assert bad.status_code == 416
+
+
+def test_file_upload_hook_runs_off_the_event_loop(tmp_path):
+    import asyncio
+    import threading
+    seen = []
+
+    def hook(run_id, path):
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:
+            on_loop = False
+        seen.append((path, on_loop, threading.current_thread()))
+
+    app = FastAPI()
+    app.include_router(build_runs_router(str(tmp_path), on_change=hook))
+    c2 = TestClient(app)
+    c2.put(f"/runs/{RID}", json=_run())
+    assert c2.put(f"/runs/{RID}/files/photos/a.jpg", content=b"x").status_code in (200, 201, 204)
+    path, on_loop, _ = [s for s in seen if s[0]][-1]
+    assert path == "photos/a.jpg" and on_loop is False
