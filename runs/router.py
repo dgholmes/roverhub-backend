@@ -3,15 +3,18 @@ or write any run, like every endpoint today."""
 from __future__ import annotations
 
 import os
+import tempfile
+import zipfile
 from typing import Callable, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from shared.schemas.runs import MissionRun, RunEvent
 
-from .store import CONTENT_TYPES, RunStore
+from .store import CONTENT_TYPES, EVENTS_FILE, RUN_FILE, RunStore
 
 OnChange = Callable[[str, Optional[str]], None]
 
@@ -132,5 +135,30 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
         if status == 206:
             headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         return StreamingResponse(_iter(), status_code=status, media_type=media_type, headers=headers)
+
+    @router.get("/runs/{run_id}/zip")
+    def get_zip(run_id: str):
+        _require(run_id)
+        base = store.run_dir(run_id)
+        # Built into a temp file, not memory: a run can hold gigabytes of video.
+        fd, tmp = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(tmp, "w") as z:
+                for name in (RUN_FILE, EVENTS_FILE):
+                    full = os.path.join(base, name)
+                    if os.path.isfile(full):
+                        z.write(full, f"{run_id}/{name}", compress_type=zipfile.ZIP_DEFLATED)
+                for f in store.files(run_id):
+                    kind = zipfile.ZIP_STORED if f["path"].startswith("video/") else zipfile.ZIP_DEFLATED
+                    z.write(os.path.join(base, *f["path"].split("/")), f"{run_id}/{f['path']}", compress_type=kind)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return FileResponse(tmp, media_type="application/zip", filename=f"{run_id}.zip",
+                            background=BackgroundTask(os.unlink, tmp))
 
     return router
