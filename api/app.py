@@ -14,6 +14,8 @@ from missions.router import DEFAULT_MISSIONS_DIR, build_missions_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
 from robots.router import build_robots_router
+from runs.router import build_runs_router
+from runs.store import DEFAULT_RUNS_DIR
 
 load_dotenv()  # loads .env in the working directory, if present; real env vars still win
 
@@ -52,6 +54,9 @@ app.include_router(build_snapshot_router(
 app.include_router(build_missions_router(
     missions_dir=os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR),
 ))
+# Mission run records: one folder per run (run-records spec §6). See runs/.
+runs_router = build_runs_router(runs_dir=os.environ.get("RUNS_DIR", DEFAULT_RUNS_DIR))
+app.include_router(runs_router)
 # Rejects oversized audio-clip uploads by Content-Length before Starlette's
 # multipart parser spools the body -- see ContentLengthLimitMiddleware's
 # docstring in control/media.py for why this can't live in the handler alone.
