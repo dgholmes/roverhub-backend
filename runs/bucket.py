@@ -46,6 +46,8 @@ class BucketCopier:
         run = self.store.get(run_id)
         if run is None or run.result == "running":
             return
+        # A stamped run uploads just the changed path (a media file, run.json or
+        # events.jsonl); an unstamped finished run gets the full copy.
         rels = [path] if path and run.bucket_copied_at else \
             [RUN_FILE, EVENTS_FILE] + [f["path"] for f in self.store.files(run_id)]
         for rel in rels:

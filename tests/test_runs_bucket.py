@@ -97,3 +97,36 @@ def test_runs_under_the_stores_run_lock(tmp_path):
 def test_from_env_off_when_unset(tmp_path, monkeypatch):
     monkeypatch.delenv("RUNS_BUCKET", raising=False)
     assert from_env(RunStore(str(tmp_path))) is None
+
+
+def test_events_posted_after_stamping_reach_the_bucket(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from runs.router import build_runs_router
+    from tests.test_runs import _event
+
+    store, s3, copier = _setup(tmp_path, result="completed")
+    app = FastAPI()
+    app.include_router(build_runs_router(str(tmp_path), on_change=copier.on_change))
+    client = TestClient(app)
+    copier.on_change(RID, None)
+    assert store.get(RID).bucket_copied_at
+    s3.objects.clear()
+
+    added = client.post(f"/runs/{RID}/events", json={"events": [_event(0, run_id=RID)]})
+    assert added.json()["added"] == 1
+    assert set(s3.objects) == {("runs-bucket", f"site-a/{RID}/events.jsonl"),
+                               ("runs-bucket", f"site-a/{RID}/run.json")}
+    assert b'"seq":0' in s3.objects[("runs-bucket", f"site-a/{RID}/events.jsonl")].replace(b" ", b"")
+
+    s3.objects.clear()
+    client.post(f"/runs/{RID}/events", json={"events": [_event(0, run_id=RID)]})
+    assert s3.objects == {}  # nothing new, nothing uploaded
+
+
+def test_change_on_unstamped_finished_run_does_full_copy(tmp_path):
+    store, s3, copier = _setup(tmp_path, result="completed")
+    copier.on_change(RID, "events.jsonl")
+    keys = {k for (_, k) in s3.objects}
+    assert f"site-a/{RID}/photos/a.jpg" in keys and f"site-a/{RID}/run.json" in keys

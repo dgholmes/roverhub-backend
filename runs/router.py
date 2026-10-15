@@ -7,7 +7,7 @@ import tempfile
 import zipfile
 from typing import Callable, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -61,13 +61,14 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
         if any(e.run_id != run_id for e in batch.events):
             raise HTTPException(status_code=400, detail="event run_id does not match the path")
         added = store.add_events(run_id, batch.events)
+        if added > 0:
+            on_change(run_id, EVENTS_FILE)
         return {"added": added, "total": len(store.events(run_id))}
 
     @router.get("/runs")
     def list_runs(site_id: Optional[str] = None, robot_id: Optional[str] = None,
                   mission_id: Optional[str] = None, since: Optional[str] = None,
-                  limit: int = 50, offset: int = 0):
-        limit = max(1, min(limit, 500))
+                  limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
         runs = store.list(site_id, robot_id, mission_id, since)
         page = runs[offset:offset + limit]
         return {"items": [_summary(store, r) for r in page], "total": len(runs),

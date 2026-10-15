@@ -24,7 +24,7 @@ DEFAULT_RUNS_DIR = str(Path(__file__).resolve().parents[1] / "data" / "runs")
 RUN_FILE = "run.json"
 EVENTS_FILE = "events.jsonl"
 MEDIA_DIRS = ("photos", "video", "audio", "detections")
-FILE_NAME_RE = re.compile(r"^(?!\.)[A-Za-z0-9_.-]{1,160}$")
+FILE_NAME_RE = re.compile(r"^(?!\.)[A-Za-z0-9_.-]{1,160}\Z")
 MAX_FILE_BYTES = {
     "photos": 20 * 1024 * 1024,
     "detections": 20 * 1024 * 1024,

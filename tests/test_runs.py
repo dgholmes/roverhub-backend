@@ -134,3 +134,24 @@ def test_run_dir_rejects_symlink_escaping_root(tmp_path):
     with pytest.raises(HTTPException) as exc:
         store.run_dir("evil")
     assert exc.value.status_code == 400
+
+
+def test_list_rejects_negative_offset_and_out_of_range_limit(tmp_path):
+    client = _client(tmp_path)
+    client.put("/runs/r-one", json=_run(run_id="r-one"))
+    assert client.get("/runs?offset=-1").status_code == 422
+    assert client.get("/runs?limit=0").status_code == 422
+    assert client.get("/runs?limit=501").status_code == 422
+    assert client.get("/runs?limit=500&offset=0").status_code == 200
+
+
+def test_file_name_with_trailing_newline_is_rejected(tmp_path):
+    import pytest
+    from fastapi import HTTPException
+
+    from runs.store import RunStore
+
+    store = RunStore(str(tmp_path))
+    with pytest.raises(HTTPException) as exc:
+        store.file_path("20261016-060000-m-1-rvr-01", "photos/a.jpg\n")
+    assert exc.value.status_code == 400
