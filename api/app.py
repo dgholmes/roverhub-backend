@@ -14,6 +14,7 @@ from missions.router import DEFAULT_MISSIONS_DIR, build_missions_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
 from robots.router import build_robots_router
+from runs.bucket import from_env as bucket_from_env
 from runs.router import build_runs_router
 from runs.store import DEFAULT_RUNS_DIR
 
@@ -55,7 +56,14 @@ app.include_router(build_missions_router(
     missions_dir=os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR),
 ))
 # Mission run records: one folder per run (run-records spec §6). See runs/.
-runs_router = build_runs_router(runs_dir=os.environ.get("RUNS_DIR", DEFAULT_RUNS_DIR))
+# The copier shares the router's own RunStore so its per-run locks coordinate
+# with PUT /runs; hence the forwarding hook, bound once the copier exists.
+_copier = None
+runs_router = build_runs_router(
+    runs_dir=os.environ.get("RUNS_DIR", DEFAULT_RUNS_DIR),
+    on_change=lambda run_id, path: _copier.on_change(run_id, path) if _copier else None,
+)
+_copier = bucket_from_env(runs_router.store)
 app.include_router(runs_router)
 # Rejects oversized audio-clip uploads by Content-Length before Starlette's
 # multipart parser spools the body -- see ContentLengthLimitMiddleware's
