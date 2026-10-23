@@ -93,7 +93,7 @@ def test_rejects_path_traversal_id(tmp_path):
     store = TaskStore(str(tmp_path))
     for call in (
         lambda: store.get_task("../escape"),
-        lambda: store.delete_task("..\escape"),
+        lambda: store.delete_task(r"..\escape"),
         lambda: store.get_occurrence("../escape"),
         lambda: store.get_task("a:b"),  # NTFS alternate data stream
         lambda: store.get_task(".."),
@@ -115,6 +115,8 @@ def test_put_rejects_traversal_id_and_writes_nothing(tmp_path):
         store.put_occurrence(bad_occ)
     assert e.value.status_code == 400
     # Nothing landed in the parent directory nor inside the store.
+    # A real "../escape" from root/tasks (or root/occurrences) lands at root/escape.json.
+    assert not (tmp_path / "root" / "escape.json").exists()
     assert not (tmp_path / "escape.json").exists()
     assert os.listdir(tmp_path / "root" / "tasks") == []
     assert os.listdir(tmp_path / "root" / "occurrences") == []
@@ -166,3 +168,25 @@ def test_occurrence_with_unparseable_due_at_is_left_out_of_a_bounded_listing(tmp
     assert len(store.list_occurrences(None, None, None)) == 2
     assert [o.due_at for o in store.list_occurrences(None, "2026-10-01T00:00:00Z", None)] == [
         "2026-10-24T09:00:00Z"]
+
+
+def test_list_tasks_is_ordered_by_task_id(tmp_path):
+    store = TaskStore(str(tmp_path))
+    for task_id in ("t-c", "t-a", "t-b"):
+        store.put_task(_task(task_id))
+    assert [t.task_id for t in store.list_tasks(None)] == ["t-a", "t-b", "t-c"]
+
+
+def test_occurrences_due_at_the_same_instant_are_ordered_by_id(tmp_path):
+    store = TaskStore(str(tmp_path))
+    for task_id in ("t-b", "t-a"):
+        store.put_occurrence(_occ("2026-10-24T09:00:00Z", task_id))
+    assert [o.task_id for o in store.list_occurrences(None, None, None)] == ["t-a", "t-b"]
+
+
+def test_unparseable_due_at_sorts_first_in_an_unbounded_listing(tmp_path):
+    store = TaskStore(str(tmp_path))
+    store.put_occurrence(_occ("2026-10-24T09:00:00Z"))
+    store.put_occurrence(_occ("2026-10-25T09:00:00Z").model_copy(update={"due_at": "not-a-time"}))
+    assert [o.due_at for o in store.list_occurrences(None, None, None)] == [
+        "not-a-time", "2026-10-24T09:00:00Z"]

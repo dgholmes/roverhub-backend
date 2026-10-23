@@ -60,6 +60,8 @@ def _parse_utc(stamp: str) -> Optional[datetime]:
         parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return None
+    # Naive means UTC, not local: the spec types `due_at` as "UTC ISO, computed
+    # from the schedule's wall clock" (spec 5.2), so a bare timestamp is UTC.
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
@@ -169,12 +171,13 @@ class TaskStore:
         start: Optional[str] = None,
         end: Optional[str] = None,
     ) -> List[TaskOccurrence]:
-        """Occurrences with `start <= due_at < end`, oldest first. Either bound
-        may be None. Half-open so adjacent windows never share a slot. `due_at`
-        is compared as an instant, not as text, so an offset-bearing bound still
-        means what it says. An occurrence whose `due_at` does not parse cannot
-        be placed in a window, so a bounded listing leaves it out rather than
-        guessing; an unbounded one still returns it."""
+        """Occurrences with `start <= due_at < end`, oldest first, ties broken by
+        occurrence_id. An occurrence whose `due_at` does not parse sorts before
+        every real one. Either bound may be None. Half-open so adjacent windows
+        never share a slot. `due_at` is compared as an instant, not as text, so
+        an offset-bearing bound still means what it says. An unparseable `due_at`
+        cannot be placed in a window, so a bounded listing leaves it out rather
+        than guessing; an unbounded one still returns it."""
         lo = _parse_utc(start) if start is not None else None
         hi = _parse_utc(end) if end is not None else None
         if (start is not None and lo is None) or (end is not None and hi is None):
