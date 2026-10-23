@@ -236,6 +236,50 @@ def test_a_mission_the_library_rejects_does_not_stop_the_other_occurrences(tmp_p
     assert world.store.get_occurrence(good.occurrence_id).status == "running"
 
 
+def test_a_mission_file_that_is_present_but_unreadable_is_reported_as_such(tmp_path):
+    # MissionStore.get returns None for a schema-invalid file (one that predates
+    # `kind`, say), the same as for an absent one. The operator must not be told
+    # the mission was deleted.
+    world = _World(tmp_path, executor_kinds=frozenset({"program"}))
+    world.task()
+    (tmp_path / "missions" / "m-1.json").write_text('{"mission_id": "m-1"}', encoding="utf-8")
+    occ = world.due()
+
+    world.loop.run_once(AT_DUE)
+
+    stored = world.store.get_occurrence(occ.occurrence_id)
+    assert (stored.status, stored.skip_reason) == ("skipped", "mission_missing")
+    assert "missing or unreadable" in stored.message and "deleted" not in stored.message
+
+
+def test_an_occurrence_that_blows_up_does_not_stop_the_others(tmp_path, monkeypatch):
+    # The per-occurrence try/except is what makes "one bad record must not stop
+    # every patrol on the site" true; nothing in decide() can raise to exercise
+    # it, so a store write is made to.
+    world = _World(tmp_path, executor_kinds=frozenset({"program"}))
+    world.registry.upsert_from_registration("robot-2", "site-a", "quad")
+    world.task("t-1")
+    world.task("t-2", robot_id="robot-2")
+    bad = world.due("t-1")
+    good = world.due("t-2", robot_id="robot-2")
+    real_put = world.runs.put
+
+    def put(run):
+        if run.run_id == bad.occurrence_id:
+            raise OSError("disk full")
+        real_put(run)
+
+    monkeypatch.setattr(world.runs, "put", put)
+
+    world.loop.run_once(AT_DUE)
+
+    assert world.store.get_occurrence(good.occurrence_id).status == "running"
+    # Pins what actually happens to the one that failed (see _dispatch): it is
+    # left "dispatched" with no run, and nothing here reaps it.
+    stuck = world.store.get_occurrence(bad.occurrence_id)
+    assert stuck.status == "dispatched" and world.runs.get(bad.occurrence_id) is None
+
+
 # -- warning repetition -----------------------------------------------------
 
 def test_a_repeat_warning_is_let_through_once_per_quiet_period():
@@ -254,6 +298,62 @@ def test_a_repeat_warning_is_let_through_once_per_quiet_period():
     assert flt.filter(warn(bad, "t-2", ValueError("no such zone")))
     now[0] = 101
     assert flt.filter(warn(bad, "t-1", ValueError("no such zone")))
+
+
+def test_distinct_exceptions_from_the_same_logging_call_are_not_swallowed():
+    # `logger.exception("scheduler tick failed")` has a constant message, so a
+    # filter keyed on text alone would hide every failure after the first --
+    # and its traceback. Disk full, then a corrupt store file: both must show.
+    now = [0.0]
+    flt = _RepeatFilter(quiet_s=100, clock=lambda: now[0])
+
+    def error(exc):
+        try:
+            raise exc
+        except Exception:
+            import sys
+            return logging.LogRecord(
+                "roverhub.tasks", logging.ERROR, "f", 1, "scheduler tick failed", (), sys.exc_info(),
+            )
+
+    assert flt.filter(error(OSError("disk full")))
+    now[0] = 30
+    assert flt.filter(error(ValueError("corrupt store file")))
+    assert flt.filter(error(OSError("a different OSError")))
+    # The same failure again, with a fresh exception object, is a repeat.
+    assert not flt.filter(error(OSError("disk full")))
+
+
+@pytest.mark.asyncio
+async def test_a_loop_logs_two_different_tick_failures_but_not_a_repeat(tmp_path, caplog):
+    import asyncio
+    world = _World(tmp_path)
+    world.loop._interval_s = 0.005
+    failures = [OSError("disk full"), ValueError("corrupt store file"), OSError("disk full")]
+    calls = []
+
+    def run_once(now):
+        calls.append(now)
+        if len(calls) <= len(failures):
+            raise failures[len(calls) - 1]
+
+    world.loop.run_once = run_once
+    caplog.set_level(logging.WARNING, logger="roverhub.tasks")
+
+    task = asyncio.create_task(world.loop.run())
+    for _ in range(200):
+        if len(calls) > len(failures):
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    logged = [
+        (r.exc_info[0].__name__, str(r.exc_info[1]))
+        for r in caplog.records if r.getMessage() == "scheduler tick failed"
+    ]
+    assert logged == [("OSError", "disk full"), ("ValueError", "corrupt store file")]
 
 
 def test_info_records_are_never_suppressed():

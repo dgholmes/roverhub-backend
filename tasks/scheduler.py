@@ -260,18 +260,23 @@ def decide(
             ))
         late = now - due
         if late > timedelta(minutes=window):
+            # Minutes and seconds: whole minutes alone would print "30 min past
+            # its due time; the window is 30 min" for a patrol 30 min 30 s late.
+            minutes, seconds = divmod(int(late.total_seconds()), 60)
             return _skip("window_missed", (
-                f"{int(late.total_seconds() // 60)} min past its due time; "
-                f"the window is {window} min"
+                f"{minutes} min {seconds} s past its due time; the window is {window} min"
             ))
 
     # 2. Executor for this mission's kind.
     if mission is None:
         # Its own reason: "no_executor" would tell the operator the patrol is
-        # waiting on the edge when the real cause is a deleted mission.
+        # waiting on the edge when the real cause is the mission. "Missing or
+        # unreadable", not "deleted": MissionStore.get returns None for a file
+        # that fails validation (one written before `kind` existed) as well as
+        # for an absent one, and the message must not blame a deletion.
         return _skip("mission_missing", (
-            f"mission {occ.mission_id!r} is not in the mission library, so there "
-            f"is nothing to run"
+            f"mission {occ.mission_id!r} is missing or unreadable in the mission "
+            f"library, so there is nothing to run"
         ))
     if mission.kind not in executor_kinds:
         return _skip("no_executor", (
@@ -314,9 +319,10 @@ def decide(
         # NaN is "unknown" too: `nan < 30` is False, so it would otherwise pass.
         if battery_pct is None or math.isnan(battery_pct):
             return _skip("dispatch_rule", (
+                # About the argument, not the cloud: this is true of any robot
+                # without a reading, today and after the registry carries one.
                 f"min_battery_pct rule ({rule.min_battery_pct:g}%): the battery "
-                f"reading is unavailable, so the rule cannot be checked; the cloud "
-                f"does not receive battery telemetry yet"
+                f"reading is unavailable for this robot, so the rule cannot be checked"
             ))
         if battery_pct < rule.min_battery_pct:
             return _skip("dispatch_rule", (
@@ -369,8 +375,21 @@ class _RepeatFilter(logging.Filter):
     timezone would otherwise log the same warning 2,880 times a day, burying
     every other warning. A warning is the only signal an operator gets that a
     patrol will never run, so it is repeated, but hourly, not constantly.
-    Keyed on the formatted message: `materialise()` passes a fresh exception
-    object each time, so the log record's args never compare equal.
+    Keyed on the formatted message, plus the exception's type and text when the
+    record carries one. The message alone is not enough: `logger.exception(
+    "scheduler tick failed")` has a constant message, so after the first
+    failure every later, *different* one (disk full, then a corrupt store file)
+    would be hidden for an hour along with its traceback. Including the
+    exception, rather than passing every `exc_info` record through, keeps a
+    persistent failure from tracebacking every 30 s while still showing each new
+    one. The exception's text, not the object, because `materialise()` and the
+    tick raise a fresh instance each time, so the log record's args never
+    compare equal.
+
+    Scope: attached to the `roverhub.tasks` logger, which `tasks/store.py` also
+    logs to, so identical store warnings raised on API request threads are
+    throttled too while the loop runs. That is acceptable (they repeat the same
+    way, per call) but it is a side effect worth knowing.
     """
 
     def __init__(self, quiet_s: float = 3600.0, clock: Callable[[], float] = _time.monotonic):
@@ -382,7 +401,12 @@ class _RepeatFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if record.levelno < logging.WARNING:
             return True
-        key = (record.levelno, record.getMessage())
+        exc = record.exc_info[1] if record.exc_info else None
+        key = (
+            record.levelno, record.getMessage(),
+            type(exc).__name__ if exc is not None else None,
+            str(exc) if exc is not None else None,
+        )
         now = self._clock()
         last = self._last.get(key)
         if last is not None and now - last < self._quiet_s:
@@ -508,16 +532,23 @@ class SchedulerLoop:
             busy.add(occ.robot_id)
 
     def _dispatch(self, occ: TaskOccurrence, mission: MissionLibraryEntry, now: datetime) -> bool:
-        # The occurrence id is the run id: deterministic, so a crash between the
-        # steps below and a retry cannot leave two runs for one occurrence.
+        # The occurrence id is the run id, so two attempts could never produce
+        # two runs. Nothing retries: run_once revisits only "scheduled" and "due"
+        # occurrences, so this runs at most once per occurrence.
         run = MissionRun(
             run_id=occ.occurrence_id, mission_id=occ.mission_id, mission=mission,
             robot_id=occ.robot_id, site_id=occ.site_id, started_at=_iso(now),
             started_by="schedule",
         )
-        # "dispatched" is written before anything is sent, so a crash mid-way
-        # leaves a record of the attempt rather than a patrol that may or may
-        # not have started and a store that says it never tried.
+        # "dispatched" is written before anything is sent, so a failure mid-way
+        # leaves a record of the attempt rather than a store that says it never
+        # tried. The cost, stated plainly: there is no recovery. If `runs.put`
+        # (or the process) fails after this write, the occurrence stays
+        # "dispatched" with no run, `run_once` seeds `busy` from "dispatched",
+        # and that robot is skipped as `robot_busy` from then on. Only a publish
+        # failure is cleaned up (below). Nothing can reach this while
+        # EXECUTOR_KINDS is empty; reaping stuck dispatches belongs with the
+        # executor's dispatched/running -> terminal lifecycle (Plan 3).
         dispatched = occ.model_copy(update={"status": "dispatched", "run_id": run.run_id})
         self._store.put_occurrence(dispatched)
         self._runs.put(run)

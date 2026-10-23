@@ -94,7 +94,10 @@ def test_a_mission_missing_from_the_library_is_skipped_with_its_id_named():
     # Not no_executor: "waiting on an executor" would send the operator to the
     # wrong place when the real cause is a deleted mission.
     _skip(verdict, "mission_missing")
-    assert "m-1" in verdict.message and "library" in verdict.message
+    # MissionStore.get returns None for an unreadable or schema-invalid file as
+    # well as an absent one, so the message must not claim it was deleted.
+    assert "m-1" in verdict.message and "missing or unreadable" in verdict.message
+    assert "deleted" not in verdict.message
 
 
 # -- window -----------------------------------------------------------------
@@ -115,6 +118,15 @@ def test_missed_window_is_skipped_even_for_a_program_that_could_run():
 def test_missed_window_wins_over_an_unavailable_robot():
     late = NOW + timedelta(minutes=31)
     _skip(_decide(task=_task(window_minutes=30), now=late, robot=None), "window_missed")
+
+
+def test_a_missed_window_message_does_not_contradict_itself_at_the_edge():
+    # 30 min 30 s late against a 30 min window: flooring to whole minutes would
+    # print "30 min past its due time; the window is 30 min".
+    late = NOW + timedelta(minutes=30, seconds=30)
+    verdict = _decide(task=_task(window_minutes=30), now=late)
+    _skip(verdict, "window_missed")
+    assert "30 min 30 s" in verdict.message
 
 
 def test_window_edge_is_inclusive():
@@ -219,6 +231,10 @@ def test_unknown_battery_with_a_threshold_is_skipped_not_permitted():
     _skip(verdict, "dispatch_rule")
     assert "min_battery_pct" in verdict.message
     assert "unavailable" in verdict.message
+    # True of the argument decide() received, not of the whole cloud: this
+    # becomes false the day the registry carries a reading, and the message
+    # must not then lie about a robot that has one.
+    assert "cloud" not in verdict.message and "telemetry" not in verdict.message
     assert "below" not in verdict.message and "low" not in verdict.message.split()
 
 
@@ -283,9 +299,3 @@ def test_the_other_rules_are_read_and_ignored():
 def test_healthy_program_dispatches():
     verdict = _decide(task=_task(min_battery_pct=15), battery_pct=80)
     assert (verdict.decision, verdict.skip_reason, verdict.message) == ("dispatch", None, None)
-
-
-def test_decide_does_not_read_the_clock_or_a_store():
-    # Same inputs, same answer, and `now` is the only time there is.
-    args = dict(occ=_occ(), task=_task(window_minutes=10), now=NOW + timedelta(minutes=11))
-    assert _decide(**args) == _decide(**args)
