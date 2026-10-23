@@ -215,3 +215,53 @@ def test_non_json_files_in_the_directory_are_ignored(tmp_path):
 
 def test_missing_missions_directory_is_an_empty_run(tmp_path):
     assert _run(tmp_path) == SplitReport(missions=0, tasks=0, skipped=[], notes=[])
+
+
+STALE_VALIDATION = {
+    "status": "invalid",
+    "issues": [{"severity": "error", "code": "noWaypoints", "message": "no waypoints", "waypoint_id": None}],
+}
+STORED_ESTIMATES = {"length_m": 12.5, "duration_s": 90.0, "energy_wh": None}
+
+
+def test_program_estimates_are_reset_to_unbounded(tmp_path):
+    # The scheduler's gate refuses an unbounded program with no max_duration_min.
+    # A schema-default `duration_bounded: true` that nobody computed would walk
+    # straight through it, so a migrated program asserts nothing until dryRun().
+    _write(tmp_path / "missions", _legacy(program_state=PROGRAM, estimates=STORED_ESTIMATES))
+
+    report = _run(tmp_path)
+
+    assert _mission(tmp_path)["estimates"] == {
+        "length_m": None, "duration_s": None, "energy_wh": None, "duration_bounded": False,
+    }
+    assert any("m-1" in n and "estimate" in n for n in report.notes)
+
+
+def test_program_without_stored_estimates_is_also_unbounded(tmp_path):
+    # The absent case is where the schema default (true) would have applied.
+    _write(tmp_path / "missions", _legacy(program_state=PROGRAM))
+    _run(tmp_path)
+    assert _mission(tmp_path)["estimates"]["duration_bounded"] is False
+
+
+def test_route_estimates_are_left_alone(tmp_path):
+    # Recomputed from geometry wherever read, so a stored value is harmless.
+    _write(tmp_path / "missions", _legacy(waypoints=[WAYPOINT], estimates=STORED_ESTIMATES))
+    report = _run(tmp_path)
+    estimates = _mission(tmp_path)["estimates"]
+    assert (estimates["length_m"], estimates["duration_s"]) == (12.5, 90.0)
+    assert estimates["duration_bounded"] is True
+    assert not any("estimate" in n for n in report.notes)
+
+
+def test_validation_is_reset_on_every_migrated_mission(tmp_path):
+    # "no waypoints" was computed by a deleted compiler against dead-reckoned
+    # waypoints; carrying it forward would present a stale claim as current.
+    _write(tmp_path / "missions", _legacy("m-prog", program_state=PROGRAM, validation=STALE_VALIDATION))
+    _write(tmp_path / "missions", _legacy("m-route", waypoints=[WAYPOINT], validation=STALE_VALIDATION))
+
+    _run(tmp_path)
+
+    for mission_id in ("m-prog", "m-route"):
+        assert _mission(tmp_path, mission_id)["validation"] == {"status": "unvalidated", "issues": []}

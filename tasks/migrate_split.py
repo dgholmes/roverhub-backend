@@ -104,6 +104,26 @@ def _migrate_one(raw: dict, stem: str, now: str, tasks: TaskStore, report: Split
         body["waypoints"] = []
         body["segments"] = []
 
+    # The stored validation was computed by a compiler this branch deletes, over
+    # waypoints that were themselves dead-reckoned: a stale claim ("no
+    # waypoints") that would read as current until someone re-saves the mission.
+    # "Not checked yet" is the true statement, and it needs no new value invented.
+    body["validation"] = {"status": "unvalidated", "issues": []}
+    if body["kind"] == "program":
+        # `duration_bounded` defaults to true, but nobody computed it for this
+        # program. tasks.scheduler.decide() relies on it to refuse an unbounded
+        # program that has no max_duration_min, so a migrated one must not walk
+        # through that gate on a default: refuse rather than permit, until the
+        # console's dry run computes the real figure. Route estimates are
+        # recomputed from geometry wherever read, so they are left alone.
+        body["estimates"] = {
+            "length_m": None, "duration_s": None, "energy_wh": None, "duration_bounded": False,
+        }
+        notes.append(
+            f"{mission_id}: estimates reset to unbounded (duration_bounded=false) -- the stored "
+            "figures were not computed for this program; opening it in the console re-runs the dry run"
+        )
+
     ignored = sorted(set(body) - set(MissionLibraryEntry.model_fields))
     if ignored:
         notes.append(f"{mission_id}: unknown keys not carried over: {', '.join(ignored)}")
