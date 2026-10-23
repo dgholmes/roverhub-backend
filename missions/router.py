@@ -18,7 +18,8 @@ overwrite or delete any mission).
 Endpoints:
 - GET    /missions[?site_id=]  -> {"items": [entry, ...]}, newest updated_at first
 - GET    /missions/{id}        -> entry, 404 if unknown
-- PUT    /missions/{id}        -> create or replace; server stamps updated_at
+- PUT    /missions/{id}        -> create or replace; server stamps updated_at and
+                                  version; 409 (with the stored entry) on a stale version
 - DELETE /missions/{id}        -> 204, 404 if unknown
 """
 from __future__ import annotations
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from api.common import now_iso, read_bounded_body
@@ -170,7 +172,21 @@ def build_missions_router(missions_dir: str, clock: Callable[[], str] = now_iso)
             ) from None
         if entry.mission_id != mission_id:
             raise HTTPException(status_code=400, detail="body mission_id does not match the path")
-        entry = entry.model_copy(update={"updated_at": clock()})
+
+        # Compare and write with no await between them: this handler runs on the
+        # event loop, so no other request can interleave. The store itself has
+        # no locking.
+        stored = store.get(mission_id)
+        if stored is not None and stored.version != entry.version:
+            # The stored entity, so the console can show what changed.
+            return JSONResponse(status_code=409, content=stored.model_dump(mode="json"))
+        # A create is always version 1, whatever the body carried: it is the first
+        # version, and a reader of the file expects that. Only a write to an
+        # existing mission increments -- the same ruling as PUT /tasks/{id}. (There
+        # is nothing stored to compare a create against, so a stale client
+        # re-creating a deleted mission starts over.)
+        version = 1 if stored is None else entry.version + 1
+        entry = entry.model_copy(update={"updated_at": clock(), "version": version})
         store.put(entry)
         return entry.model_dump(mode="json")
 

@@ -163,3 +163,44 @@ def test_no_temp_files_left_behind(tmp_path):
     client.put("/missions/m-1", json=_entry())
     client.put("/missions/m-1", json=_entry())
     assert sorted(p.name for p in tmp_path.iterdir()) == ["m-1.json"]
+
+
+def test_a_create_is_stored_at_version_1_and_each_later_write_increments(tmp_path):
+    client = _client(tmp_path)
+    created = client.put("/missions/m-1", json=_entry()).json()  # the body's default version is 1
+    assert created["version"] == 1                               # a first version, not 2
+    second = client.put("/missions/m-1", json={**_entry(), "version": created["version"]}).json()
+    assert second["version"] == 2
+    third = client.put("/missions/m-1", json={**_entry(), "version": second["version"]}).json()
+    assert third["version"] == 3
+    assert client.get("/missions/m-1").json()["version"] == 3
+    # And it is what is on disk, for anyone opening the file.
+    assert json.loads((tmp_path / "m-1.json").read_text(encoding="utf-8"))["version"] == 3
+
+
+def test_a_create_is_stored_at_version_1_whatever_version_the_body_carries(tmp_path):
+    client = _client(tmp_path)
+    created = client.put("/missions/m-1", json={**_entry(), "version": 99}).json()
+    assert created["version"] == 1
+    assert json.loads((tmp_path / "m-1.json").read_text(encoding="utf-8"))["version"] == 1
+
+
+def test_put_with_stale_version_returns_409_and_the_stored_mission(tmp_path):
+    client = _client(tmp_path)
+    created = client.put("/missions/m-1", json=_entry()).json()                     # stored at 1
+    winner = client.put("/missions/m-1", json={**_entry(), "name": "Winner", "version": created["version"]})
+    assert winner.status_code == 200 and winner.json()["version"] == 2
+    # A second writer who also read version 1 now holds a stale copy. The body is
+    # otherwise valid and names the right id, so only the version can refuse it.
+    loser = client.put("/missions/m-1", json={**_entry(), "name": "Loser", "version": created["version"]})
+    assert loser.status_code == 409
+    assert loser.json() == winner.json()  # the stored mission, so the console can show what changed
+    stored = client.get("/missions/m-1").json()
+    assert stored["name"] == "Winner" and stored["version"] == 2  # the loser wrote nothing
+    assert stored["updated_at"] == winner.json()["updated_at"]    # not even a timestamp
+
+
+def test_put_with_a_version_ahead_of_the_stored_one_is_also_409(tmp_path):
+    client = _client(tmp_path)
+    client.put("/missions/m-1", json=_entry())
+    assert client.put("/missions/m-1", json={**_entry(), "version": 99}).status_code == 409
