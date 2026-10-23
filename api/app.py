@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 
 from dotenv import load_dotenv
@@ -10,13 +12,18 @@ from control.commands import CommandStore
 from control.media import DEFAULT_AUDIO_CLIPS_DIR, MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router
 from control.snapshots import DEFAULT_SNAPSHOTS_DIR, build_snapshot_router
 from control.router import build_router
-from missions.router import DEFAULT_MISSIONS_DIR, build_missions_router
+from missions.router import DEFAULT_MISSIONS_DIR, MissionStore, build_missions_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
 from robots.router import build_robots_router
 from runs.bucket import from_env as bucket_from_env
 from runs.router import build_runs_router
 from runs.store import DEFAULT_RUNS_DIR
+from tasks.router import build_tasks_router
+from tasks.scheduler import EXECUTOR_KINDS, SchedulerLoop
+from tasks.store import DEFAULT_TASKS_DIR, TaskStore
+from shared.schemas.runs import MissionRun
+from shared.schemas.tasks import TaskOccurrence
 
 load_dotenv()  # loads .env in the working directory, if present; real env vars still win
 
@@ -65,6 +72,34 @@ runs_router = build_runs_router(
 )
 _copier = bucket_from_env(runs_router.store)
 app.include_router(runs_router)
+# Mission tasks (a mission assigned to a robot on a schedule) and the occurrence
+# queue the scheduler materialises from them. See tasks/router.py.
+_tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)
+app.include_router(build_tasks_router(tasks_dir=_tasks_dir))
+
+
+def _publish_mission_start(occurrence: TaskOccurrence, run: MissionRun) -> None:
+    # What this would send is Plan 3's to define: no command type can start a
+    # mission on the edge yet, so there is nothing to hand to
+    # mqtt_client.publish_command. Raising -- not logging and returning -- is
+    # what keeps that honest: the loop records the occurrence as failed with this
+    # message instead of calling a dispatch that never reached a robot "running".
+    # Unreachable today, because EXECUTOR_KINDS is empty and every occurrence is
+    # skipped as `no_executor` before it gets here. Whoever adds a kind to
+    # EXECUTOR_KINDS must replace this in the same change.
+    raise NotImplementedError("no command exists to start a mission on the edge yet")
+
+
+# Its own MissionStore and TaskStore, not the routers': the directories are the
+# source of truth and are re-read on every call, so a second instance over the
+# same directory is coherent by construction. The run store is the router's own,
+# so its per-run locks coordinate with PUT /runs.
+scheduler_loop = SchedulerLoop(
+    TaskStore(_tasks_dir), registry,
+    MissionStore(os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR)),
+    _publish_mission_start,
+    run_store=runs_router.store, executor_kinds=EXECUTOR_KINDS,
+)
 # Rejects oversized audio-clip uploads by Content-Length before Starlette's
 # multipart parser spools the body -- see ContentLengthLimitMiddleware's
 # docstring in control/media.py for why this can't live in the handler alone.
@@ -104,12 +139,21 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def _on_startup() -> None:
+async def _on_startup() -> None:
     mqtt_client.connect()
+    # Async so there is a running event loop to hang the task on. The tick does
+    # its file I/O on a worker thread (SchedulerLoop.run), so it does not stall
+    # requests.
+    app.state.scheduler_task = asyncio.create_task(scheduler_loop.run())
 
 
 @app.on_event("shutdown")
-def _on_shutdown() -> None:
+async def _on_shutdown() -> None:
+    task = getattr(app.state, "scheduler_task", None)
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
     mqtt_client.disconnect()
 
 
