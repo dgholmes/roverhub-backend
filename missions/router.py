@@ -35,6 +35,7 @@ from typing import Callable, List, Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import ValidationError
 
+from api.common import now_iso, read_bounded_body
 from shared.schemas.missions import MissionLibraryEntry
 
 logger = logging.getLogger("roverhub.missions")
@@ -55,10 +56,6 @@ MISSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 MAX_MISSION_BYTES = 1024 * 1024
 
 SUFFIX = ".json"
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _sort_key(entry: MissionLibraryEntry):
@@ -142,19 +139,7 @@ class MissionStore:
             return False
 
 
-async def _read_bounded_body(request: Request) -> bytes:
-    declared = request.headers.get("content-length")
-    if declared is not None and declared.isdigit() and int(declared) > MAX_MISSION_BYTES:
-        raise HTTPException(status_code=413, detail=f"mission exceeds {MAX_MISSION_BYTES} bytes")
-    body = bytearray()
-    async for chunk in request.stream():
-        body.extend(chunk)
-        if len(body) > MAX_MISSION_BYTES:
-            raise HTTPException(status_code=413, detail=f"mission exceeds {MAX_MISSION_BYTES} bytes")
-    return bytes(body)
-
-
-def build_missions_router(missions_dir: str, clock: Callable[[], str] = _now_iso) -> APIRouter:
+def build_missions_router(missions_dir: str, clock: Callable[[], str] = now_iso) -> APIRouter:
     """`clock` returns the UTC ISO string stamped into `updated_at`; injectable
     so ordering is testable."""
     router = APIRouter()
@@ -176,7 +161,7 @@ def build_missions_router(missions_dir: str, clock: Callable[[], str] = _now_iso
     @router.put("/missions/{mission_id}")
     async def put_mission(mission_id: str, request: Request):
         store._path(mission_id)  # validate the id before reading the body
-        raw = await _read_bounded_body(request)
+        raw = await read_bounded_body(request, MAX_MISSION_BYTES, "mission")
         try:
             entry = MissionLibraryEntry.model_validate_json(raw)
         except ValidationError as exc:

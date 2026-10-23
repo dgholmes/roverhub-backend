@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import timezone
 from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -30,6 +30,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from api.common import now_iso, read_bounded_body
 from shared.schemas.tasks import MissionSchedule, MissionTask, TaskOccurrence
 from tasks.scheduler import parse_start
 from tasks.store import TaskStore, parse_utc
@@ -51,22 +52,6 @@ RESERVED_TASK_IDS = frozenset({"occurrences"})
 _PLUS_DECODED_TO_SPACE = re.compile(
     r"(T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?) (\d{2}(?::?\d{2})?)$"
 )
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-async def _read_bounded_body(request: Request) -> bytes:
-    declared = request.headers.get("content-length")
-    if declared is not None and declared.isdigit() and int(declared) > MAX_TASK_BYTES:
-        raise HTTPException(status_code=413, detail=f"task exceeds {MAX_TASK_BYTES} bytes")
-    body = bytearray()
-    async for chunk in request.stream():
-        body.extend(chunk)
-        if len(body) > MAX_TASK_BYTES:
-            raise HTTPException(status_code=413, detail=f"task exceeds {MAX_TASK_BYTES} bytes")
-    return bytes(body)
 
 
 def _bound(name: str, raw: str) -> str:
@@ -117,9 +102,19 @@ def _schedule_problems(schedule: MissionSchedule) -> List[dict]:
     return problems
 
 
-def build_tasks_router(tasks_dir: str, clock: Callable[[], str] = _now_iso) -> APIRouter:
+def build_tasks_router(
+    tasks_dir: str,
+    clock: Callable[[], str] = now_iso,
+    scheduler_enabled: Callable[[], bool] = lambda: True,
+) -> APIRouter:
     """`clock` returns the UTC ISO string stamped into `updated_at` and used as
-    the due time of a run-now; injectable so both are testable."""
+    the due time of a run-now; injectable so both are testable.
+
+    `scheduler_enabled` is asked on each run-now, not once at build time, because
+    whether the loop runs is decided at app startup (SCHEDULER_ENABLED) and this
+    router is built at import. It only changes what run-now *says*: a queued
+    occurrence with no loop to decide it would otherwise be promised a tick that
+    never comes."""
     router = APIRouter()
     store = TaskStore(tasks_dir)
 
@@ -155,7 +150,7 @@ def build_tasks_router(tasks_dir: str, clock: Callable[[], str] = _now_iso) -> A
         if task_id in RESERVED_TASK_IDS:
             raise HTTPException(status_code=400, detail=f"{task_id!r} is reserved and cannot be a task_id")
         store.get_task(task_id)  # validates the id (400) before the body is read
-        raw = await _read_bounded_body(request)
+        raw = await read_bounded_body(request, MAX_TASK_BYTES, "task")
         try:
             task = MissionTask.model_validate_json(raw)
         except ValidationError as exc:
@@ -176,10 +171,11 @@ def build_tasks_router(tasks_dir: str, clock: Callable[[], str] = _now_iso) -> A
         if stored is not None and stored.version != task.version:
             # The stored entity, so the console can show what changed.
             return JSONResponse(status_code=409, content=stored.model_dump(mode="json"))
-        # A create is stored at the version it carries (1 by default): version 1
-        # is the first version, and a reader of the file expects that. Only a
-        # write to an existing task increments.
-        version = task.version if stored is None else task.version + 1
+        # A create is always version 1, whatever the body carried: it is the first
+        # version, and a reader of the file expects that. Only a write to an
+        # existing task increments. (There is nothing stored to compare a create
+        # against, so a stale client re-creating a deleted task starts over.)
+        version = 1 if stored is None else task.version + 1
         task = task.model_copy(update={"updated_at": clock(), "version": version})
         store.put_task(task)
         return task.model_dump(mode="json")
@@ -213,12 +209,16 @@ def build_tasks_router(tasks_dir: str, clock: Callable[[], str] = _now_iso) -> A
         occurrence = TaskOccurrence(
             occurrence_id=occurrence_id, task_id=task.task_id, mission_id=task.mission_id,
             site_id=task.site_id, robot_id=task.robot_id, due_at=due_at, status="due",
-            # Not a claim a run started: this only queues. The scheduler's next
-            # tick decides, and may skip it (no executor, robot offline, ...);
-            # its verdict replaces this message.
+            # Not a claim a run started: this only queues. With the loop on, its
+            # next tick decides and may skip it (no executor, robot offline, ...),
+            # and its verdict replaces this message.
             message=(
                 "Run-now requested: queued, not started. The scheduler decides on "
                 "its next tick and may skip it; status and skip_reason will say which."
+                if scheduler_enabled() else
+                "Run-now requested: queued, not started. The scheduler loop is "
+                "disabled on this backend, so nothing will decide this occurrence "
+                "until it is enabled."
             ),
         )
         store.put_occurrence(occurrence)

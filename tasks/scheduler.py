@@ -421,7 +421,8 @@ class SchedulerLoop:
 
     `materialise()` and `decide()` carry the logic and are tested on their own;
     this is the I/O around them, and `run_once()` is the tick without the sleep.
-    Nothing starts this loop yet -- it is not wired into `main.py`.
+    api/app.py starts it at startup (unless SCHEDULER_ENABLED turns it off) and
+    cancels it at shutdown.
     """
 
     def __init__(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 
@@ -78,7 +77,18 @@ app.include_router(runs_router)
 # Mission tasks (a mission assigned to a robot on a schedule) and the occurrence
 # queue the scheduler materialises from them. See tasks/router.py.
 _tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)
-app.include_router(build_tasks_router(tasks_dir=_tasks_dir))
+
+
+def _scheduler_enabled() -> bool:
+    # SCHEDULER_ENABLED=false (or 0/no/off) turns the background loop off: it
+    # writes to TASKS_DIR every 30 s, which is not always wanted on a dev
+    # machine. Default on. Read when asked, so it is a startup decision.
+    return os.environ.get("SCHEDULER_ENABLED", "").strip().lower() not in ("0", "false", "no", "off")
+
+
+# run-now is told whether the loop is on, so it does not promise a tick that
+# will never come.
+app.include_router(build_tasks_router(tasks_dir=_tasks_dir, scheduler_enabled=_scheduler_enabled))
 
 
 def _publish_mission_start(occurrence: TaskOccurrence, run: MissionRun) -> None:
@@ -145,16 +155,9 @@ app.add_middleware(
 )
 
 
-def _scheduler_enabled() -> bool:
-    return os.environ.get("SCHEDULER_ENABLED", "").strip().lower() not in ("0", "false", "no", "off")
-
-
 @app.on_event("startup")
 async def _on_startup() -> None:
     mqtt_client.connect()
-    # SCHEDULER_ENABLED=false (or 0/no/off) turns the background loop off: it
-    # writes to TASKS_DIR every 30 s, which is not always wanted on a dev
-    # machine. Default on. Read here, not at import, so it is a startup decision.
     if _scheduler_enabled():
         # Async so there is a running event loop to hang the task on. The tick
         # does its file I/O on a worker thread (SchedulerLoop.run), so it does
@@ -168,12 +171,20 @@ async def _on_startup() -> None:
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
     task = getattr(app.state, "scheduler_task", None)
-    if task is not None:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        app.state.scheduler_task = None  # a later startup (or a test) must not see a stale one
-    mqtt_client.disconnect()
+    try:
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # The loop already logs each tick's failure; one that escaped
+                # it is worth a line, but must not skip the disconnect below.
+                logger.exception("scheduler loop ended with an error")
+            app.state.scheduler_task = None  # a later startup (or a test) must not see a stale one
+    finally:
+        mqtt_client.disconnect()
 
 
 @app.get("/healthz")

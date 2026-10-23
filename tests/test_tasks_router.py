@@ -17,9 +17,9 @@ class _Clock:
         return f"2026-10-23T00:00:{self.n:02d}Z"
 
 
-def _client(tmp_path, clock=None):
+def _client(tmp_path, clock=None, **router_kwargs):
     app = FastAPI()
-    app.include_router(build_tasks_router(str(tmp_path), clock=clock or _Clock()))
+    app.include_router(build_tasks_router(str(tmp_path), clock=clock or _Clock(), **router_kwargs))
     return TestClient(app)
 
 
@@ -95,6 +95,13 @@ def test_put_with_stale_version_returns_409_and_the_stored_entity(tmp_path):
     assert loser.json() == winner.json()  # the stored task, so the console can show what changed
     stored = client.get("/tasks/t-1").json()
     assert stored["status"] == "paused" and stored["version"] == 2  # the loser wrote nothing
+
+
+def test_a_create_is_stored_at_version_1_whatever_version_the_body_carries(tmp_path):
+    client = _client(tmp_path)
+    created = client.put("/tasks/t-1", json={**_task(), "version": 99}).json()
+    assert created["version"] == 1
+    assert TaskStore(str(tmp_path)).get_task("t-1").version == 1
 
 
 def test_put_with_a_version_ahead_of_the_stored_one_is_also_409(tmp_path):
@@ -184,8 +191,11 @@ def test_delete_then_404(tmp_path):
 
 def test_a_real_timezone_and_start_at_are_accepted(tmp_path):
     client = _client(tmp_path)
-    for tz in ("Asia/Seoul", "UTC", "America/New_York"):
-        assert client.put("/tasks/t-1", json=_task(schedule=_schedule(timezone=tz))).status_code in (200, 409), tz
+    # A distinct id per zone: each is a create, so each must be a plain 200 and
+    # not a 409 against the one before.
+    for n, tz in enumerate(("Asia/Seoul", "UTC", "America/New_York")):
+        response = client.put(f"/tasks/t-{n}", json=_task(f"t-{n}", schedule=_schedule(timezone=tz)))
+        assert response.status_code == 200, (tz, response.text)
 
 
 @pytest.mark.parametrize("zone", [
@@ -361,6 +371,24 @@ def test_run_now_twice_in_one_second_is_one_occurrence(tmp_path):
     assert first.json() == second.json()
     assert first.json()["due_at"] == "2026-10-23T00:00:05Z"
     assert len(TaskStore(str(tmp_path)).list_occurrences()) == 1
+
+
+def test_run_now_says_so_when_the_scheduler_is_off(tmp_path):
+    client = _client(tmp_path, scheduler_enabled=lambda: False)
+    client.put("/tasks/t-1", json=_task())
+    occ = client.post("/tasks/t-1/run-now").json()
+    assert occ["status"] == "due"
+    message = occ["message"].lower()
+    assert "not started" in message
+    # Not "decides on its next tick": no tick is coming.
+    assert "next tick" not in message and "disabled" in message
+
+
+def test_run_now_promises_a_tick_only_when_the_scheduler_is_on(tmp_path):
+    client = _client(tmp_path, scheduler_enabled=lambda: True)
+    client.put("/tasks/t-1", json=_task())
+    message = client.post("/tasks/t-1/run-now").json()["message"].lower()
+    assert "next tick" in message and "disabled" not in message
 
 
 @pytest.mark.parametrize("status", ["paused", "archived"])

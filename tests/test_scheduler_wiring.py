@@ -55,9 +55,11 @@ def test_the_kill_switch_starts_no_task_and_logs_that(monkeypatch, caplog):
 
     with caplog.at_level(logging.INFO, logger="roverhub.tasks"):
         with TestClient(app_module.app) as client:
-            assert client.get("/healthz").status_code == 200
-    assert not fake.running
-    assert getattr(app_module.app.state, "scheduler_task", None) is None
+            assert client.get("/healthz").status_code == 200  # lets a created task run
+            assert not fake.running
+            # Inside the block: shutdown clears the handle either way, so after
+            # the block this would hold even if startup had created a task.
+            assert getattr(app_module.app.state, "scheduler_task", None) is None
     assert "scheduler loop disabled" in caplog.text
 
 
@@ -72,7 +74,8 @@ def test_the_loop_defaults_to_on_and_logs_that(monkeypatch, caplog, value):
     _no_mqtt(monkeypatch)
 
     with caplog.at_level(logging.INFO, logger="roverhub.tasks"):
-        with TestClient(app_module.app):
+        with TestClient(app_module.app) as client:
+            assert client.get("/healthz").status_code == 200  # lets the task take its first step
             assert fake.running
     assert "scheduler loop started" in caplog.text
 
@@ -83,7 +86,10 @@ def test_every_off_spelling_disables_it(monkeypatch, value):
     monkeypatch.setattr(app_module, "scheduler_loop", fake)
     monkeypatch.setenv("SCHEDULER_ENABLED", value)
     _no_mqtt(monkeypatch)
-    with TestClient(app_module.app):
+    with TestClient(app_module.app) as client:
+        # A request gives a task the switch wrongly created time to start, so a
+        # spelling that is ignored fails here instead of passing by being early.
+        assert client.get("/healthz").status_code == 200
         assert not fake.running
 
 
@@ -109,3 +115,19 @@ def test_the_publish_stub_says_what_is_missing():
         app_module._publish_mission_start(None, None)
     message = str(exc.value)
     assert "CommandType" in message and "executor" in message
+
+
+def test_shutdown_still_disconnects_mqtt_when_the_loop_task_raised(monkeypatch):
+    class _Crashes(_FakeLoop):
+        async def run(self):
+            self.running = True
+            raise RuntimeError("tick blew up")
+
+    disconnected = []
+    monkeypatch.setattr(app_module, "scheduler_loop", _Crashes())
+    monkeypatch.setattr(app_module.mqtt_client, "connect", lambda: None)
+    monkeypatch.setattr(app_module.mqtt_client, "disconnect", lambda: disconnected.append(True))
+
+    with TestClient(app_module.app) as client:
+        assert client.get("/healthz").status_code == 200
+    assert disconnected == [True]
