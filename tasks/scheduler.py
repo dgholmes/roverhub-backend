@@ -14,19 +14,32 @@ of a weekly schedule) is therefore decided on the schedule's own local date;
 only at the very end is the local time converted to the UTC instant that
 `due_at` carries.
 
-This is only the arithmetic. Whether a due occurrence is dispatched, skipped or
-missed its window is the dispatch gate's job, and persisting them is the
-store's.
+`materialise()` is only the arithmetic. Whether a due occurrence is dispatched
+or skipped is `decide()`'s job, and what to do about it each tick is
+`SchedulerLoop`'s; persisting occurrences is the store's.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import re
+import time as _time
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Iterable, List
+from typing import Callable, Iterable, List, Literal, NamedTuple, Optional
 from zoneinfo import ZoneInfo
 
-from shared.schemas.tasks import MissionSchedule, MissionTask, TaskOccurrence
+from fastapi import HTTPException
+
+from missions.router import MissionStore
+from robots.registry import RobotRecord, RobotRegistry
+from runs.store import RunStore
+from shared.schemas.missions import MissionKind, MissionLibraryEntry
+from shared.schemas.runs import MissionRun
+from shared.schemas.tasks import (
+    MissionSchedule, MissionTask, SkipReason, TaskOccurrence,
+)
+from tasks.store import TaskStore, _parse_utc
 
 logger = logging.getLogger("roverhub.tasks")
 
@@ -168,3 +181,348 @@ def _to_utc(day: date, wall_clock: time, zone: ZoneInfo) -> datetime:
     """
     local = datetime.combine(day, wall_clock, tzinfo=zone).replace(fold=0)
     return local.astimezone(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# The dispatch gate
+# ---------------------------------------------------------------------------
+
+Decision = Literal["dispatch", "skip"]
+
+# The mission kinds something on the edge can actually receive. Configuration,
+# not logic, and EMPTY in this plan: nothing on the edge can accept a route or
+# a program yet (`mission_executor.py` is 0 bytes), so every occurrence skips as
+# `no_executor`. That is the honest state and it is shown to the operator, not
+# hidden. Plan 3 (the edge program executor) makes this {"program"}; the SLAM
+# backpack adds "route". Do not hard-code "route skips, program dispatches" in
+# decide(): until each executor lands, the scheduler must not claim a dispatch
+# no component can accept.
+EXECUTOR_KINDS: frozenset[MissionKind] = frozenset()
+
+
+class Verdict(NamedTuple):
+    """What the gate decided and, for a skip, why.
+
+    `decision` and `skip_reason` are the pair spec 6.1 describes. `message` is
+    what makes the skip answerable: `skip_reason` is a closed set shared with
+    the UI, and "dispatch_rule" alone cannot say *which* rule, so the operator
+    asking "why didn't my patrol run?" would be left guessing. It is None for a
+    dispatch.
+    """
+
+    decision: Decision
+    skip_reason: Optional[SkipReason]
+    message: Optional[str]
+
+
+def _skip(reason: SkipReason, message: str) -> Verdict:
+    return Verdict("skip", reason, message)
+
+
+def decide(
+    occ: TaskOccurrence,
+    task: MissionTask,
+    mission: Optional[MissionLibraryEntry],
+    robot: Optional[RobotRecord],
+    now: datetime,
+    executor_kinds: frozenset[MissionKind] = EXECUTOR_KINDS,
+    *,
+    battery_pct: Optional[float] = None,
+    robot_busy: bool = False,
+) -> Verdict:
+    """Dispatch or skip one occurrence that has come due. Pure: no store, no
+    clock, no I/O -- everything it judges is a parameter.
+
+    The order is spec 6.1's and it matters, because the first failing check is
+    the reason the operator is shown: window, then executor, then robot, then
+    rules. A patrol that is 3 hours late AND has no executor is, to the person
+    reading the log, a missed patrol first.
+
+    `robot` is the registry's record for `occ.robot_id`, None if it has none.
+    `battery_pct` is a parameter and not read from `robot` because the cloud
+    does not have it: `RobotRecord` carries no battery field and the MQTT client
+    uses telemetry only to bump `last_seen`, so today the tick passes None.
+    `robot_busy` is whether that robot already has a dispatched or running
+    occurrence; only the tick, which sees every occurrence, can know.
+    """
+    now = _as_utc(now)
+
+    # 1. Window. Past it, the patrol that was asked for is gone; starting it
+    # late would be a different patrol.
+    window = task.schedule.window_minutes if task.schedule is not None else None
+    if window is not None:
+        due = _parse_utc(occ.due_at)
+        if due is None:
+            # Fail closed: a window that cannot be measured has not been met.
+            return _skip("window_missed", (
+                f"due_at {occ.due_at!r} is not a valid time, so the {window}-minute "
+                f"window cannot be checked"
+            ))
+        late = now - due
+        if late > timedelta(minutes=window):
+            return _skip("window_missed", (
+                f"{int(late.total_seconds() // 60)} min past its due time; "
+                f"the window is {window} min"
+            ))
+
+    # 2. Executor for this mission's kind.
+    if mission is None:
+        # The closed SkipReason set has nothing for "the mission was deleted";
+        # no_executor is the nearest true statement (there is nothing to run).
+        return _skip("no_executor", (
+            f"mission {occ.mission_id!r} is not in the mission library, so there "
+            f"is nothing to run"
+        ))
+    if mission.kind not in executor_kinds:
+        return _skip("no_executor", (
+            f"nothing on the edge can run a {mission.kind} mission yet"
+        ))
+
+    # 3. Robot. "Unreachable" here means the robot is not known at all; whether
+    # a known robot is online is the require_network rule's question (below),
+    # which would otherwise be dead -- this branch would always have skipped.
+    if occ.robot_id is None:
+        return _skip("robot_unavailable", "no robot is assigned to this task")
+    if robot is None:
+        return _skip("robot_unavailable", (
+            f"robot {occ.robot_id!r} is not registered with the cloud"
+        ))
+    if robot_busy:
+        return _skip("robot_busy", (
+            f"robot {occ.robot_id!r} is already running another scheduled mission"
+        ))
+
+    # 4. Dispatch rules (spec 6.3). Only min_battery_pct and require_network are
+    # consulted. require_approval, block_if_maintenance_flagged, max_wind_kph and
+    # require_safety_checklist are read and ignored on purpose: no approval
+    # flow, maintenance flag, weather source or checklist exists, so enforcing
+    # them would skip tasks for a rule no operator can satisfy.
+    rule = task.dispatch_rule
+    if rule.require_network and not robot.online:
+        return _skip("dispatch_rule", (
+            f"require_network rule: robot {occ.robot_id!r} is offline"
+        ))
+    if rule.min_battery_pct is not None:
+        # NaN is "unknown" too: `nan < 30` is False, so it would otherwise pass.
+        if battery_pct is None or math.isnan(battery_pct):
+            return _skip("dispatch_rule", (
+                f"min_battery_pct rule ({rule.min_battery_pct:g}%): the battery "
+                f"reading is unavailable, so the rule cannot be checked; the cloud "
+                f"does not receive battery telemetry yet"
+            ))
+        if battery_pct < rule.min_battery_pct:
+            return _skip("dispatch_rule", (
+                f"min_battery_pct rule: battery is {battery_pct:g}%, below the "
+                f"required {rule.min_battery_pct:g}%"
+            ))
+    if not mission.estimates.duration_bounded and task.max_duration_min is None:
+        # An unbounded program has no computable duration, and the robot would
+        # be held for as long as it runs. The task must cap it.
+        return _skip("dispatch_rule", (
+            "this mission has no computable duration (an unbounded wait or loop) "
+            "and the task sets no max_duration_min"
+        ))
+
+    return Verdict("dispatch", None, None)
+
+
+# ---------------------------------------------------------------------------
+# The tick
+# ---------------------------------------------------------------------------
+
+# Invoked as publish(occurrence, run) after the MissionRun exists. What it sends
+# is Plan 3's to define: no command type can start a mission on the edge yet,
+# which is also why nothing reaches it while EXECUTOR_KINDS is empty. Sync, and
+# run on a worker thread with the rest of the tick.
+Publish = Callable[[TaskOccurrence, MissionRun], None]
+
+
+def _battery_pct(robot: Optional[RobotRecord]) -> Optional[float]:
+    """The robot's battery as the cloud knows it -- which is not at all.
+
+    `RobotRecord` has no battery field and `realtime/mqtt_client.py` reads a
+    telemetry frame only to bump `last_seen`. So this is None for every robot,
+    and a task carrying `min_battery_pct` always skips (safe, and visible: the
+    skip message says the reading is unavailable). Retaining the last telemetry
+    battery per robot is separate work, on the backlog; when it lands, this is
+    the one place that changes.
+    """
+    return None
+
+
+def _iso(moment: datetime) -> str:
+    return f"{moment:%Y-%m-%dT%H:%M:%SZ}"
+
+
+class _RepeatFilter(logging.Filter):
+    """Let an identical warning through once per `quiet_s`, not once per tick.
+
+    The tick re-reads the same tasks every 30 s, so one task with an unknown
+    timezone would otherwise log the same warning 2,880 times a day, burying
+    every other warning. A warning is the only signal an operator gets that a
+    patrol will never run, so it is repeated, but hourly, not constantly.
+    Keyed on the formatted message: `materialise()` passes a fresh exception
+    object each time, so the log record's args never compare equal.
+    """
+
+    def __init__(self, quiet_s: float = 3600.0, clock: Callable[[], float] = _time.monotonic):
+        super().__init__()
+        self._quiet_s = quiet_s
+        self._clock = clock
+        self._last: dict = {}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno < logging.WARNING:
+            return True
+        key = (record.levelno, record.getMessage())
+        now = self._clock()
+        last = self._last.get(key)
+        if last is not None and now - last < self._quiet_s:
+            return False
+        self._last[key] = now
+        return True
+
+
+class SchedulerLoop:
+    """Every `interval_s`: materialise occurrences into the store, then decide
+    each one that has come due and write the outcome back.
+
+    `materialise()` and `decide()` carry the logic and are tested on their own;
+    this is the I/O around them, and `run_once()` is the tick without the sleep.
+    Nothing starts this loop yet -- it is not wired into `main.py`.
+    """
+
+    def __init__(
+        self,
+        store: TaskStore,
+        registry: RobotRegistry,
+        mission_store: MissionStore,
+        publish: Publish,
+        interval_s: float = 30,
+        *,
+        run_store: RunStore,
+        executor_kinds: frozenset[MissionKind] = EXECUTOR_KINDS,
+    ):
+        self._store = store
+        self._registry = registry
+        self._missions = mission_store
+        self._publish = publish
+        self._interval_s = interval_s
+        self._runs = run_store
+        self._executor_kinds = executor_kinds
+
+    async def run(self) -> None:
+        # Scoped to this loop's lifetime, so building a loop (in a test) does
+        # not leave a filter on a logger every other module shares.
+        repeats = _RepeatFilter()
+        logger.addFilter(repeats)
+        try:
+            while True:
+                try:
+                    await asyncio.to_thread(self.run_once, datetime.now(timezone.utc))
+                except Exception:
+                    # One bad tick must not end scheduling for good.
+                    logger.exception("scheduler tick failed")
+                await asyncio.sleep(self._interval_s)
+        finally:
+            logger.removeFilter(repeats)
+
+    def run_once(self, now: datetime) -> None:
+        now = _as_utc(now)
+        self._materialise(now)
+
+        everything = self._store.list_occurrences()
+        # Robots with a mission in flight. Updated as this tick dispatches, so
+        # two occurrences due at the same moment cannot both claim one robot.
+        busy = {
+            o.robot_id for o in everything
+            if o.status in ("dispatched", "running") and o.robot_id is not None
+        }
+        for occ in everything:  # due_at order, as the store lists
+            if occ.status not in ("scheduled", "due"):
+                continue
+            due = _parse_utc(occ.due_at)
+            if due is None:
+                logger.warning(
+                    "occurrence %s: due_at %r is not a valid time, leaving it alone",
+                    occ.occurrence_id, occ.due_at,
+                )
+                continue
+            if due > now:
+                continue
+            try:
+                self._handle(occ, now, busy)
+            except Exception:
+                # One bad record must not stop the other patrols on the site.
+                logger.exception("occurrence %s: could not be handled", occ.occurrence_id)
+
+    def _materialise(self, now: datetime) -> None:
+        for occ in materialise(self._store.list_tasks(), now):
+            # Never overwrite: once written, an occurrence is the store's, and
+            # one that has left "scheduled" must keep its outcome.
+            if self._store.get_occurrence(occ.occurrence_id) is None:
+                self._store.put_occurrence(occ)
+
+    def _mission(self, mission_id: str) -> Optional[MissionLibraryEntry]:
+        try:
+            return self._missions.get(mission_id)
+        except HTTPException:  # a mission_id the library rejects as unsafe
+            return None
+
+    def _handle(self, occ: TaskOccurrence, now: datetime, busy: set) -> None:
+        task = self._store.get_task(occ.task_id)
+        if task is None or task.status != "enabled":
+            # Paused, archived or deleted after this was materialised: it is
+            # not a patrol anyone still wants, and not a skip for a reason the
+            # operator can act on, so it is cancelled rather than dispatched.
+            self._store.put_occurrence(occ.model_copy(update={
+                "status": "cancelled",
+                "message": "the task was deleted" if task is None
+                else f"the task is {task.status}",
+            }))
+            return
+
+        robot = self._registry.get(occ.robot_id) if occ.robot_id is not None else None
+        mission = self._mission(occ.mission_id)
+        verdict = decide(
+            occ, task, mission, robot, now, self._executor_kinds,
+            battery_pct=_battery_pct(robot), robot_busy=occ.robot_id in busy,
+        )
+        if verdict.decision == "skip":
+            self._store.put_occurrence(occ.model_copy(update={
+                "status": "skipped",
+                "skip_reason": verdict.skip_reason,
+                "message": verdict.message,
+            }))
+            return
+        # A dispatch that could not be sent leaves the robot free for the next.
+        if self._dispatch(occ, mission, now):
+            busy.add(occ.robot_id)
+
+    def _dispatch(self, occ: TaskOccurrence, mission: MissionLibraryEntry, now: datetime) -> bool:
+        # The occurrence id is the run id: deterministic, so a crash between the
+        # steps below and a retry cannot leave two runs for one occurrence.
+        run = MissionRun(
+            run_id=occ.occurrence_id, mission_id=occ.mission_id, mission=mission,
+            robot_id=occ.robot_id, site_id=occ.site_id, started_at=_iso(now),
+            started_by="schedule",
+        )
+        # "dispatched" is written before anything is sent, so a crash mid-way
+        # leaves a record of the attempt rather than a patrol that may or may
+        # not have started and a store that says it never tried.
+        dispatched = occ.model_copy(update={"status": "dispatched", "run_id": run.run_id})
+        self._store.put_occurrence(dispatched)
+        self._runs.put(run)
+        try:
+            self._publish(dispatched, run)
+        except Exception as exc:
+            logger.exception("occurrence %s: publish failed", occ.occurrence_id)
+            self._runs.put(run.model_copy(update={
+                "result": "failed", "ended_at": _iso(now), "end_reason": f"publish failed: {exc}",
+            }))
+            self._store.put_occurrence(dispatched.model_copy(update={
+                "status": "failed", "message": f"the dispatch could not be sent: {exc}",
+            }))
+            return False
+        self._store.put_occurrence(dispatched.model_copy(update={"status": "running"}))
+        return True
