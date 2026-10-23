@@ -30,9 +30,11 @@ from shared.schemas.tasks import MissionSchedule, MissionTask, TaskOccurrence
 
 logger = logging.getLogger("roverhub.tasks")
 
-# "YYYY-MM-DDTHH:mm", wall clock, no offset (MissionSchedule.start_at). Not
-# validated by the schema, so parsed defensively here.
-_START_AT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})")
+# "YYYY-MM-DDTHH:mm", wall clock, no offset (MissionSchedule.start_at). The
+# schema types it as a plain str, so this is the only place it is ever checked.
+# Matched with fullmatch: a value carrying seconds or an offset ("...:00Z",
+# "+09:00") must be rejected, not read as a wall clock with the offset dropped.
+_START_AT_RE = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})")
 
 
 def materialise(
@@ -120,7 +122,7 @@ def _due_times(
 
 
 def _parse_start(start_at: str) -> tuple[date, time]:
-    match = _START_AT_RE.match(start_at)
+    match = _START_AT_RE.fullmatch(start_at)
     if match is None:
         raise ValueError(f"start_at {start_at!r} is not YYYY-MM-DDTHH:mm")
     return (
@@ -139,6 +141,8 @@ def _runs_on(schedule: MissionSchedule, start_date: date, day: date) -> bool:
         return day == start_date
     if schedule.recurrence == "daily":
         return True
+    # Only "weekly" remains: ScheduleRecurrence is Literal["once", "daily",
+    # "weekly"] (shared/schemas/tasks.py), so pydantic rejects anything else.
     return day.weekday() in schedule.days_of_week
 
 

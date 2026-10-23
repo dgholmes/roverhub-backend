@@ -302,3 +302,25 @@ def test_window_edges_are_walked_in_the_schedules_local_dates():
         "2026-10-23T03:00:00Z"]
     assert _due(materialise([east], _utc(2026, 10, 23, 23), horizon_days=1)) == [
         "2026-10-24T21:00:00Z"]
+
+
+def test_start_date_is_compared_as_a_local_date_not_a_utc_one():
+    # Seoul, series starts 2026-10-25 06:00. Its first run is 2026-10-24T21:00Z,
+    # whose UTC date (the 24th) is *before* the start date. A UTC-date
+    # comparison would wrongly call the 24th "before start" and suppress it.
+    task = _task(_schedule("2026-10-25T06:00"))
+    out = materialise([task], _utc(2026, 10, 24, 12), horizon_days=2)
+
+    assert _due(out) == ["2026-10-24T21:00:00Z", "2026-10-25T21:00:00Z"]
+
+
+def test_start_at_with_an_offset_or_trailing_junk_is_rejected_not_misread():
+    # start_at is wall clock "YYYY-MM-DDTHH:mm" and nothing else; the schema
+    # does not validate it, so this is the only check. A value carrying seconds
+    # or an offset must be skipped loudly, never read as a wall-clock time with
+    # the offset silently dropped -- that would run the patrol at the wrong instant.
+    now = _utc(2026, 10, 23, 8)
+    for bad in ("2026-10-20T09:00:00Z", "2026-10-20T09:00+09:00", "2026-10-20T09:00junk",
+                "2026-10-20T09:00\n"):
+        task = _task(_schedule(bad, tz="UTC"), task_id="bad")
+        assert materialise([task], now, horizon_days=2) == [], bad
