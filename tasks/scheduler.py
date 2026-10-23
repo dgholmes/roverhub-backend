@@ -267,9 +267,9 @@ def decide(
 
     # 2. Executor for this mission's kind.
     if mission is None:
-        # The closed SkipReason set has nothing for "the mission was deleted";
-        # no_executor is the nearest true statement (there is nothing to run).
-        return _skip("no_executor", (
+        # Its own reason: "no_executor" would tell the operator the patrol is
+        # waiting on the edge when the real cause is a deleted mission.
+        return _skip("mission_missing", (
             f"mission {occ.mission_id!r} is not in the mission library, so there "
             f"is nothing to run"
         ))
@@ -278,31 +278,39 @@ def decide(
             f"nothing on the edge can run a {mission.kind} mission yet"
         ))
 
-    # 3. Robot. "Unreachable" here means the robot is not known at all; whether
-    # a known robot is online is the require_network rule's question (below),
-    # which would otherwise be dead -- this branch would always have skipped.
+    # 3. Robot: unset, unreachable (unknown to the registry, or offline), or
+    # already running something. Reachability is unconditional: a command
+    # published to a robot nobody can reach goes into the void, and no task
+    # setting may opt out of that.
     if occ.robot_id is None:
         return _skip("robot_unavailable", "no robot is assigned to this task")
     if robot is None:
         return _skip("robot_unavailable", (
             f"robot {occ.robot_id!r} is not registered with the cloud"
         ))
+    if not robot.online:
+        return _skip("robot_unavailable", (
+            f"robot {occ.robot_id!r} is offline"
+        ))
     if robot_busy:
         return _skip("robot_busy", (
             f"robot {occ.robot_id!r} is already running another scheduled mission"
         ))
 
-    # 4. Dispatch rules (spec 6.3). Only min_battery_pct and require_network are
-    # consulted. require_approval, block_if_maintenance_flagged, max_wind_kph and
-    # require_safety_checklist are read and ignored on purpose: no approval
-    # flow, maintenance flag, weather source or checklist exists, so enforcing
-    # them would skip tasks for a rule no operator can satisfy.
+    # 4. Dispatch rules (spec 6.3). Only min_battery_pct is consulted. The rest
+    # are read and ignored on purpose:
+    #   - require_network is not unenforceable but subsumed: branch 3 already
+    #     skips every unreachable robot, so by here the robot is reachable
+    #     whatever the task says.
+    #   - require_approval, block_if_maintenance_flagged, max_wind_kph and
+    #     require_safety_checklist have nothing behind them (no approval flow,
+    #     maintenance flag, weather source or checklist exist), so enforcing
+    #     them would skip tasks for a rule no operator can satisfy.
     rule = task.dispatch_rule
-    if rule.require_network and not robot.online:
-        return _skip("dispatch_rule", (
-            f"require_network rule: robot {occ.robot_id!r} is offline"
-        ))
-    if rule.min_battery_pct is not None:
+    # `> 0`, not "is set": 0 is the project's explicit no-gate opt-out (the
+    # edge's SAFETY_MIN_BATTERY_PCT=0), and a gRPC-only host has no battery
+    # reading at all. Any real threshold with no reading is a skip.
+    if rule.min_battery_pct is not None and rule.min_battery_pct > 0:
         # NaN is "unknown" too: `nan < 30` is False, so it would otherwise pass.
         if battery_pct is None or math.isnan(battery_pct):
             return _skip("dispatch_rule", (
@@ -342,7 +350,7 @@ def _battery_pct(robot: Optional[RobotRecord]) -> Optional[float]:
 
     `RobotRecord` has no battery field and `realtime/mqtt_client.py` reads a
     telemetry frame only to bump `last_seen`. So this is None for every robot,
-    and a task carrying `min_battery_pct` always skips (safe, and visible: the
+    and a task carrying a `min_battery_pct` above 0 always skips (safe, and visible: the
     skip message says the reading is unavailable). Retaining the last telemetry
     battery per robot is separate work, on the backlog; when it lands, this is
     the one place that changes.

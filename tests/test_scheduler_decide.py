@@ -91,7 +91,9 @@ def test_route_is_skipped_as_no_executor_when_only_programs_have_one():
 def test_a_mission_missing_from_the_library_is_skipped_with_its_id_named():
     # Called directly: `_decide` substitutes a healthy mission for None.
     verdict = decide(_occ(), _task(), None, _robot(), NOW, PROGRAMS)
-    _skip(verdict, "no_executor")
+    # Not no_executor: "waiting on an executor" would send the operator to the
+    # wrong place when the real cause is a deleted mission.
+    _skip(verdict, "mission_missing")
     assert "m-1" in verdict.message and "library" in verdict.message
 
 
@@ -155,6 +157,17 @@ def test_unset_robot_is_skipped():
     assert "no robot" in verdict.message
 
 
+def test_offline_robot_is_skipped_as_unavailable_whatever_require_network_says():
+    # Publishing a command to a robot nobody can reach is a command into the
+    # void, and no task setting may opt out of that: spec 6.1 step 3.
+    for require_network in (True, False):
+        verdict = _decide(
+            task=_task(require_network=require_network), robot=_robot(online=False),
+        )
+        _skip(verdict, "robot_unavailable")
+        assert "robot-1" in verdict.message and "offline" in verdict.message
+
+
 def test_robot_unknown_to_the_registry_is_skipped():
     verdict = _decide(robot=None)
     _skip(verdict, "robot_unavailable")
@@ -174,6 +187,13 @@ def test_robot_is_checked_before_the_rules():
     # Busy AND a failing rule.
     verdict = _decide(task=_task(min_battery_pct=50), robot_busy=True, battery_pct=5)
     _skip(verdict, "robot_busy")
+    # Offline AND a failing rule.
+    verdict = _decide(task=_task(min_battery_pct=50), robot=_robot(online=False), battery_pct=5)
+    _skip(verdict, "robot_unavailable")
+
+
+def test_unreachable_is_checked_before_busy():
+    _skip(_decide(robot=_robot(online=False), robot_busy=True), "robot_unavailable")
 
 
 # -- rules: battery ---------------------------------------------------------
@@ -213,26 +233,19 @@ def test_a_nan_battery_reading_is_unknown_not_permitted():
     assert "unavailable" in verdict.message
 
 
-def test_a_threshold_of_zero_is_still_a_threshold():
-    # The edge treats 0 as "no gate" (SAFETY_MIN_BATTERY_PCT=0); here a set
-    # threshold with no reading skips, whatever its value. Pinned so the
-    # difference from the edge is a decision, not an accident.
-    _skip(_decide(task=_task(min_battery_pct=0), battery_pct=None), "dispatch_rule")
+def test_a_threshold_of_zero_means_no_gate_and_dispatches_with_no_reading():
+    # SAFETY_MIN_BATTERY_PCT=0 is the project's explicit no-gate opt-out
+    # (CLAUDE.md), and a gRPC-only host has no BMS at all: skipping on 0 would
+    # leave every such host permanently unschedulable.
+    task = _task(min_battery_pct=0)
+    assert _decide(task=task, battery_pct=None).decision == "dispatch"
+    assert _decide(task=task, battery_pct=float("nan")).decision == "dispatch"
+    assert _decide(task=task, battery_pct=3).decision == "dispatch"
 
 
-# -- rules: network ---------------------------------------------------------
-
-def test_offline_robot_is_skipped_when_the_network_is_required():
-    verdict = _decide(task=_task(require_network=True), robot=_robot(online=False))
-    _skip(verdict, "dispatch_rule")
-    assert "require_network" in verdict.message and "offline" in verdict.message
-
-
-def test_offline_robot_dispatches_when_the_network_is_not_required():
-    # What makes `require_network` a rule rather than a no-op: the robot being
-    # *registered* is the robot branch's question, being *online* is this one's.
-    task = _task(require_network=False)
-    assert _decide(task=task, robot=_robot(online=False)).decision == "dispatch"
+def test_the_smallest_real_threshold_still_gates_an_absent_reading():
+    # The line between "no gate" and "gate" is > 0, not "was set".
+    _skip(_decide(task=_task(min_battery_pct=0.5), battery_pct=None), "dispatch_rule")
 
 
 # -- rules: unbounded programs ----------------------------------------------
@@ -250,15 +263,19 @@ def test_unbounded_program_with_max_duration_dispatches():
 
 # -- the four rules nothing can enforce -------------------------------------
 
-def test_the_unenforceable_rules_are_read_and_ignored():
+def test_the_other_rules_are_read_and_ignored():
     # require_approval / block_if_maintenance_flagged / max_wind_kph /
-    # require_safety_checklist have nothing behind them (spec 6.3). If they
+    # require_safety_checklist have nothing behind them (spec 6.3); if they
     # blocked, a task would be skipped for a rule no operator can satisfy.
+    # require_network is subsumed by the robot branch (an offline robot never
+    # reaches the rules), so it too adds nothing here: set or not, a reachable
+    # robot dispatches.
     task = _task(
         require_approval=True, block_if_maintenance_flagged=True, max_wind_kph=1.0,
-        require_safety_checklist=True,
+        require_safety_checklist=True, require_network=True,
     )
     assert _decide(task=task).decision == "dispatch"
+    assert _decide(task=_task(require_network=False)).decision == "dispatch"
 
 
 # -- the happy path ---------------------------------------------------------

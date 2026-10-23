@@ -232,7 +232,7 @@ def test_a_mission_the_library_rejects_does_not_stop_the_other_occurrences(tmp_p
     world.loop.run_once(AT_DUE)
 
     stored = world.store.get_occurrence(bad.occurrence_id)
-    assert (stored.status, stored.skip_reason) == ("skipped", "no_executor")
+    assert (stored.status, stored.skip_reason) == ("skipped", "mission_missing")
     assert world.store.get_occurrence(good.occurrence_id).status == "running"
 
 
