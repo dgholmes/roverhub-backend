@@ -175,18 +175,171 @@ def test_filename_must_match_mission_id(tmp_path):
     assert any("other.json" in s for s in report.skipped)
 
 
-def test_an_existing_task_is_never_overwritten(tmp_path):
+def test_a_second_run_reports_already_migrated_not_skipped(tmp_path):
+    # "Did nothing because it was done" must be separable from "hit corrupt
+    # files" without parsing a message. Scheduled and unscheduled alike.
+    unscheduled = _legacy("m-plain")
+    del unscheduled["schedule"]
     _write(tmp_path / "missions", _legacy())
+    _write(tmp_path / "missions", unscheduled)
     first = _run(tmp_path)
-    assert first.tasks == 1
-    path = tmp_path / "tasks" / "tasks" / "task-m-1.json"
-    before = path.read_bytes()
+    assert (first.missions, first.tasks, first.already_migrated) == (2, 1, [])
+    task_path = tmp_path / "tasks" / "tasks" / "task-m-1.json"
+    plain_path = tmp_path / "out" / "m-plain.json"
+    before = (task_path.read_bytes(), plain_path.read_bytes())
 
     again = _run(tmp_path)
 
-    assert (again.missions, again.tasks) == (0, 0)
-    assert any("task-m-1" in s for s in again.skipped)
+    assert (again.missions, again.tasks, again.skipped) == (0, 0, [])
+    assert sorted(again.already_migrated) == ["m-1.json", "m-plain.json"]
+    # Neither half is rewritten, so the asymmetry between scheduled and
+    # unscheduled files is gone.
+    assert (task_path.read_bytes(), plain_path.read_bytes()) == before
+
+
+def test_a_conflicting_existing_task_is_never_overwritten(tmp_path):
+    # A task already stored under this id that is not this mission's own (a
+    # different robot here) is somebody's work: refuse, write nothing.
+    _write(tmp_path / "missions", _legacy())
+    TaskStore(str(tmp_path / "tasks")).put_task(MissionTask(
+        task_id="task-m-1", mission_id="m-1", site_id="site-a", robot_id="someone-else",
+        created_by="x", created_at=NOW, updated_at=NOW,
+    ))
+    path = tmp_path / "tasks" / "tasks" / "task-m-1.json"
+    before = path.read_bytes()
+
+    report = _run(tmp_path)
+
+    assert (report.missions, report.tasks, report.already_migrated) == (0, 0, [])
+    assert any("task-m-1" in s for s in report.skipped)
     assert path.read_bytes() == before
+    assert not (tmp_path / "out" / "m-1.json").exists()
+
+
+def test_an_interrupted_migration_is_completed_by_a_rerun(tmp_path, monkeypatch):
+    # Task written, mission write fails: the half-done state a crash leaves.
+    # A rerun must write the missing mission without a hand-deleted file, and
+    # must not rewrite the task.
+    from missions.router import MissionStore
+
+    _write(tmp_path / "missions", _legacy())
+
+    def boom(self, entry):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(MissionStore, "put", boom)
+    failed = _run(tmp_path)
+    monkeypatch.undo()
+
+    assert (failed.missions, failed.tasks) == (0, 1)
+    assert any("m-1.json" in s and "disk full" in s for s in failed.skipped)
+    task_path = tmp_path / "tasks" / "tasks" / "task-m-1.json"
+    assert task_path.is_file() and not (tmp_path / "out" / "m-1.json").exists()
+    before = task_path.read_bytes()
+
+    retry = _run(tmp_path)
+
+    assert (retry.missions, retry.tasks, retry.skipped) == (1, 0, [])
+    assert any("m-1" in n and "interrupted" in n for n in retry.notes)
+    assert _mission(tmp_path)["kind"] == "route"
+    assert task_path.read_bytes() == before
+
+
+def test_a_missing_task_is_restored_when_its_mission_is_already_written(tmp_path):
+    _write(tmp_path / "missions", _legacy())
+    _run(tmp_path)
+    (tmp_path / "tasks" / "tasks" / "task-m-1.json").unlink()
+
+    report = _run(tmp_path)
+
+    assert (report.missions, report.tasks, report.skipped) == (0, 1, [])
+    assert TaskStore(str(tmp_path / "tasks")).get_task("task-m-1").robot_id == "robot-7"
+
+
+def test_out_dir_may_not_be_the_missions_dir(tmp_path):
+    # `--out data/missions` is a realistic slip, and would atomically replace
+    # every original with its migrated form.
+    import pytest
+
+    path = _write(tmp_path / "missions", _legacy())
+    before = path.read_bytes()
+
+    for out in (tmp_path / "missions", str(tmp_path / "missions") + os.sep,
+                tmp_path / "missions" / ".." / "missions"):
+        with pytest.raises(ValueError, match="same directory"):
+            split_missions(str(tmp_path / "missions"), str(tmp_path / "tasks"), str(out), lambda: NOW)
+
+    assert path.read_bytes() == before
+    assert sorted(os.listdir(tmp_path / "missions")) == ["m-1.json"]
+
+
+def test_tasks_dir_may_not_be_the_missions_dir(tmp_path):
+    import pytest
+
+    _write(tmp_path / "missions", _legacy())
+    with pytest.raises(ValueError, match="same directory"):
+        split_missions(str(tmp_path / "missions"), str(tmp_path / "missions"), str(tmp_path / "out"), lambda: NOW)
+    assert sorted(os.listdir(tmp_path / "missions")) == ["m-1.json"]
+
+
+def test_an_overlong_task_id_skips_that_file_only(tmp_path):
+    # 124-128 char mission ids pass MISSION_ID_RE but "task-" + id exceeds the
+    # 128 the task store accepts. That must cost one file, not the run.
+    long_id = "m" * 126
+    _write(tmp_path / "missions", _legacy(long_id))
+    _write(tmp_path / "missions", _legacy("m-ok"))
+
+    report = _run(tmp_path)
+
+    assert (report.missions, report.tasks) == (1, 1)
+    assert any(long_id in s and "task id" in s for s in report.skipped)
+    assert not (tmp_path / "out" / f"{long_id}.json").exists()
+
+
+def test_a_missing_or_null_dispatch_rule_takes_the_schema_default(tmp_path):
+    from shared.schemas.tasks import DispatchRule
+
+    absent = _legacy("m-absent")
+    del absent["dispatch_rule"]
+    _write(tmp_path / "missions", absent)
+    _write(tmp_path / "missions", _legacy("m-null", dispatch_rule=None))
+
+    report = _run(tmp_path)
+
+    assert (report.tasks, report.skipped) == (2, [])
+    store = TaskStore(str(tmp_path / "tasks"))
+    for mission_id in ("m-absent", "m-null"):
+        task = store.get_task(f"task-{mission_id}")
+        assert task.dispatch_rule == DispatchRule()
+        # And the schedule beside it is still the authored one.
+        assert task.schedule.days_of_week == [0, 2, 4]
+
+
+def test_a_scheduled_program_mission_keeps_its_task_and_program(tmp_path):
+    # The shape of the live mission-mvaebufi.json this migration exists for:
+    # a program that is also scheduled. Everything must survive together.
+    _write(tmp_path / "missions", _legacy(program_state=PROGRAM))
+
+    report = _run(tmp_path)
+
+    assert (report.missions, report.tasks, report.skipped) == (1, 1, [])
+    mission = _mission(tmp_path)
+    assert mission["kind"] == "program" and mission["program_state"] == PROGRAM
+    assert mission["waypoints"] == [] and mission["estimates"]["duration_bounded"] is False
+    task = TaskStore(str(tmp_path / "tasks")).get_task("task-m-1")
+    assert task.robot_id == "robot-7"
+    assert task.schedule.model_dump() == {**SCHEDULE, "until": None, "skip_dates": []}
+    assert task.dispatch_rule.model_dump() == RULE
+
+
+def test_unknown_keys_are_reported_not_carried_over(tmp_path):
+    _write(tmp_path / "missions", _legacy(operator_notes="hi", legacy_flag=True))
+
+    report = _run(tmp_path)
+
+    assert (report.missions, report.skipped) == (1, [])
+    assert any("m-1" in n and "legacy_flag" in n and "operator_notes" in n for n in report.notes)
+    assert "operator_notes" not in _mission(tmp_path)
 
 
 def test_originals_are_untouched(tmp_path):

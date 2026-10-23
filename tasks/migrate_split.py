@@ -21,6 +21,11 @@ manual step for after the console is seen reading the new shape.
 
 Each file is all-or-nothing: if its task cannot be built, the mission is not
 written either, since a mission without its schedule is the silent loss above.
+
+Reruns are safe. Neither output is ever overwritten: a file whose mission (and
+task, if scheduled) already exist is reported as `already_migrated`, a missing
+half of an interrupted migration is written, and a task that is not this
+mission's own is refused. To redo a migration, delete its output first.
 """
 from __future__ import annotations
 
@@ -40,7 +45,7 @@ from missions.router import MISSION_ID_RE, MissionStore, SUFFIX
 from shared.schemas.missions import MissionLibraryEntry
 from shared.schemas.tasks import DispatchRule, MissionTask
 from tasks.scheduler import parse_start
-from tasks.store import TaskStore
+from tasks.store import TASK_ID_RE, TaskStore
 
 # The four fields that moved to MissionTask (`library_status` has no successor:
 # "completed"/"failed" describe a run, and nothing could ever set them on a mission).
@@ -57,6 +62,11 @@ class SplitReport:
     # Files that migrated but where something was dropped or may not work, each
     # as "<mission_id>: <what>". These are what a human should look at.
     notes: List[str] = field(default_factory=list)
+    # Files whose output (mission and, if scheduled, task) was already complete,
+    # so this run left them alone. Kept apart from `skipped` so that a rerun that
+    # did nothing because it was done cannot be mistaken for one that hit
+    # corrupt files, and callers need not parse a message to tell.
+    already_migrated: List[str] = field(default_factory=list)
 
 
 def task_id_for(mission_id: str) -> str:
@@ -78,9 +88,10 @@ def _unusable_schedule(schedule) -> Optional[str]:
     return None
 
 
-def _migrate_one(raw: dict, stem: str, now: str, tasks: TaskStore, report: SplitReport):
-    """(mission, task-or-None) for one raw legacy dict. Raises ValueError with a
-    reason when it cannot be migrated whole. Touches nothing on disk."""
+def _migrate_one(raw: dict, stem: str, now: str):
+    """(mission, task-or-None, notes) for one raw legacy dict. Raises ValueError
+    with a reason when it cannot be migrated whole. Touches nothing on disk; the
+    notes are the caller's to report only if the file is actually written."""
     mission_id = raw.get("mission_id")
     if mission_id != stem:
         raise ValueError(f"mission_id is {mission_id!r}, which does not match the file name")
@@ -131,8 +142,14 @@ def _migrate_one(raw: dict, stem: str, now: str, tasks: TaskStore, report: Split
 
     task = None
     if moved["schedule"]:
+        task_id = task_id_for(mission_id)
+        # "task-" + a 124..128 character mission id passes MISSION_ID_RE but not
+        # the task store's identical 128 limit, whose get_task would raise an
+        # HTTPException (not a ValueError) and end the whole run.
+        if not TASK_ID_RE.match(task_id):
+            raise ValueError(f"task id {task_id!r} is longer than 128 characters or otherwise invalid")
         task = MissionTask.model_validate({
-            "task_id": task_id_for(mission_id),
+            "task_id": task_id,
             "mission_id": mission_id,
             "site_id": mission.site_id,
             "robot_id": moved["robot_id"],
@@ -143,8 +160,6 @@ def _migrate_one(raw: dict, stem: str, now: str, tasks: TaskStore, report: Split
             "created_at": now,
             "updated_at": now,
         })
-        if tasks.get_task(task.task_id) is not None:
-            raise ValueError(f"task {task.task_id} already exists and is never overwritten")
         problem = _unusable_schedule(task.schedule)
         if problem:
             notes.append(f"{mission_id}: migrated, but the scheduler cannot use its schedule: {problem}")
@@ -155,8 +170,22 @@ def _migrate_one(raw: dict, stem: str, now: str, tasks: TaskStore, report: Split
         if moved["dispatch_rule"] and DispatchRule.model_validate(moved["dispatch_rule"]) != DispatchRule():
             notes.append(f"{mission_id}: non-default dispatch_rule not carried over (no schedule, so no task)")
 
-    report.notes.extend(notes)
-    return mission, task
+    return mission, task, notes
+
+
+def _same_dir(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def _same_assignment(existing: MissionTask, candidate: MissionTask) -> bool:
+    """Is a task already stored under this id the one this migration would
+    write? Compared on what the migration carries over, not on its stamps."""
+    return (
+        existing.mission_id == candidate.mission_id
+        and existing.robot_id == candidate.robot_id
+        and existing.schedule == candidate.schedule
+        and existing.dispatch_rule == candidate.dispatch_rule
+    )
 
 
 def split_missions(
@@ -165,6 +194,15 @@ def split_missions(
     out_dir: str,
     clock: Callable[[], str] = now_iso,
 ) -> SplitReport:
+    # "Never modifies the originals" is enforced here, not left to convention:
+    # `--out data/missions` would otherwise atomically replace every original
+    # with its migrated form, discarding what the new shape has no field for.
+    for label, directory in (("out_dir", out_dir), ("tasks_dir", tasks_dir)):
+        if _same_dir(directory, missions_dir):
+            raise ValueError(
+                f"{label} {directory!r} is the same directory as missions_dir {missions_dir!r}; "
+                "refusing, because the originals must never be written to"
+            )
     report = SplitReport()
     if not os.path.isdir(missions_dir):
         return report
@@ -180,19 +218,47 @@ def split_missions(
                 raw = json.load(handle)
             if not isinstance(raw, dict):
                 raise ValueError("not a JSON object")
-            mission, task = _migrate_one(raw, name[: -len(SUFFIX)], clock(), tasks, report)
+            mission, task, notes = _migrate_one(raw, name[: -len(SUFFIX)], clock())
+            existing = tasks.get_task(task.task_id) if task is not None else None
         except (OSError, ValueError) as exc:  # json errors and ValidationError are ValueErrors
-            reason = _brief(exc)
-            report.skipped.append(f"{name}: {reason}")
+            report.skipped.append(f"{name}: {_brief(exc)}")
             continue
+
+        # Work out which halves are missing rather than assuming a fresh run, so
+        # an interrupted migration (task written, mission not) is completed by a
+        # rerun instead of needing a file deleted by hand, and a finished one is
+        # left alone -- scheduled and unscheduled files alike.
+        if existing is not None and not _same_assignment(existing, task):
+            report.skipped.append(
+                f"{name}: task {task.task_id} already exists and is not this mission's own "
+                "assignment; never overwritten"
+            )
+            continue
+        write_task = task is not None and existing is None
+        write_mission = not os.path.isfile(os.path.join(out_dir, mission.mission_id + SUFFIX))
+        if not write_task and not write_mission:
+            report.already_migrated.append(name)
+            continue
+
         # Task first: a crash between the two leaves a task whose mission is
-        # missing (visible, and a rerun refuses to overwrite it), not a mission
-        # silently stripped of its schedule.
-        if task is not None:
-            tasks.put_task(task)
-            report.tasks += 1
-        missions.put(mission)
-        report.missions += 1
+        # missing, which the rerun above completes, not a mission silently
+        # stripped of its schedule.
+        try:
+            if write_task:
+                tasks.put_task(task)
+                report.tasks += 1
+            if write_mission:
+                missions.put(mission)
+                report.missions += 1
+        except OSError as exc:
+            report.skipped.append(f"{name}: write failed ({exc}); a rerun completes what is missing")
+            continue
+        report.notes.extend(notes)
+        if task is not None and not (write_task and write_mission):
+            report.notes.append(
+                f"{mission.mission_id}: completed an interrupted migration; wrote only the "
+                f"missing {'task' if write_task else 'mission'}"
+            )
     return report
 
 
@@ -208,10 +274,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--out", required=True, help="directory to write migrated missions to")
     parser.add_argument("--tasks", required=True, help="tasks directory to write new tasks into")
     args = parser.parse_args(argv)
-    report = split_missions(args.missions, args.tasks, args.out)
+    try:
+        report = split_missions(args.missions, args.tasks, args.out)
+    except ValueError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
     print(f"missions written: {report.missions}")
     print(f"tasks written:    {report.tasks}")
-    for label, items in (("skipped", report.skipped), ("notes", report.notes)):
+    for label, items in (
+        ("already migrated", report.already_migrated), ("skipped", report.skipped), ("notes", report.notes),
+    ):
         print(f"{label}: {len(items)}")
         for item in items:
             print(f"  - {item}")
