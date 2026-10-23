@@ -36,4 +36,13 @@ python-multipart>=0.0.9
 # roverhub-backend/. That's already the convention for every component here.
 -e ../shared
 
+# IANA timezone database for the stdlib `zoneinfo`, used by tasks/scheduler.py to
+# turn a schedule's wall-clock time + zone name ("Asia/Seoul") into a UTC instant.
+# Linux and macOS ship that database; Windows does not, and without this package
+# every ZoneInfo(...) call raises ZoneInfoNotFoundError -- on the Windows dev
+# machine, even ZoneInfo("UTC"). Data only, no code. Schedules store an IANA name
+# rather than an offset precisely so a 09:00 patrol survives a DST change, so
+# there is no offset-based way around needing it.
+tzdata>=2024.1
+
 # Optional: boto3, only when RUNS_BUCKET is set (runs/bucket.py imports it lazily).
