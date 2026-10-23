@@ -5,6 +5,9 @@ wrong is whether the loop is actually started at startup, stopped at shutdown,
 and built from the app's own registry and run store.
 """
 import asyncio
+import logging
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -44,6 +47,46 @@ def test_startup_runs_the_loop_and_shutdown_cancels_it(monkeypatch):
     assert fake.cancelled, "shutdown did not cancel the scheduler loop"
 
 
+def test_the_kill_switch_starts_no_task_and_logs_that(monkeypatch, caplog):
+    fake = _FakeLoop()
+    monkeypatch.setattr(app_module, "scheduler_loop", fake)
+    monkeypatch.setenv("SCHEDULER_ENABLED", "false")
+    _no_mqtt(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="roverhub.tasks"):
+        with TestClient(app_module.app) as client:
+            assert client.get("/healthz").status_code == 200
+    assert not fake.running
+    assert getattr(app_module.app.state, "scheduler_task", None) is None
+    assert "scheduler loop disabled" in caplog.text
+
+
+@pytest.mark.parametrize("value", [None, "", "true", "1", "yes", "on", "anything"])
+def test_the_loop_defaults_to_on_and_logs_that(monkeypatch, caplog, value):
+    fake = _FakeLoop()
+    monkeypatch.setattr(app_module, "scheduler_loop", fake)
+    if value is None:
+        monkeypatch.delenv("SCHEDULER_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("SCHEDULER_ENABLED", value)
+    _no_mqtt(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="roverhub.tasks"):
+        with TestClient(app_module.app):
+            assert fake.running
+    assert "scheduler loop started" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off", " Off "])
+def test_every_off_spelling_disables_it(monkeypatch, value):
+    fake = _FakeLoop()
+    monkeypatch.setattr(app_module, "scheduler_loop", fake)
+    monkeypatch.setenv("SCHEDULER_ENABLED", value)
+    _no_mqtt(monkeypatch)
+    with TestClient(app_module.app):
+        assert not fake.running
+
+
 def test_the_loop_is_built_from_the_apps_own_collaborators():
     loop = app_module.scheduler_loop
     assert isinstance(loop, SchedulerLoop)
@@ -57,3 +100,12 @@ def test_the_loop_is_built_from_the_apps_own_collaborators():
 def test_the_tasks_router_is_mounted():
     body = TestClient(app_module.app).get("/tasks").json()
     assert isinstance(body["items"], list)
+
+
+def test_the_publish_stub_says_what_is_missing():
+    # Unreachable while EXECUTOR_KINDS is empty; when someone makes it reachable
+    # the error must say why, not just that.
+    with pytest.raises(NotImplementedError) as exc:
+        app_module._publish_mission_start(None, None)
+    message = str(exc.value)
+    assert "CommandType" in message and "executor" in message

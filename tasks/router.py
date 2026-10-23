@@ -31,8 +31,8 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from shared.schemas.tasks import MissionSchedule, MissionTask, TaskOccurrence
-from tasks.scheduler import _parse_start
-from tasks.store import TaskStore, _parse_utc
+from tasks.scheduler import parse_start
+from tasks.store import TaskStore, parse_utc
 
 # A task is a few hundred bytes of fields plus, at most, a list of skip dates.
 # 64 KB is far beyond a realistic one while still bounding what an
@@ -73,7 +73,7 @@ def _bound(name: str, raw: str) -> str:
     """A `from`/`to` query value, repaired if a '+' offset was decoded to a space,
     and checked so a bad one is answered with *which* bound and why."""
     repaired = _PLUS_DECODED_TO_SPACE.sub(r"\1+\2", raw)
-    if _parse_utc(repaired) is None:
+    if parse_utc(repaired) is None:
         raise HTTPException(status_code=400, detail=(
             f"{name!r} is not an ISO 8601 timestamp: {raw!r}. "
             f"A '+' UTC offset must be percent-encoded as %2B in a URL."
@@ -107,7 +107,7 @@ def _schedule_problems(schedule: MissionSchedule) -> List[dict]:
             "type": "value_error",
         })
     try:
-        _parse_start(schedule.start_at)  # the one definition of what start_at means
+        parse_start(schedule.start_at)  # the one definition of what start_at means
     except ValueError as exc:
         problems.append({
             "loc": ["body", "schedule", "start_at"],
@@ -176,7 +176,11 @@ def build_tasks_router(tasks_dir: str, clock: Callable[[], str] = _now_iso) -> A
         if stored is not None and stored.version != task.version:
             # The stored entity, so the console can show what changed.
             return JSONResponse(status_code=409, content=stored.model_dump(mode="json"))
-        task = task.model_copy(update={"updated_at": clock(), "version": task.version + 1})
+        # A create is stored at the version it carries (1 by default): version 1
+        # is the first version, and a reader of the file expects that. Only a
+        # write to an existing task increments.
+        version = task.version if stored is None else task.version + 1
+        task = task.model_copy(update={"updated_at": clock(), "version": version})
         store.put_task(task)
         return task.model_dump(mode="json")
 
@@ -197,7 +201,7 @@ def build_tasks_router(tasks_dir: str, clock: Callable[[], str] = _now_iso) -> A
             raise HTTPException(status_code=409, detail=(
                 f"task is {task.status}; only an enabled task can be run"
             ))
-        now = _parse_utc(clock()).astimezone(timezone.utc)
+        now = parse_utc(clock()).astimezone(timezone.utc)
         due_at = f"{now:%Y-%m-%dT%H:%M:%SZ}"
         occurrence_id = f"{task.task_id}-{now:%Y%m%dT%H%M%SZ}"
         # Same id scheme as the scheduler's, to the second: a double click, or a

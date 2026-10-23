@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -24,6 +25,8 @@ from tasks.scheduler import EXECUTOR_KINDS, SchedulerLoop
 from tasks.store import DEFAULT_TASKS_DIR, TaskStore
 from shared.schemas.runs import MissionRun
 from shared.schemas.tasks import TaskOccurrence
+
+logger = logging.getLogger("roverhub.tasks")
 
 load_dotenv()  # loads .env in the working directory, if present; real env vars still win
 
@@ -87,7 +90,11 @@ def _publish_mission_start(occurrence: TaskOccurrence, run: MissionRun) -> None:
     # Unreachable today, because EXECUTOR_KINDS is empty and every occurrence is
     # skipped as `no_executor` before it gets here. Whoever adds a kind to
     # EXECUTOR_KINDS must replace this in the same change.
-    raise NotImplementedError("no command exists to start a mission on the edge yet")
+    raise NotImplementedError(
+        "cannot dispatch a scheduled mission: no mission-start CommandType exists in "
+        "shared/schemas/commands.py, so there is nothing to publish to the edge. The "
+        "executor plan defines it; add it before adding a kind to EXECUTOR_KINDS."
+    )
 
 
 # Its own MissionStore and TaskStore, not the routers': the directories are the
@@ -138,13 +145,24 @@ app.add_middleware(
 )
 
 
+def _scheduler_enabled() -> bool:
+    return os.environ.get("SCHEDULER_ENABLED", "").strip().lower() not in ("0", "false", "no", "off")
+
+
 @app.on_event("startup")
 async def _on_startup() -> None:
     mqtt_client.connect()
-    # Async so there is a running event loop to hang the task on. The tick does
-    # its file I/O on a worker thread (SchedulerLoop.run), so it does not stall
-    # requests.
-    app.state.scheduler_task = asyncio.create_task(scheduler_loop.run())
+    # SCHEDULER_ENABLED=false (or 0/no/off) turns the background loop off: it
+    # writes to TASKS_DIR every 30 s, which is not always wanted on a dev
+    # machine. Default on. Read here, not at import, so it is a startup decision.
+    if _scheduler_enabled():
+        # Async so there is a running event loop to hang the task on. The tick
+        # does its file I/O on a worker thread (SchedulerLoop.run), so it does
+        # not stall requests.
+        app.state.scheduler_task = asyncio.create_task(scheduler_loop.run())
+        logger.info("scheduler loop started (set SCHEDULER_ENABLED=false to disable)")
+    else:
+        logger.info("scheduler loop disabled by SCHEDULER_ENABLED; no occurrences will be materialised")
 
 
 @app.on_event("shutdown")
@@ -154,6 +172,7 @@ async def _on_shutdown() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        app.state.scheduler_task = None  # a later startup (or a test) must not see a stale one
     mqtt_client.disconnect()
 
 

@@ -53,7 +53,7 @@ SUFFIX = ".json"
 _M = TypeVar("_M", bound=BaseModel)
 
 
-def _parse_utc(stamp: str) -> Optional[datetime]:
+def parse_utc(stamp: str) -> Optional[datetime]:
     """UTC-aware datetime from an ISO string, or None if it is not one. A
     string with no offset is read as UTC, the convention for every `due_at`."""
     try:
@@ -178,8 +178,8 @@ class TaskStore:
         an offset-bearing bound still means what it says. An unparseable `due_at`
         cannot be placed in a window, so a bounded listing leaves it out rather
         than guessing; an unbounded one still returns it."""
-        lo = _parse_utc(start) if start is not None else None
-        hi = _parse_utc(end) if end is not None else None
+        lo = parse_utc(start) if start is not None else None
+        hi = parse_utc(end) if end is not None else None
         if (start is not None and lo is None) or (end is not None and hi is None):
             raise HTTPException(status_code=400, detail="invalid start or end")
         bounded = lo is not None or hi is not None
@@ -188,7 +188,7 @@ class TaskStore:
         for occ in self._occurrences.all():
             if site_id is not None and occ.site_id != site_id:
                 continue
-            due = _parse_utc(occ.due_at)
+            due = parse_utc(occ.due_at)
             if bounded:
                 if due is None or (lo is not None and due < lo) or (hi is not None and due >= hi):
                     continue

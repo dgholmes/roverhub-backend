@@ -39,7 +39,7 @@ from shared.schemas.runs import MissionRun
 from shared.schemas.tasks import (
     MissionSchedule, MissionTask, SkipReason, TaskOccurrence,
 )
-from tasks.store import TaskStore, _parse_utc
+from tasks.store import TaskStore, parse_utc
 
 logger = logging.getLogger("roverhub.tasks")
 
@@ -114,7 +114,7 @@ def _due_times(
     schedule: MissionSchedule, window_start: datetime, window_end: datetime,
 ) -> List[datetime]:
     """UTC instants in `[window_start, window_end)` at which `schedule` runs."""
-    start_date, start_time = _parse_start(schedule.start_at)
+    start_date, start_time = parse_start(schedule.start_at)
     zone = ZoneInfo(schedule.timezone)
     skip = set(schedule.skip_dates)
 
@@ -134,7 +134,7 @@ def _due_times(
     return due_times
 
 
-def _parse_start(start_at: str) -> tuple[date, time]:
+def parse_start(start_at: str) -> tuple[date, time]:
     match = _START_AT_RE.fullmatch(start_at)
     if match is None:
         raise ValueError(f"start_at {start_at!r} is not YYYY-MM-DDTHH:mm")
@@ -251,7 +251,7 @@ def decide(
     # late would be a different patrol.
     window = task.schedule.window_minutes if task.schedule is not None else None
     if window is not None:
-        due = _parse_utc(occ.due_at)
+        due = parse_utc(occ.due_at)
         if due is None:
             # Fail closed: a window that cannot be measured has not been met.
             return _skip("window_missed", (
@@ -473,7 +473,7 @@ class SchedulerLoop:
         for occ in everything:  # due_at order, as the store lists
             if occ.status not in ("scheduled", "due"):
                 continue
-            due = _parse_utc(occ.due_at)
+            due = parse_utc(occ.due_at)
             if due is None:
                 logger.warning(
                     "occurrence %s: due_at %r is not a valid time, leaving it alone",
