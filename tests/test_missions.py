@@ -25,7 +25,7 @@ def _client(tmp_path, clock=None):
 def _entry(mission_id="m-1", site_id="site-a", **extra):
     return {
         "mission_id": mission_id, "name": f"Patrol {mission_id}", "type": "patrol",
-        "library_status": "draft", "creator": "operator-dev",
+        "kind": "route", "creator": "operator-dev",
         "updated_at": "1999-01-01T00:00:00Z", "map_id": "map-1",
         "site_id": site_id, **extra,
     }
@@ -33,7 +33,7 @@ def _entry(mission_id="m-1", site_id="site-a", **extra):
 
 def test_put_creates_and_get_returns_it(tmp_path):
     client = _client(tmp_path)
-    put = client.put("/missions/m-1", json=_entry(program_state='{"blocks":{}}'))
+    put = client.put("/missions/m-1", json=_entry(kind="program", program_state='{"blocks":{}}'))
     assert put.status_code == 200
     assert put.json()["program_state"] == '{"blocks":{}}'
     assert (tmp_path / "m-1.json").is_file()
@@ -141,7 +141,7 @@ def test_invalid_body_is_422(tmp_path):
 
 def test_oversized_body_is_413(tmp_path):
     client = _client(tmp_path)
-    huge = _entry(program_state="x" * (MAX_MISSION_BYTES + 1))
+    huge = _entry(kind="program", program_state="x" * (MAX_MISSION_BYTES + 1))
     assert client.put("/missions/m-1", json=huge).status_code == 413
     assert not (tmp_path / "m-1.json").exists()
 

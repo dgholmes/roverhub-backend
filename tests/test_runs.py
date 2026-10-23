@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from runs.router import build_runs_router
 
 MISSION = {
-    "mission_id": "m-1", "name": "Patrol", "type": "patrol", "library_status": "draft",
+    "mission_id": "m-1", "name": "Patrol", "type": "patrol", "kind": "route",
     "creator": "x", "updated_at": "2026-10-15T00:00:00Z", "map_id": "map", "site_id": "site-a",
 }
 
