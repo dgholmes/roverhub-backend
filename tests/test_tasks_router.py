@@ -216,7 +216,7 @@ def test_delete_keeps_history_and_other_tasks_occurrences(tmp_path, caplog):
     store = TaskStore(str(tmp_path))
     ran = _occ("t-1", "2026-10-22T09:00:00Z", status="succeeded", run_id="t-1-20261022T090000Z")
     flying = _occ("t-1", "2026-10-23T09:00:00Z", status="running")
-    skipped = _occ("t-1", "2026-10-24T09:00:00Z", status="skipped", skip_reason="no_executor")
+    skipped = _occ("t-1", "2026-10-24T09:00:00Z", status="skipped", skip_reason="no_executor", run_id="r-3")
     other = _occ("t-2", "2026-10-25T09:00:00Z")
     for occ in (ran, flying, skipped, other):
         store.put_occurrence(occ)

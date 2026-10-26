@@ -211,14 +211,18 @@ def test_an_occurrence_of_a_task_no_longer_enabled_is_cancelled_not_dispatched(t
     assert world.published == []
 
 
-def test_an_occurrence_of_a_deleted_task_is_cancelled(tmp_path):
+def test_an_occurrence_of_a_deleted_task_is_removed_not_cancelled(tmp_path):
+    # Was "cancelled: the task was deleted" until the tick started pruning
+    # orphans: a cancelled row for a task that no longer exists is just debris.
+    # _handle's own deleted-task branch remains for the race where the task goes
+    # between the prune and the handle.
     world = _World(tmp_path, executor_kinds=frozenset({"program"}))
     occ = world.due()  # no task written
 
     world.loop.run_once(AT_DUE)
 
-    stored = world.store.get_occurrence(occ.occurrence_id)
-    assert stored.status == "cancelled" and "deleted" in stored.message
+    assert world.store.get_occurrence(occ.occurrence_id) is None
+    assert world.published == []
 
 
 def test_a_mission_the_library_rejects_does_not_stop_the_other_occurrences(tmp_path):
@@ -385,9 +389,13 @@ async def test_run_installs_and_removes_the_filter(tmp_path):
 # real, "Scheduled" future runs of an "Unknown mission". The tick now removes
 # only what nothing has acted on; see TaskStore.prune_orphan_occurrences.
 
-def test_the_tick_prunes_future_occurrences_of_a_deleted_task(tmp_path, caplog):
+def test_the_tick_prunes_unstarted_occurrences_of_a_deleted_task(tmp_path, caplog):
     world = _World(tmp_path)
     future = [world.due("ghost", f"2026-10-2{d}T09:00:00Z") for d in (5, 6, 7)]
+    # Past-dated debris counts too: scheduled, skipped and cancelled with no run.
+    future.append(world.due("ghost", "2026-10-22T09:00:00Z"))
+    future.append(world.due("ghost", "2026-10-21T09:00:00Z", status="skipped", skip_reason="no_executor"))
+    future.append(world.due("ghost", "2026-10-20T09:00:00Z", status="cancelled"))
 
     with caplog.at_level("WARNING", logger="roverhub.tasks"):
         world.loop.run_once(AT_DUE)
@@ -409,8 +417,8 @@ def test_the_tick_does_not_prune_a_live_tasks_future_occurrences(tmp_path):
 
 @pytest.mark.parametrize("extra", [
     {"status": "dispatched"}, {"status": "running"}, {"status": "succeeded"},
-    {"status": "failed"}, {"status": "skipped", "skip_reason": "no_executor"},
-    {"status": "cancelled"}, {"run_id": "run-1"},
+    {"status": "failed"}, {"status": "skipped", "run_id": "run-1"},
+    {"status": "cancelled", "run_id": "run-1"}, {"run_id": "run-1"},
 ])
 def test_the_tick_keeps_an_orphan_that_ran_or_was_decided(tmp_path, extra):
     world = _World(tmp_path)
@@ -426,7 +434,7 @@ def test_a_prune_failure_does_not_stop_the_tick(tmp_path, monkeypatch):
     world.task()
     occ = world.due()
 
-    def boom(now):
+    def boom():
         raise OSError("disk on fire")
     monkeypatch.setattr(world.store, "prune_orphan_occurrences", boom)
 

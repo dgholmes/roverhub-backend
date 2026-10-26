@@ -462,7 +462,7 @@ class SchedulerLoop:
 
     def run_once(self, now: datetime) -> None:
         now = _as_utc(now)
-        self._prune_orphans(now)
+        self._prune_orphans()
         self._materialise(now)
 
         everything = self._store.list_occurrences()
@@ -490,12 +490,12 @@ class SchedulerLoop:
                 # One bad record must not stop the other patrols on the site.
                 logger.exception("occurrence %s: could not be handled", occ.occurrence_id)
 
-    def _prune_orphans(self, now: datetime) -> None:
+    def _prune_orphans(self) -> None:
         # Before materialising, so the queue the rest of the tick reads is
         # already clean. The policy (what counts as an orphan, and what is
         # history that must stay) lives in TaskStore.prune_orphan_occurrences.
         try:
-            pruned = self._store.prune_orphan_occurrences(now)
+            pruned = self._store.prune_orphan_occurrences()
         except Exception:
             # Housekeeping must not stop the patrols that are due.
             logger.exception("could not prune orphaned occurrences")
@@ -504,7 +504,7 @@ class SchedulerLoop:
             # WARNING, not INFO: nothing configures logging, so INFO is dropped,
             # and a deletion the scheduler decided on its own must be visible.
             logger.warning(
-                "pruned %d unstarted occurrence(s) whose task no longer exists: %s",
+                "pruned %d never-started occurrence(s) whose task no longer exists: %s",
                 len(pruned), pruned,
             )
 

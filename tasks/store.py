@@ -50,15 +50,18 @@ TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 SUFFIX = ".json"
 
-# The only occurrence statuses that may ever be deleted automatically: a promise
-# nobody has acted on. "scheduled" has not come due; "due" has come due but the
-# scheduler has not decided it. Everything else is history or in flight --
-# "dispatched"/"running" may be referenced by a MissionRun, "succeeded"/"failed"
-# are what happened, and "skipped"/"cancelled" are the scheduler's recorded
-# decision and reason -- and is never removed by a cascade or a prune. A frozen
-# allowlist, not a denylist, so a status added later is kept until someone
-# decides otherwise.
-PRUNABLE_STATUSES = frozenset({"scheduled", "due"})
+# The only occurrence statuses that may ever be deleted automatically, and only
+# for a task that is gone and only with no `run_id`. All four are states in which
+# nothing was ever started: "scheduled" and "due" are promises nobody acted on,
+# and "skipped" and "cancelled" are the scheduler's decision *not* to run. With
+# the task and mission deleted and no MissionRun pointing at the occurrence there
+# is no history left in them -- they render as a run of a mission the operator
+# deleted. Everything else is kept: "dispatched"/"running" are in flight (there
+# is a window in the scheduler's `_dispatch` between that status write and the
+# run existing, and a stuck "dispatched" is a known gap), and "succeeded"/"failed"
+# are what happened. A frozen allowlist, not a denylist, so a status added later
+# is kept until someone decides otherwise.
+PRUNABLE_STATUSES = frozenset({"scheduled", "due", "skipped", "cancelled"})
 
 _M = TypeVar("_M", bound=BaseModel)
 
@@ -151,8 +154,9 @@ class _JsonDir(Generic[_M]):
 
 
 def _unstarted(occ: TaskOccurrence) -> bool:
-    """True only for an occurrence nothing has acted on. `run_id` is checked as
-    well as `status`: a run id means a run was created, whatever the status says."""
+    """True only for an occurrence that never started anything. `run_id` is
+    checked as well as `status`: a run id means a run was created, whatever the
+    status says, and that run is history."""
     return occ.status in PRUNABLE_STATUSES and occ.run_id is None
 
 
@@ -262,23 +266,19 @@ class TaskStore:
         `task_id`, never a prefix: "t-1" must not return "t-10"'s."""
         return [o for o in self.list_occurrences() if o.task_id == task_id]
 
-    def prune_orphan_occurrences(self, now: datetime) -> List[str]:
+    def prune_orphan_occurrences(self) -> List[str]:
         """Delete occurrences whose task no longer exists, and return their ids.
 
-        Deliberately narrower than "has no task": an occurrence goes only if it is
-        unstarted (`PRUNABLE_STATUSES`, no `run_id`) **and** its `due_at` is
-        strictly after `now`. One that has already come due is left for the
-        scheduler's own tick, which cancels it with a recorded reason ("the task
-        was deleted"); one with an unparseable `due_at` is left alone because it
-        cannot be placed in time. "No task" means no task *file*
-        (`task_exists`): a corrupt one is not a deleted one.
+        Narrower than "has no task": an occurrence goes only if it never started
+        anything (`PRUNABLE_STATUSES`, no `run_id`). `due_at` is irrelevant -- a
+        past-dated "skipped" row of a deleted task is the same debris as a future
+        "scheduled" one, and keeping it would bring the bug back a day later.
+        "No task" means no task *file* (`task_exists`): a corrupt one is not a
+        deleted one.
         """
         pruned: List[str] = []
         for occ in self.list_occurrences():
             if not _unstarted(occ):
-                continue
-            due = parse_utc(occ.due_at)
-            if due is None or due <= now:
                 continue
             try:
                 if os.path.isfile(self._tasks.path(occ.task_id)):

@@ -5,7 +5,7 @@ import pytest
 from fastapi import HTTPException
 
 from shared.schemas.tasks import MissionTask, TaskOccurrence
-from tasks.store import TaskStore, parse_utc
+from tasks.store import TaskStore
 
 
 def _task(task_id="t-1", site_id="site-a", **extra):
@@ -236,7 +236,7 @@ def test_task_exists_is_about_the_file_not_whether_it_parses(tmp_path):
     assert store.task_exists("../escape") is False  # an id the store rejects names no task
 
 
-@pytest.mark.parametrize("status", ["scheduled", "due"])
+@pytest.mark.parametrize("status", ["scheduled", "due", "skipped", "cancelled"])
 def test_delete_task_cascade_removes_unstarted_occurrences(tmp_path, status):
     store = TaskStore(str(tmp_path))
     store.put_task(_task("t-1"))
@@ -250,7 +250,7 @@ def test_delete_task_cascade_removes_unstarted_occurrences(tmp_path, status):
     assert store.get_occurrence(occ.occurrence_id) is None
 
 
-@pytest.mark.parametrize("status", ["dispatched", "running", "succeeded", "failed", "skipped", "cancelled"])
+@pytest.mark.parametrize("status", ["dispatched", "running", "succeeded", "failed"])
 def test_delete_task_cascade_keeps_history(tmp_path, status):
     store = TaskStore(str(tmp_path))
     store.put_task(_task("t-1"))
@@ -293,23 +293,58 @@ def test_delete_task_cascade_leaves_other_tasks_alone_and_is_idempotent(tmp_path
     assert store.get_occurrence(survivor.occurrence_id) == survivor
 
 
-NOW = parse_utc("2026-10-24T08:00:00Z")
-
-
-def test_prune_removes_future_unstarted_occurrences_of_a_missing_task(tmp_path):
+def test_prune_removes_unstarted_occurrences_of_a_missing_task_whatever_their_date(tmp_path):
     store = TaskStore(str(tmp_path))
-    gone = _occ("2026-10-25T09:00:00Z", task_id="ghost")
-    gone_due = _occ("2026-10-26T09:00:00Z", task_id="ghost", status="due")
-    store.put_occurrence(gone)
-    store.put_occurrence(gone_due)
+    gone = [
+        _occ("2026-10-25T09:00:00Z", task_id="ghost"),                                          # future
+        _occ("2026-10-26T09:00:00Z", task_id="ghost", status="due"),
+        _occ("2026-10-24T08:00:00Z", task_id="ghost"),                                          # due exactly now
+        _occ("2026-10-20T09:00:00Z", task_id="ghost"),                                          # long past
+        _occ("2026-10-21T09:00:00Z", task_id="ghost", status="skipped", skip_reason="no_executor"),
+        _occ("2026-10-22T09:00:00Z", task_id="ghost", status="cancelled", message="the task was deleted"),
+    ]
+    for occ in gone:
+        store.put_occurrence(occ)
 
-    pruned = store.prune_orphan_occurrences(NOW)
+    pruned = store.prune_orphan_occurrences()
 
-    assert sorted(pruned) == sorted([gone.occurrence_id, gone_due.occurrence_id])
+    assert sorted(pruned) == sorted(o.occurrence_id for o in gone)
     assert store.list_occurrences() == []
 
 
-def test_prune_keeps_everything_that_is_not_a_future_orphan(tmp_path):
+def test_a_past_dated_orphaned_skipped_occurrence_is_pruned(tmp_path):
+    # The bug's slow-motion return: yesterday's "scheduled" becomes "skipped",
+    # and must not become permanent debris labelled as a run of a deleted mission.
+    store = TaskStore(str(tmp_path))
+    occ = _occ("2026-10-23T06:00:00Z", task_id="ghost", status="skipped", skip_reason="no_executor")
+    store.put_occurrence(occ)
+
+    assert store.prune_orphan_occurrences() == [occ.occurrence_id]
+
+
+@pytest.mark.parametrize("status", ["skipped", "cancelled", "scheduled", "due"])
+def test_an_orphan_with_a_run_id_survives_whatever_its_status(tmp_path, status):
+    store = TaskStore(str(tmp_path))
+    occ = _occ("2026-10-23T06:00:00Z", task_id="ghost", status=status, run_id="run-1")
+    store.put_occurrence(occ)
+
+    assert store.prune_orphan_occurrences() == []
+    assert store.get_occurrence(occ.occurrence_id) == occ
+
+
+@pytest.mark.parametrize("status", ["dispatched", "running"])
+def test_an_orphaned_in_flight_occurrence_survives_even_with_no_run_id(tmp_path, status):
+    # `_dispatch` writes "dispatched" before the run exists: no run_id yet does
+    # not mean nothing started.
+    store = TaskStore(str(tmp_path))
+    occ = _occ("2026-10-25T06:00:00Z", task_id="ghost", status=status)
+    store.put_occurrence(occ)
+
+    assert store.prune_orphan_occurrences() == []
+    assert store.get_occurrence(occ.occurrence_id) == occ
+
+
+def test_prune_keeps_everything_that_is_not_an_unstarted_orphan(tmp_path):
     store = TaskStore(str(tmp_path))
     store.put_task(_task("t-1"))
     kept = [
@@ -318,26 +353,24 @@ def test_prune_keeps_everything_that_is_not_a_future_orphan(tmp_path):
         _occ("2026-10-25T10:00:00Z", task_id="ghost", status="running"),
         _occ("2026-10-25T11:00:00Z", task_id="ghost", status="succeeded"),    # history
         _occ("2026-10-25T12:00:00Z", task_id="ghost", status="failed"),
-        _occ("2026-10-25T13:00:00Z", task_id="ghost", status="skipped", skip_reason="no_executor"),
-        _occ("2026-10-25T14:00:00Z", task_id="ghost", status="cancelled"),
+        _occ("2026-10-25T13:00:00Z", task_id="ghost", status="skipped", run_id="run-2"),
+        _occ("2026-10-25T14:00:00Z", task_id="ghost", status="cancelled", run_id="run-3"),
         _occ("2026-10-25T15:00:00Z", task_id="ghost", run_id="run-1"),        # carries a run
-        _occ("2026-10-24T07:00:00Z", task_id="ghost"),                        # already came due: the tick decides it
-        _occ("2026-10-24T08:00:00Z", task_id="ghost"),                        # due exactly now is not "future"
     ]
     for occ in kept:
         store.put_occurrence(occ)
 
-    assert store.prune_orphan_occurrences(NOW) == []
+    assert store.prune_orphan_occurrences() == []
     assert sorted(o.occurrence_id for o in store.list_occurrences()) == sorted(o.occurrence_id for o in kept)
 
 
-def test_prune_leaves_an_occurrence_with_an_unparseable_due_at(tmp_path):
+def test_prune_does_not_need_a_parseable_due_at(tmp_path):
+    # due_at is irrelevant to an orphan that never started anything.
     store = TaskStore(str(tmp_path))
     odd = _occ("2026-10-25T09:00:00Z", task_id="ghost").model_copy(update={"due_at": "sometime"})
     store.put_occurrence(odd)
 
-    assert store.prune_orphan_occurrences(NOW) == []
-    assert store.get_occurrence(odd.occurrence_id) is not None
+    assert store.prune_orphan_occurrences() == [odd.occurrence_id]
 
 
 def test_prune_does_not_mistake_an_unreadable_task_file_for_a_deleted_task(tmp_path):
@@ -346,7 +379,7 @@ def test_prune_does_not_mistake_an_unreadable_task_file_for_a_deleted_task(tmp_p
     occ = _occ("2026-10-25T09:00:00Z", task_id="t-1")
     store.put_occurrence(occ)
 
-    assert store.prune_orphan_occurrences(NOW) == []
+    assert store.prune_orphan_occurrences() == []
     assert store.get_occurrence(occ.occurrence_id) == occ
 
 
@@ -355,5 +388,5 @@ def test_prune_skips_an_occurrence_whose_task_id_the_store_rejects(tmp_path):
     occ = _occ("2026-10-25T09:00:00Z", task_id="ghost").model_copy(update={"task_id": "../x"})
     store.put_occurrence(occ)
 
-    assert store.prune_orphan_occurrences(NOW) == []
+    assert store.prune_orphan_occurrences() == []
     assert store.get_occurrence(occ.occurrence_id) is not None
