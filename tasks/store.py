@@ -27,7 +27,7 @@ import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Generic, List, Optional, Type, TypeVar
+from typing import Generic, List, NamedTuple, Optional, Type, TypeVar
 
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -49,6 +49,16 @@ DEFAULT_TASKS_DIR = str(Path(__file__).resolve().parents[1] / "data" / "tasks")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 SUFFIX = ".json"
+
+# The only occurrence statuses that may ever be deleted automatically: a promise
+# nobody has acted on. "scheduled" has not come due; "due" has come due but the
+# scheduler has not decided it. Everything else is history or in flight --
+# "dispatched"/"running" may be referenced by a MissionRun, "succeeded"/"failed"
+# are what happened, and "skipped"/"cancelled" are the scheduler's recorded
+# decision and reason -- and is never removed by a cascade or a prune. A frozen
+# allowlist, not a denylist, so a status added later is kept until someone
+# decides otherwise.
+PRUNABLE_STATUSES = frozenset({"scheduled", "due"})
 
 _M = TypeVar("_M", bound=BaseModel)
 
@@ -140,6 +150,19 @@ class _JsonDir(Generic[_M]):
             return False
 
 
+def _unstarted(occ: TaskOccurrence) -> bool:
+    """True only for an occurrence nothing has acted on. `run_id` is checked as
+    well as `status`: a run id means a run was created, whatever the status says."""
+    return occ.status in PRUNABLE_STATUSES and occ.run_id is None
+
+
+class CascadeResult(NamedTuple):
+    """What `delete_task_cascade` did, as occurrence ids, so a caller can log it."""
+    task_deleted: bool
+    occurrences_deleted: List[str]
+    occurrences_kept: List[str]
+
+
 class TaskStore:
     def __init__(self, tasks_dir: str):
         self._tasks = _JsonDir(os.path.join(tasks_dir, "tasks"), MissionTask, "task_id")
@@ -162,6 +185,35 @@ class TaskStore:
 
     def delete_task(self, task_id: str) -> bool:
         return self._tasks.delete(task_id)
+
+    def task_exists(self, task_id: str) -> bool:
+        """Whether a task *file* is present -- not whether it parses. `get_task`
+        answers None for a corrupt file, and a corrupt file is not a deleted
+        task: anything that deletes on "the task is gone" must ask this instead.
+        An id the store rejects names no task."""
+        try:
+            return os.path.isfile(self._tasks.path(task_id))
+        except HTTPException:
+            return False
+
+    def delete_task_cascade(self, task_id: str) -> CascadeResult:
+        """Delete a task and the occurrences that never started. The task file
+        goes first, so a crash part-way leaves orphans (which `prune_orphan_occurrences`
+        finishes) rather than a live task with half its queue. Occurrences that
+        started or were decided stay, by `PRUNABLE_STATUSES`. Idempotent: for a
+        task that is already gone it still clears whatever unstarted occurrences
+        it left behind."""
+        task_deleted = self._tasks.delete(task_id)
+        deleted: List[str] = []
+        kept: List[str] = []
+        for occ in self.occurrences_for_task(task_id):
+            if _unstarted(occ):
+                # A concurrent delete is not a failure of this one.
+                self._occurrences.delete(occ.occurrence_id)
+                deleted.append(occ.occurrence_id)
+            else:
+                kept.append(occ.occurrence_id)
+        return CascadeResult(task_deleted, deleted, kept)
 
     # -- occurrences ---------------------------------------------------------
 
@@ -201,3 +253,38 @@ class TaskStore:
 
     def put_occurrence(self, occ: TaskOccurrence) -> None:
         self._occurrences.put(occ)
+
+    def delete_occurrence(self, occurrence_id: str) -> bool:
+        return self._occurrences.delete(occurrence_id)
+
+    def occurrences_for_task(self, task_id: str) -> List[TaskOccurrence]:
+        """Every readable occurrence of one task, oldest first. Exact match on
+        `task_id`, never a prefix: "t-1" must not return "t-10"'s."""
+        return [o for o in self.list_occurrences() if o.task_id == task_id]
+
+    def prune_orphan_occurrences(self, now: datetime) -> List[str]:
+        """Delete occurrences whose task no longer exists, and return their ids.
+
+        Deliberately narrower than "has no task": an occurrence goes only if it is
+        unstarted (`PRUNABLE_STATUSES`, no `run_id`) **and** its `due_at` is
+        strictly after `now`. One that has already come due is left for the
+        scheduler's own tick, which cancels it with a recorded reason ("the task
+        was deleted"); one with an unparseable `due_at` is left alone because it
+        cannot be placed in time. "No task" means no task *file*
+        (`task_exists`): a corrupt one is not a deleted one.
+        """
+        pruned: List[str] = []
+        for occ in self.list_occurrences():
+            if not _unstarted(occ):
+                continue
+            due = parse_utc(occ.due_at)
+            if due is None or due <= now:
+                continue
+            try:
+                if os.path.isfile(self._tasks.path(occ.task_id)):
+                    continue
+            except HTTPException:  # a task_id the store rejects: not ours to judge
+                continue
+            self._occurrences.delete(occ.occurrence_id)
+            pruned.append(occ.occurrence_id)
+        return pruned

@@ -20,7 +20,8 @@ Endpoints:
 - GET    /missions/{id}        -> entry, 404 if unknown
 - PUT    /missions/{id}        -> create or replace; server stamps updated_at and
                                   version; 409 (with the stored entry) on a stale version
-- DELETE /missions/{id}        -> 204, 404 if unknown
+- DELETE /missions/{id}        -> 204, 404 if unknown; also deletes the mission's tasks and
+                                  their unstarted occurrences (history is kept) and logs it
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ from pydantic import ValidationError
 
 from api.common import now_iso, read_bounded_body
 from shared.schemas.missions import MissionLibraryEntry
+from tasks.store import TaskStore
 
 logger = logging.getLogger("roverhub.missions")
 
@@ -141,11 +143,21 @@ class MissionStore:
             return False
 
 
-def build_missions_router(missions_dir: str, clock: Callable[[], str] = now_iso) -> APIRouter:
+def build_missions_router(
+    missions_dir: str,
+    clock: Callable[[], str] = now_iso,
+    tasks_dir: Optional[str] = None,
+) -> APIRouter:
     """`clock` returns the UTC ISO string stamped into `updated_at`; injectable
-    so ordering is testable."""
+    so ordering is testable.
+
+    `tasks_dir` is where deleting a mission also deletes its tasks. It is
+    deliberately not defaulted to the real tasks directory: a router built over a
+    temp missions directory (every test) must never reach into `data/tasks`.
+    api/app.py passes it; with None, a delete touches the mission only."""
     router = APIRouter()
     store = MissionStore(missions_dir)
+    task_store = TaskStore(tasks_dir) if tasks_dir is not None else None
 
     @router.get("/missions")
     def list_missions(site_id: Optional[str] = None):
@@ -192,6 +204,30 @@ def build_missions_router(missions_dir: str, clock: Callable[[], str] = now_iso)
 
     @router.delete("/missions/{mission_id}", status_code=204)
     def delete_mission(mission_id: str):
+        store._path(mission_id)  # a bad id is a 400 before anything is touched
+        # Tasks first, then the mission file: a crash in between leaves a mission
+        # with no tasks (harmless) rather than tasks with no mission (which the
+        # calendar renders as "Unknown mission"). Runs even when the mission is
+        # already gone, so a retry cleans tasks an earlier delete orphaned.
+        removed_tasks = []
+        if task_store is not None:
+            for task in task_store.list_tasks():
+                if task.mission_id != mission_id:
+                    continue
+                result = task_store.delete_task_cascade(task.task_id)
+                removed_tasks.append((task.task_id, result))
+        if removed_tasks:
+            # WARNING, not INFO: nothing configures logging, so INFO is dropped,
+            # and a cascade that deletes files should never be invisible.
+            logger.warning(
+                "deleted mission %s: removed task(s) %s; removed %d unstarted occurrence(s) %s; "
+                "kept %d that started or were decided %s",
+                mission_id, [t for t, _ in removed_tasks],
+                sum(len(r.occurrences_deleted) for _, r in removed_tasks),
+                [o for _, r in removed_tasks for o in r.occurrences_deleted],
+                sum(len(r.occurrences_kept) for _, r in removed_tasks),
+                [o for _, r in removed_tasks for o in r.occurrences_kept],
+            )
         if not store.delete(mission_id):
             raise HTTPException(status_code=404, detail="mission not found")
         return Response(status_code=204)

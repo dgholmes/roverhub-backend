@@ -187,6 +187,60 @@ def test_delete_then_404(tmp_path):
     assert client.get("/tasks/t-1").status_code == 404
 
 
+def _occ(task_id, due_at, **extra):
+    compact = due_at.replace("-", "").replace(":", "")
+    return TaskOccurrence(
+        occurrence_id=f"{task_id}-{compact}", task_id=task_id, mission_id="m-1",
+        site_id="site-a", robot_id="robot-1", due_at=due_at, **extra,
+    )
+
+
+def test_delete_removes_the_tasks_unstarted_occurrences(tmp_path, caplog):
+    client = _client(tmp_path)
+    client.put("/tasks/t-1", json=_task())
+    store = TaskStore(str(tmp_path))
+    store.put_occurrence(_occ("t-1", "2026-10-25T09:00:00Z"))
+    store.put_occurrence(_occ("t-1", "2026-10-26T09:00:00Z", status="due"))
+
+    with caplog.at_level("WARNING", logger="roverhub.tasks"):
+        assert client.delete("/tasks/t-1").status_code == 204
+
+    assert store.list_occurrences() == []
+    # Not silent: what went is in the log, with its ids.
+    assert "t-1" in caplog.text and "t-1-20261025T090000Z" in caplog.text
+
+
+def test_delete_keeps_history_and_other_tasks_occurrences(tmp_path, caplog):
+    client = _client(tmp_path)
+    client.put("/tasks/t-1", json=_task())
+    store = TaskStore(str(tmp_path))
+    ran = _occ("t-1", "2026-10-22T09:00:00Z", status="succeeded", run_id="t-1-20261022T090000Z")
+    flying = _occ("t-1", "2026-10-23T09:00:00Z", status="running")
+    skipped = _occ("t-1", "2026-10-24T09:00:00Z", status="skipped", skip_reason="no_executor")
+    other = _occ("t-2", "2026-10-25T09:00:00Z")
+    for occ in (ran, flying, skipped, other):
+        store.put_occurrence(occ)
+
+    with caplog.at_level("WARNING", logger="roverhub.tasks"):
+        assert client.delete("/tasks/t-1").status_code == 204
+
+    assert {o.occurrence_id for o in store.list_occurrences()} == {
+        ran.occurrence_id, flying.occurrence_id, skipped.occurrence_id, other.occurrence_id,
+    }
+    assert "kept 3" in caplog.text  # the log says history was left, not just what went
+
+
+def test_delete_of_an_already_deleted_task_still_clears_its_leftovers(tmp_path):
+    # The state the owner's data is in: no task, occurrences left behind.
+    client = _client(tmp_path)
+    store = TaskStore(str(tmp_path))
+    store.put_occurrence(_occ("ghost", "2026-10-25T09:00:00Z"))
+
+    assert client.delete("/tasks/ghost").status_code == 404  # contract unchanged: it was not there
+    assert store.list_occurrences() == []
+    assert client.delete("/tasks/ghost").status_code == 404  # and idempotent
+
+
 # -- validation the schema cannot do ------------------------------------------
 
 def test_a_real_timezone_and_start_at_are_accepted(tmp_path):

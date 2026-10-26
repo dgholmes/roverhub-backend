@@ -59,10 +59,13 @@ app.include_router(build_snapshot_router(
     snapshots_dir=os.environ.get("SNAPSHOTS_DIR", DEFAULT_SNAPSHOTS_DIR),
     site_lookup=_site_for,
 ))
+_tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)
 # Missions authored in the console, stored as one JSON file each so they
 # survive a refresh and are shared between browsers. See missions/router.py.
+# `tasks_dir` is what lets deleting a mission delete its tasks too.
 app.include_router(build_missions_router(
     missions_dir=os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR),
+    tasks_dir=_tasks_dir,
 ))
 # Mission run records: one folder per run (run-records spec §6). See runs/.
 # The copier shares the router's own RunStore so its per-run locks coordinate
@@ -76,7 +79,6 @@ _copier = bucket_from_env(runs_router.store)
 app.include_router(runs_router)
 # Mission tasks (a mission assigned to a robot on a schedule) and the occurrence
 # queue the scheduler materialises from them. See tasks/router.py.
-_tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)
 
 
 def _scheduler_enabled() -> bool:

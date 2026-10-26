@@ -377,3 +377,59 @@ async def test_run_installs_and_removes_the_filter(tmp_path):
         await task
 
     assert logger.filters == before
+
+
+# -- orphaned occurrences (2026-10-26) ----------------------------------------
+#
+# Deleting a task used to leave its queue behind, and the calendar showed it as
+# real, "Scheduled" future runs of an "Unknown mission". The tick now removes
+# only what nothing has acted on; see TaskStore.prune_orphan_occurrences.
+
+def test_the_tick_prunes_future_occurrences_of_a_deleted_task(tmp_path, caplog):
+    world = _World(tmp_path)
+    future = [world.due("ghost", f"2026-10-2{d}T09:00:00Z") for d in (5, 6, 7)]
+
+    with caplog.at_level("WARNING", logger="roverhub.tasks"):
+        world.loop.run_once(AT_DUE)
+
+    for occ in future:
+        assert world.store.get_occurrence(occ.occurrence_id) is None
+    assert "ghost-20261025T090000Z" in caplog.text  # not silent
+
+
+def test_the_tick_does_not_prune_a_live_tasks_future_occurrences(tmp_path):
+    world = _World(tmp_path)
+    world.task("t-1")
+    occ = world.due("t-1", "2026-10-25T09:00:00Z")
+
+    world.loop.run_once(AT_DUE)
+
+    assert world.store.get_occurrence(occ.occurrence_id) == occ
+
+
+@pytest.mark.parametrize("extra", [
+    {"status": "dispatched"}, {"status": "running"}, {"status": "succeeded"},
+    {"status": "failed"}, {"status": "skipped", "skip_reason": "no_executor"},
+    {"status": "cancelled"}, {"run_id": "run-1"},
+])
+def test_the_tick_keeps_an_orphan_that_ran_or_was_decided(tmp_path, extra):
+    world = _World(tmp_path)
+    occ = world.due("ghost", "2026-10-25T09:00:00Z", **extra)
+
+    world.loop.run_once(AT_DUE)
+
+    assert world.store.get_occurrence(occ.occurrence_id) == occ
+
+
+def test_a_prune_failure_does_not_stop_the_tick(tmp_path, monkeypatch):
+    world = _World(tmp_path, executor_kinds=frozenset({"program"}))
+    world.task()
+    occ = world.due()
+
+    def boom(now):
+        raise OSError("disk on fire")
+    monkeypatch.setattr(world.store, "prune_orphan_occurrences", boom)
+
+    world.loop.run_once(AT_DUE)
+
+    assert world.store.get_occurrence(occ.occurrence_id).status == "running"

@@ -5,6 +5,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from missions.router import MAX_MISSION_BYTES, build_missions_router
+from shared.schemas.tasks import MissionTask, TaskOccurrence
+from tasks.store import TaskStore
 
 
 class _Clock:
@@ -204,3 +206,78 @@ def test_put_with_a_version_ahead_of_the_stored_one_is_also_409(tmp_path):
     client = _client(tmp_path)
     client.put("/missions/m-1", json=_entry())
     assert client.put("/missions/m-1", json={**_entry(), "version": 99}).status_code == 409
+
+
+# -- deleting a mission cascades to its tasks and their queue (2026-10-26) -----
+
+def _cascade_client(tmp_path):
+    app = FastAPI()
+    app.include_router(build_missions_router(
+        str(tmp_path / "missions"), clock=_Clock(), tasks_dir=str(tmp_path / "tasks"),
+    ))
+    return TestClient(app), TaskStore(str(tmp_path / "tasks"))
+
+
+def _task(task_id, mission_id):
+    return MissionTask(
+        task_id=task_id, mission_id=mission_id, site_id="site-a", robot_id="robot-1",
+        created_by="operator-dev", created_at="2026-10-23T00:00:00Z",
+        updated_at="2026-10-23T00:00:00Z",
+    )
+
+
+def _occ(task_id, mission_id, due_at, **extra):
+    compact = due_at.replace("-", "").replace(":", "")
+    return TaskOccurrence(
+        occurrence_id=f"{task_id}-{compact}", task_id=task_id, mission_id=mission_id,
+        site_id="site-a", robot_id="robot-1", due_at=due_at, **extra,
+    )
+
+
+def test_deleting_a_mission_deletes_its_tasks_and_their_unstarted_occurrences(tmp_path, caplog):
+    client, tasks = _cascade_client(tmp_path)
+    client.put("/missions/m-1", json=_entry("m-1"))
+    client.put("/missions/m-2", json=_entry("m-2"))
+    for task_id, mission_id in (("t-1", "m-1"), ("t-2", "m-1"), ("t-3", "m-2")):
+        tasks.put_task(_task(task_id, mission_id))
+        tasks.put_occurrence(_occ(task_id, mission_id, "2026-10-25T09:00:00Z"))
+
+    with caplog.at_level("WARNING", logger="roverhub.missions"):
+        assert client.delete("/missions/m-1").status_code == 204
+
+    assert [t.task_id for t in tasks.list_tasks()] == ["t-3"]
+    assert [o.task_id for o in tasks.list_occurrences()] == ["t-3"]
+    assert client.get("/missions/m-2").status_code == 200
+    assert "m-1" in caplog.text and "t-1" in caplog.text and "t-2" in caplog.text
+
+
+def test_deleting_a_mission_keeps_its_runs_history(tmp_path):
+    client, tasks = _cascade_client(tmp_path)
+    client.put("/missions/m-1", json=_entry("m-1"))
+    tasks.put_task(_task("t-1", "m-1"))
+    ran = _occ("t-1", "m-1", "2026-10-22T09:00:00Z", status="succeeded", run_id="r-1")
+    flying = _occ("t-1", "m-1", "2026-10-23T09:00:00Z", status="running", run_id="r-2")
+    for occ in (ran, flying):
+        tasks.put_occurrence(occ)
+
+    assert client.delete("/missions/m-1").status_code == 204
+
+    assert tasks.get_task("t-1") is None
+    assert {o.occurrence_id for o in tasks.list_occurrences()} == {ran.occurrence_id, flying.occurrence_id}
+
+
+def test_deleting_an_unknown_mission_cleans_leftover_tasks_and_is_still_404(tmp_path):
+    client, tasks = _cascade_client(tmp_path)
+    tasks.put_task(_task("t-1", "gone"))
+    tasks.put_occurrence(_occ("t-1", "gone", "2026-10-25T09:00:00Z"))
+
+    assert client.delete("/missions/gone").status_code == 404
+    assert tasks.list_tasks() == [] and tasks.list_occurrences() == []
+    assert client.delete("/missions/gone").status_code == 404
+
+
+def test_without_a_tasks_dir_deleting_a_mission_touches_no_tasks(tmp_path):
+    # The default must not reach for the real data/tasks.
+    client = _client(tmp_path)
+    client.put("/missions/m-1", json=_entry())
+    assert client.delete("/missions/m-1").status_code == 204

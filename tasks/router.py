@@ -15,12 +15,14 @@ Endpoints:
 - GET    /tasks/occurrences?from=&to=[&site_id=]  -> {"items": [occurrence, ...]}, by due_at
 - GET    /tasks/{id}                              -> task, 404 if unknown
 - PUT    /tasks/{id}                              -> create or replace; 409 on a stale version
-- DELETE /tasks/{id}                              -> 204, 404 if unknown
+- DELETE /tasks/{id}                              -> 204, 404 if unknown; also deletes the task's
+                                                    unstarted occurrences (history is kept) and logs both
 - POST   /tasks/{id}/run-now                      -> 202 with the queued occurrence
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import timezone
 from typing import Callable, List, Optional
@@ -34,6 +36,8 @@ from api.common import now_iso, read_bounded_body
 from shared.schemas.tasks import MissionSchedule, MissionTask, TaskOccurrence
 from tasks.scheduler import parse_start
 from tasks.store import TaskStore, parse_utc
+
+logger = logging.getLogger("roverhub.tasks")
 
 # A task is a few hundred bytes of fields plus, at most, a list of skip dates.
 # 64 KB is far beyond a realistic one while still bounding what an
@@ -182,7 +186,20 @@ def build_tasks_router(
 
     @router.delete("/tasks/{task_id}", status_code=204)
     def delete_task(task_id: str):
-        if not store.delete_task(task_id):
+        # Runs even for a task that is already gone, so a retry (or a delete of
+        # an id whose file was removed some other way) still clears the unstarted
+        # occurrences it left behind. The 404 contract is unchanged.
+        result = store.delete_task_cascade(task_id)
+        if result.occurrences_deleted or result.occurrences_kept:
+            # WARNING, not INFO: nothing configures logging, so INFO is dropped,
+            # and a cascade that deletes files should never be invisible.
+            logger.warning(
+                "deleted task %s: removed %d unstarted occurrence(s) %s; kept %d that "
+                "started or were decided %s",
+                task_id, len(result.occurrences_deleted), result.occurrences_deleted,
+                len(result.occurrences_kept), result.occurrences_kept,
+            )
+        if not result.task_deleted:
             raise HTTPException(status_code=404, detail="task not found")
         return Response(status_code=204)
 
