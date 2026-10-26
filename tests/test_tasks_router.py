@@ -453,3 +453,64 @@ def test_run_now_refuses_a_task_that_is_not_enabled(tmp_path, status):
     assert response.status_code == 409
     assert status in response.json()["detail"]
     assert TaskStore(str(tmp_path)).list_occurrences() == []
+
+
+# -- an edit re-plans the task's runs ----------------------------------------
+
+def _planned(store, task_id="t-1"):
+    return sorted((o.due_at, o.robot_id) for o in store.occurrences_for_task(task_id) if o.status == "scheduled")
+
+
+def test_saving_a_task_plans_its_runs_at_once(tmp_path):
+    client = _client(tmp_path)
+    assert client.put("/tasks/t-1", json=_task(schedule=_schedule())).status_code == 200
+    planned = _planned(TaskStore(str(tmp_path)))
+    # Daily 09:00 Seoul is 00:00Z; the calendar has them before the scheduler's first tick.
+    assert planned and all(due.endswith("T00:00:00Z") and robot == "robot-1" for due, robot in planned)
+
+
+def test_editing_a_task_replaces_the_runs_planned_from_its_old_version(tmp_path, caplog):
+    client = _client(tmp_path)
+    created = client.put("/tasks/t-1", json=_task(schedule=_schedule())).json()
+    edited = {**created, "robot_id": "robot-2", "schedule": _schedule(start_at="2026-10-24T10:00")}
+    with caplog.at_level("WARNING", logger="roverhub.tasks"):
+        assert client.put("/tasks/t-1", json=edited).status_code == 200
+
+    planned = _planned(TaskStore(str(tmp_path)))
+    # No run is left at the old time or under the old robot.
+    assert planned and all(due.endswith("T01:00:00Z") and robot == "robot-2" for due, robot in planned)
+    assert "replaced" in caplog.text
+
+
+def test_an_edit_keeps_runs_that_were_decided_started_or_already_due(tmp_path):
+    client = _client(tmp_path)
+    created = client.put("/tasks/t-1", json=_task(schedule=_schedule())).json()
+    store = TaskStore(str(tmp_path))
+    past = _occ("t-1", "2026-10-22T09:00:00Z")  # before the clock's "now": the scheduler's to decide
+    skipped = _occ("t-1", "2026-10-30T05:00:00Z", status="skipped", skip_reason="no_executor")
+    queued = _occ("t-1", "2026-10-30T06:00:00Z", status="due")
+    for occ in (past, skipped, queued):
+        store.put_occurrence(occ)
+
+    client.put("/tasks/t-1", json={**created, "schedule": None})
+
+    left = {o.occurrence_id for o in store.occurrences_for_task("t-1")}
+    assert left == {past.occurrence_id, skipped.occurrence_id, queued.occurrence_id}
+
+
+def test_removing_a_tasks_schedule_clears_what_it_had_planned(tmp_path):
+    client = _client(tmp_path)
+    created = client.put("/tasks/t-1", json=_task(schedule=_schedule())).json()
+    assert _planned(TaskStore(str(tmp_path)))
+    client.put("/tasks/t-1", json={**created, "schedule": None})
+    assert _planned(TaskStore(str(tmp_path))) == []
+
+
+def test_an_edit_leaves_other_tasks_runs_alone(tmp_path):
+    client = _client(tmp_path)
+    created = client.put("/tasks/t-1", json=_task(schedule=_schedule())).json()
+    store = TaskStore(str(tmp_path))
+    other = _occ("t-10", "2026-10-30T00:00:00Z")
+    store.put_occurrence(other)
+    client.put("/tasks/t-1", json={**created, "schedule": None})
+    assert store.get_occurrence(other.occurrence_id) is not None

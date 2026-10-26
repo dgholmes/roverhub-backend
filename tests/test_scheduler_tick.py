@@ -441,3 +441,35 @@ def test_a_prune_failure_does_not_stop_the_tick(tmp_path, monkeypatch):
     world.loop.run_once(AT_DUE)
 
     assert world.store.get_occurrence(occ.occurrence_id).status == "running"
+
+
+# -- planned runs the task no longer plans ------------------------------------
+
+def test_the_tick_drops_a_planned_run_at_a_time_the_task_no_longer_plans(tmp_path, caplog):
+    w = _World(tmp_path)
+    w.task()  # daily 18:00 Seoul = 09:00Z
+    old = w.due(due_at="2026-10-25T06:00:00Z")  # planned before the time was moved
+    with caplog.at_level("WARNING", logger="roverhub.tasks"):
+        w.loop.run_once(BEFORE)
+    assert w.store.get_occurrence(old.occurrence_id) is None
+    assert w.store.get_occurrence("t-1-20261025T090000Z") is not None
+    assert old.occurrence_id in caplog.text
+
+
+def test_the_tick_replans_a_run_planned_under_the_old_robot(tmp_path):
+    w = _World(tmp_path)
+    w.task(robot_id="robot-1")
+    w.due(due_at="2026-10-25T09:00:00Z", robot_id=None)
+    w.loop.run_once(BEFORE)
+    assert w.store.get_occurrence("t-1-20261025T090000Z").robot_id == "robot-1"
+
+
+def test_the_tick_leaves_a_paused_tasks_and_decided_runs_alone(tmp_path):
+    w = _World(tmp_path)
+    w.task(task_id="t-1", status="paused")
+    paused = w.due(task_id="t-1", due_at="2026-10-25T06:00:00Z")
+    w.task(task_id="t-2")
+    decided = w.due(task_id="t-2", due_at="2026-10-25T06:00:00Z", status="skipped", skip_reason="no_executor")
+    w.loop.run_once(BEFORE)
+    assert w.store.get_occurrence(paused.occurrence_id) is not None
+    assert w.store.get_occurrence(decided.occurrence_id) is not None

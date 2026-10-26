@@ -34,7 +34,7 @@ from pydantic import ValidationError
 
 from api.common import now_iso, read_bounded_body
 from shared.schemas.tasks import MissionSchedule, MissionTask, TaskOccurrence
-from tasks.scheduler import parse_start
+from tasks.scheduler import materialise, parse_start
 from tasks.store import TaskStore, parse_utc
 
 logger = logging.getLogger("roverhub.tasks")
@@ -180,9 +180,34 @@ def build_tasks_router(
         # existing task increments. (There is nothing stored to compare a create
         # against, so a stale client re-creating a deleted task starts over.)
         version = 1 if stored is None else task.version + 1
-        task = task.model_copy(update={"updated_at": clock(), "version": version})
+        stamp = clock()
+        task = task.model_copy(update={"updated_at": stamp, "version": version})
         store.put_task(task)
+        _replan(task, stamp)
         return task.model_dump(mode="json")
+
+    def _replan(task: MissionTask, stamp: str) -> None:
+        # The runs already planned were worked out from the task as it was: an
+        # edit that moves the time or changes the robot would otherwise leave
+        # the old runs on the calendar, under the old robot, until they came due.
+        # Plan again now, with the scheduler's own materialise, so the calendar
+        # is right the moment the save returns rather than on the next tick.
+        # The scheduler's loop never overwrites, so the two cannot disagree.
+        now = parse_utc(stamp)
+        if now is None:
+            return
+        dropped = store.drop_planned_occurrences(task.task_id, now)
+        added = []
+        for occ in materialise([task], now):
+            if store.get_occurrence(occ.occurrence_id) is None:
+                store.put_occurrence(occ)
+                added.append(occ.occurrence_id)
+        if dropped:
+            # WARNING, like the delete cascade: deleting files must not be silent.
+            logger.warning(
+                "task %s changed: replaced %d planned occurrence(s) %s with %d %s",
+                task.task_id, len(dropped), dropped, len(added), added,
+            )
 
     @router.delete("/tasks/{task_id}", status_code=204)
     def delete_task(task_id: str):

@@ -219,6 +219,21 @@ class TaskStore:
                 kept.append(occ.occurrence_id)
         return CascadeResult(task_deleted, deleted, kept)
 
+    def drop_planned_occurrences(self, task_id: str, now: datetime) -> List[str]:
+        """Delete the task's runs that are only planned -- still "scheduled", never
+        started, and not yet due -- and return their ids. They were worked out
+        from the task as it was, so after an edit they name the old robot and
+        the old times; the caller plans them again from the task as it is.
+        Anything decided, started or already due stays: that is history, or the
+        scheduler's to decide on its next tick."""
+        dropped: List[str] = []
+        for occ in self.occurrences_for_task(task_id):
+            due = parse_utc(occ.due_at)
+            if occ.status == "scheduled" and occ.run_id is None and due is not None and due >= now:
+                self._occurrences.delete(occ.occurrence_id)
+                dropped.append(occ.occurrence_id)
+        return dropped
+
     # -- occurrences ---------------------------------------------------------
 
     def list_occurrences(

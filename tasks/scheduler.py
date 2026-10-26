@@ -463,6 +463,7 @@ class SchedulerLoop:
     def run_once(self, now: datetime) -> None:
         now = _as_utc(now)
         self._prune_orphans()
+        self._drop_stale_plans(now)
         self._materialise(now)
 
         everything = self._store.list_occurrences()
@@ -507,6 +508,35 @@ class SchedulerLoop:
                 "pruned %d never-started occurrence(s) whose task no longer exists: %s",
                 len(pruned), pruned,
             )
+
+    def _drop_stale_plans(self, now: datetime) -> None:
+        # A planned run that the task, as it is now, would not plan: worked out
+        # before an edit moved the time, changed the robot or dropped the
+        # schedule. Saving a task already re-plans it (router._replan); this
+        # catches an edit made any other way, and runs planned before that
+        # existed. Only enabled tasks: a paused task's runs are cancelled when
+        # they come due, which is how the calendar says it was paused.
+        try:
+            planned: dict = {}
+            for occ in self._store.list_occurrences():
+                due = parse_utc(occ.due_at)
+                if occ.status == "scheduled" and occ.run_id is None and due is not None and due >= now:
+                    planned.setdefault(occ.task_id, []).append(occ)
+            stale = []
+            for task in self._store.list_tasks():
+                if task.status != "enabled" or task.task_id not in planned:
+                    continue
+                wanted = {o.occurrence_id: o for o in materialise([task], now)}
+                for occ in planned[task.task_id]:
+                    want = wanted.get(occ.occurrence_id)
+                    if want is None or want.robot_id != occ.robot_id or want.mission_id != occ.mission_id:
+                        self._store.delete_occurrence(occ.occurrence_id)
+                        stale.append(occ.occurrence_id)
+        except Exception:
+            logger.exception("could not drop stale planned occurrences")
+            return
+        if stale:
+            logger.warning("dropped %d planned occurrence(s) their task no longer plans: %s", len(stale), stale)
 
     def _materialise(self, now: datetime) -> None:
         for occ in materialise(self._store.list_tasks(), now):
