@@ -99,3 +99,29 @@ def test_state_hook_gate(tmp_path):
 
     hook("rvr-01", None, "boot-b")      # changed (or first seen after backend restart)
     assert runs.get("r-1").result == "failed"
+
+
+def test_a_run_the_new_state_names_is_not_failed_as_restarted(tmp_path):
+    runs, tasks = _stores(tmp_path)
+    _put(runs, "r-live", bridge_boot_id="boot-a")   # started just after the restart
+    _put(runs, "r-lost", bridge_boot_id="boot-a")
+
+    changed = reconcile_boot(runs, tasks, "rvr-01", "boot-b", NOW, active_run_id="r-live")
+
+    assert changed == ["r-lost"]
+    assert runs.get("r-live").result == "running"
+
+
+def test_state_hook_reads_the_active_run_from_the_registry(tmp_path):
+    from robots.registry import RobotRegistry
+    runs, tasks = _stores(tmp_path)
+    registry = RobotRegistry()
+    registry.upsert_from_registration("rvr-01", "site-a", "quad", "b-1", "0.0.11")
+    registry.update_state("rvr-01", "STAND", "stand", active_run={"run_id": "r-live"},
+                          bridge_boot_id="boot-b")
+    _put(runs, "r-live", bridge_boot_id="boot-a")
+    hook = make_state_hook(runs, tasks, lambda: NOW, registry=registry)
+
+    hook("rvr-01", "boot-a", "boot-b")
+
+    assert runs.get("r-live").result == "running"

@@ -19,6 +19,7 @@ from robots.registry import RobotRegistry
 from robots.router import build_robots_router
 from runs.dispatch import RunDispatcher, make_run_ended_hook
 from runs.bucket import from_env as bucket_from_env
+from runs.reaper import RunReaper
 from runs.reconcile import make_state_hook
 from runs.router import build_runs_router
 from runs.store import DEFAULT_RUNS_DIR
@@ -179,6 +180,7 @@ _reconcile_hook = make_state_hook(
     lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     # The copier is bound after the router, and may be absent: same as PUT /runs.
     on_change=lambda run_id, path: _copier.on_change(run_id, path) if _copier else None,
+    registry=registry,
 )
 # Starting a run: POST /robots/{id}/runs. Same run store (and bucket hook) as
 # PUT /runs, so its lock and copy behaviour match.
@@ -187,6 +189,25 @@ _run_dispatcher = RunDispatcher(
     on_change=lambda run_id, path: _copier.on_change(run_id, path) if _copier else None,
 )
 runs_router.dispatcher = _run_dispatcher
+# Runs that never close: a START_MISSION nobody answered, or a run its bridge
+# stopped naming. Checked every few seconds by the watchdog task below.
+run_reaper = RunReaper(registry, runs_router.store, _run_dispatcher.start_failed)
+_RUN_WATCH_INTERVAL_S = 5.0
+
+
+def _sweep_runs() -> None:
+    _run_dispatcher.sweep_unanswered()
+    run_reaper.sweep()
+
+
+async def _run_watchdog() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(_sweep_runs)
+        except Exception:
+            logger.exception("run watchdog sweep failed")
+        await asyncio.sleep(_RUN_WATCH_INTERVAL_S)
+
 tasks_router.dispatcher = _run_dispatcher
 # The edge's run_ended closes the run record (runs/router.py); this settles the
 # task occurrence that shares its id.
@@ -232,6 +253,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def _on_startup() -> None:
     mqtt_client.connect()
+    app.state.run_watch_task = asyncio.create_task(_run_watchdog())
     if _scheduler_enabled():
         # Async so there is a running event loop to hang the task on. The tick
         # does its file I/O on a worker thread (SchedulerLoop.run), so it does
@@ -245,7 +267,15 @@ async def _on_startup() -> None:
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
     task = getattr(app.state, "scheduler_task", None)
+    watch = getattr(app.state, "run_watch_task", None)
     try:
+        if watch is not None:
+            watch.cancel()
+            try:
+                await watch
+            except asyncio.CancelledError:
+                pass
+            app.state.run_watch_task = None
         if task is not None:
             task.cancel()
             try:

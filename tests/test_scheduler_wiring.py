@@ -245,3 +245,25 @@ def test_shutdown_still_disconnects_mqtt_when_the_loop_task_raised(monkeypatch):
     with TestClient(app_module.app) as client:
         assert client.get("/healthz").status_code == 200
     assert disconnected == [True]
+
+
+def test_startup_runs_the_run_watchdog_and_shutdown_stops_it(monkeypatch):
+    import time
+    sweeps = []
+    monkeypatch.setattr(app_module, "_sweep_runs", lambda: sweeps.append(1))
+    monkeypatch.setattr(app_module, "_RUN_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr(app_module, "scheduler_loop", _FakeLoop())
+    _no_mqtt(monkeypatch)
+
+    with TestClient(app_module.app):
+        deadline = time.time() + 2
+        while len(sweeps) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(sweeps) >= 2
+        task = app_module.app.state.run_watch_task
+    assert task.cancelled() or task.done()
+    assert app_module.app.state.run_watch_task is None
+
+
+def test_the_reaper_closes_runs_through_the_dispatcher():
+    assert app_module.run_reaper._fail == app_module._run_dispatcher.start_failed

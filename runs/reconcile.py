@@ -14,6 +14,7 @@ def reconcile_boot(
     run_store: RunStore, task_store: TaskStore, robot_id: str,
     boot_id: Optional[str], now_iso: str,
     on_change: Optional[Callable[[str, Optional[str]], None]] = None,
+    active_run_id: Optional[str] = None,
 ) -> List[str]:
     """A run still "running" under a boot id other than the one the bridge now
     reports died with the old process: nothing will ever send its run_ended.
@@ -26,12 +27,18 @@ def reconcile_boot(
     on_change is the bucket copier's hook (same shape PUT /runs uses): writing
     through the store directly would otherwise leave the bucket copy saying
     "running" forever. One bad run is logged and skipped -- there is no retry,
-    the new boot id is already recorded -- so it cannot strand the others."""
+    the new boot id is already recorded -- so it cannot strand the others.
+
+    active_run_id is the run the new process's own state names: it is running
+    right now under the new boot (it started in the moment between the restart
+    and the first /state, so it still carries the old boot id) and is skipped."""
     if boot_id is None:
         return []
     changed: List[str] = []
     for listed in run_store.list(robot_id=robot_id):
         try:
+            if listed.run_id == active_run_id:
+                continue
             if _fail_if_lost(run_store, task_store, listed.run_id, boot_id, now_iso):
                 changed.append(listed.run_id)
                 if on_change is not None:
@@ -63,7 +70,7 @@ def _fail_if_lost(run_store, task_store, run_id: str, boot_id: str, now_iso: str
     return True
 
 
-def make_state_hook(run_store, task_store, clock: Callable[[], str], on_change=None):
+def make_state_hook(run_store, task_store, clock: Callable[[], str], on_change=None, registry=None):
     """The (robot_id, previous_boot_id, boot_id) hook for BackendMqttClient.
 
     Only a CHANGED boot id reconciles (spec 6.7): the heartbeat republishes the
@@ -72,5 +79,10 @@ def make_state_hook(run_store, task_store, clock: Callable[[], str], on_change=N
     def hook(robot_id: str, previous_boot_id: Optional[str], boot_id: Optional[str]) -> None:
         if boot_id is None or previous_boot_id == boot_id:
             return
-        reconcile_boot(run_store, task_store, robot_id, boot_id, clock(), on_change)
+        # The registry already holds this very state message (it is updated
+        # before the hook fires), so its active_run is the new process's answer.
+        record = registry.get(robot_id) if registry is not None else None
+        active = (record.active_run or {}).get("run_id") if record is not None else None
+        reconcile_boot(run_store, task_store, robot_id, boot_id, clock(), on_change,
+                       active_run_id=active)
     return hook
