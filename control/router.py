@@ -21,6 +21,12 @@ def build_router(command_store: CommandStore, mqtt_client) -> APIRouter:
                 detail=f"{request.type} is not wired to the real pipeline in this build",
             )
 
+        if request.type == "START_MISSION":
+            # A mission start needs its MissionRun and the dispatcher's checks;
+            # sent from here the edge would post events to a run that is not there.
+            raise HTTPException(
+                status_code=409, detail=f"use POST /robots/{robot_id}/runs to start a mission")
+
         command = Command(
             command_id=str(uuid.uuid4()),
             robot_id=robot_id,

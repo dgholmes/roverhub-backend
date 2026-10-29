@@ -93,3 +93,27 @@ def test_get_command_404_for_unknown_id():
     client = TestClient(app)
     response = client.get("/robots/robot-dev-01/commands/does-not-exist")
     assert response.status_code == 404
+
+
+def test_start_mission_is_refused_here_so_it_cannot_bypass_the_dispatcher():
+    app, store, mqtt_client = _make_app()
+    client = TestClient(app)
+
+    response = client.post(
+        "/robots/robot-dev-01/commands",
+        json={"type": "START_MISSION", "label": "Start", "initiated_by": "x",
+              "params": {"run_id": "r-1", "steps": []}},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "use POST /robots/robot-dev-01/runs to start a mission"}
+    assert mqtt_client.published_commands == []
+
+
+def test_stop_mission_is_still_allowed_here():
+    app, store, mqtt_client = _make_app()
+    response = TestClient(app).post(
+        "/robots/robot-dev-01/commands",
+        json={"type": "STOP_MISSION", "label": "Stop", "initiated_by": "x"})
+    assert response.status_code == 200
+    assert len(mqtt_client.published_commands) == 1
