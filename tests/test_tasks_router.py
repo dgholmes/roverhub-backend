@@ -540,9 +540,14 @@ class _DispatchEnv:
             program_state='{"blocks":{}}'))
         self.published = []
         self.tasks_dir = str(tmp_path / "tasks")
-        dispatcher = RunDispatcher(
-            self.registry, self.runs, TaskStore(self.tasks_dir), CommandStore(),
-            lambda robot_id, command: self.published.append(command))
+        self.on_publish = None  # a test's stand-in for an ack that beats the response
+
+        def publish(robot_id, command):
+            self.published.append(command)
+            if self.on_publish is not None:
+                self.on_publish(command)
+        dispatcher = self.dispatcher = RunDispatcher(
+            self.registry, self.runs, TaskStore(self.tasks_dir), CommandStore(), publish)
         app = FastAPI()
         app.include_router(build_tasks_router(
             self.tasks_dir, clock=_Clock(), dispatcher=dispatcher, mission_store=self.missions))
@@ -596,3 +601,27 @@ def test_run_now_with_steps_on_a_task_with_no_robot_is_409(tmp_path):
     env = _DispatchEnv(tmp_path)
     env.client.put("/tasks/t-1", json={**_task(robot_id=None), "version": 1})
     assert env.post().status_code == 409
+
+
+def test_a_refusal_that_beats_the_response_still_fails_the_occurrence(tmp_path):
+    env = _DispatchEnv(tmp_path)
+    env.on_publish = lambda command: env.dispatcher.on_ack(command.model_copy(update={
+        "current_stage": "execution_failed", "failure_reason": "REJECTED_CONTROL_HELD"}))
+
+    response = env.post()
+
+    assert response.status_code == 201
+    occurrence = TaskStore(env.tasks_dir).get_occurrence(response.json()["occurrence"]["occurrence_id"])
+    assert occurrence.status == "failed"
+    assert env.runs.get(occurrence.run_id).result == "failed"
+
+
+def test_the_occurrence_exists_as_dispatched_when_the_command_goes_out(tmp_path):
+    env = _DispatchEnv(tmp_path)
+    seen = []
+    env.on_publish = lambda command: seen.append(TaskStore(env.tasks_dir).get_occurrence(
+        command.params["run_id"]))
+
+    env.post()
+
+    assert seen[0] is not None and seen[0].status == "dispatched"

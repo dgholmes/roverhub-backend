@@ -288,19 +288,29 @@ def build_tasks_router(
         mission = mission_store.get(task.mission_id)
         if mission is None:
             raise HTTPException(status_code=404, detail="mission not found")
+        def store_dispatched(run) -> None:
+            # Before the command goes out: an edge refusal can come back before
+            # start() returns, and start_failed can only settle an occurrence
+            # that already exists.
+            store.put_occurrence(TaskOccurrence(
+                occurrence_id=occurrence_id, task_id=task.task_id, mission_id=task.mission_id,
+                site_id=task.site_id, robot_id=task.robot_id, due_at=due_at, status="dispatched",
+                run_id=run.run_id, message="Run-now: sent to the robot."))
+
         try:
             run, command = active.start(
                 task.robot_id, mission, body.steps, source="run_now", started_by=body.started_by,
                 max_duration_s=task.max_duration_min * 60 if task.max_duration_min else None,
-                run_id=occurrence_id)
+                run_id=occurrence_id, before_publish=store_dispatched)
         except StartRefused as refused:
             raise HTTPException(status_code=refused.status, detail=refused.message)
-        occurrence = TaskOccurrence(
-            occurrence_id=occurrence_id, task_id=task.task_id, mission_id=task.mission_id,
-            site_id=task.site_id, robot_id=task.robot_id, due_at=due_at, status="running",
-            run_id=occurrence_id, message="Run-now: started on the robot.",
-        )
-        store.put_occurrence(occurrence)
+        occurrence = store.get_occurrence(occurrence_id)
+        # Only a still-"dispatched" occurrence becomes running: a refusal or a
+        # finished run that raced ahead of this line has already settled it.
+        if occurrence is not None and occurrence.status == "dispatched":
+            occurrence = occurrence.model_copy(update={
+                "status": "running", "message": "Run-now: started on the robot."})
+            store.put_occurrence(occurrence)
         return JSONResponse(status_code=201, content={
             "occurrence": occurrence.model_dump(mode="json"),
             "run": run.model_dump(mode="json"),
