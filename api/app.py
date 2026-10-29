@@ -157,7 +157,7 @@ def _publish_scheduled(occurrence: TaskOccurrence, run: MissionRun) -> None:
         raise RuntimeError("scheduled runs cannot play speech yet")
     task = _reconcile_task_store.get_task(occurrence.task_id)
     minutes = task.max_duration_min if task is not None else None
-    _run_dispatcher.publish_start(run, steps, minutes * 60 if minutes is not None else None)
+    _run_dispatcher.start_scheduled(run, steps, minutes * 60 if minutes is not None else None)
 
 
 # Its own MissionStore and TaskStore, not the routers': the directories are the

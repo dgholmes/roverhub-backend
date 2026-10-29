@@ -133,7 +133,7 @@ class _Dispatcher:
     def __init__(self):
         self.calls = []
 
-    def publish_start(self, run, steps, max_duration_s):
+    def start_scheduled(self, run, steps, max_duration_s):
         self.calls.append((run, steps, max_duration_s))
 
 
