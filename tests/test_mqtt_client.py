@@ -435,6 +435,7 @@ def test_state_message_with_new_fields_calls_on_state():
     assert calls == [("robot-dev-01", None, "boot-a"), ("robot-dev-01", "boot-a", "boot-b")]
     record = registry.get("robot-dev-01")
     assert record.bridge_boot_id == "boot-b"
+    assert record.control_owner is None and record.active_run is None  # second message omitted them
 
 
 def test_state_message_from_0_0_9_bridge_still_updates_state():
@@ -450,3 +451,17 @@ def test_state_message_from_0_0_9_bridge_still_updates_state():
 
     assert registry.get("robot-dev-01").abstract_state == "STAND"
     assert calls == [("robot-dev-01", None, None)]
+
+
+def test_state_message_stores_control_owner_and_active_run():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    run = {"run_id": "r-1", "status": "running", "started_at": "2026-10-29T00:00:00Z"}
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/state", _state_payload(
+        control_owner="mission:r-1", active_run=run, bridge_boot_id="boot-a"))
+
+    record = registry.get("robot-dev-01")
+    assert record.control_owner == "mission:r-1"
+    assert record.active_run == run

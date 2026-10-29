@@ -128,6 +128,8 @@ def test_update_state_stores_owner_active_run_boot_and_returns_previous_boot():
         "robot-dev-01", "STAND", "balance_stand",
         control_owner="mission:r-1", active_run=active, bridge_boot_id="boot-a",
     )
+    stored = registry.get("robot-dev-01")
+    assert (stored.control_owner, stored.active_run) == ("mission:r-1", active)
     second = registry.update_state("robot-dev-01", "STAND", "balance_stand", bridge_boot_id="boot-b")
 
     assert first is None

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from runs.store import RunStore
 from tasks.store import TaskStore
@@ -13,6 +13,7 @@ logger = logging.getLogger("roverhub.runs")
 def reconcile_boot(
     run_store: RunStore, task_store: TaskStore, robot_id: str,
     boot_id: Optional[str], now_iso: str,
+    on_change: Optional[Callable[[str, Optional[str]], None]] = None,
 ) -> List[str]:
     """A run still "running" under a boot id other than the one the bridge now
     reports died with the old process: nothing will ever send its run_ended.
@@ -20,28 +21,56 @@ def reconcile_boot(
     Each run is compared with its OWN recorded boot id, not with the registry's
     previous one -- after a backend restart there is no previous. A run with no
     boot id is a browser-driven run, which a bridge restart does not end, so it
-    is left alone; so is an unknown new boot id (an old bridge)."""
+    is left alone; so is an unknown new boot id (an old bridge).
+
+    on_change is the bucket copier's hook (same shape PUT /runs uses): writing
+    through the store directly would otherwise leave the bucket copy saying
+    "running" forever. One bad run is logged and skipped -- there is no retry,
+    the new boot id is already recorded -- so it cannot strand the others."""
     if boot_id is None:
         return []
     changed: List[str] = []
     for listed in run_store.list(robot_id=robot_id):
-        # Re-read under the run's lock: the bridge's run_ended may land at the
-        # same moment, and a run that just completed must not be overwritten.
-        with run_store.lock(listed.run_id):
-            run = run_store.get(listed.run_id)
-            if run is None or run.result != "running":
-                continue
-            if run.bridge_boot_id is None or run.bridge_boot_id == boot_id:
-                continue
-            run.result = "failed"
-            run.ended_at = now_iso
-            run.end_reason = "bridgeRestarted"
-            run_store.put(run)
-        occurrence = task_store.get_occurrence(run.run_id)
-        if occurrence is not None:
-            occurrence.status = "failed"
-            task_store.put_occurrence(occurrence)
-        logger.warning("run %s failed: bridge on %s restarted (boot %s -> %s)",
-                       run.run_id, robot_id, run.bridge_boot_id, boot_id)
-        changed.append(run.run_id)
+        try:
+            if _fail_if_lost(run_store, task_store, listed.run_id, boot_id, now_iso):
+                changed.append(listed.run_id)
+                if on_change is not None:
+                    on_change(listed.run_id, None)
+        except Exception:
+            logger.exception("could not reconcile run %s after bridge restart", listed.run_id)
     return changed
+
+
+def _fail_if_lost(run_store, task_store, run_id: str, boot_id: str, now_iso: str) -> bool:
+    # Re-read under the run's lock: the bridge's run_ended may land at the same
+    # moment, and a run that just completed must not be overwritten.
+    with run_store.lock(run_id):
+        run = run_store.get(run_id)
+        if run is None or run.result != "running":
+            return False
+        if run.bridge_boot_id is None or run.bridge_boot_id == boot_id:
+            return False
+        old_boot = run.bridge_boot_id
+        run.result = "failed"
+        run.ended_at = now_iso
+        run.end_reason = "bridgeRestarted"
+        run_store.put(run)
+    occurrence = task_store.get_occurrence(run_id)
+    if occurrence is not None:
+        occurrence.status = "failed"
+        task_store.put_occurrence(occurrence)
+    logger.warning("run %s failed: bridge restarted (boot %s -> %s)", run_id, old_boot, boot_id)
+    return True
+
+
+def make_state_hook(run_store, task_store, clock: Callable[[], str], on_change=None):
+    """The (robot_id, previous_boot_id, boot_id) hook for BackendMqttClient.
+
+    Only a CHANGED boot id reconciles (spec 6.7): the heartbeat republishes the
+    same id, and a run that ended while the cloud was unreachable must not be
+    failed as bridgeRestarted just because its run_ended has not arrived yet."""
+    def hook(robot_id: str, previous_boot_id: Optional[str], boot_id: Optional[str]) -> None:
+        if boot_id is None or previous_boot_id == boot_id:
+            return
+        reconcile_boot(run_store, task_store, robot_id, boot_id, clock(), on_change)
+    return hook

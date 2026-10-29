@@ -18,7 +18,7 @@ from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
 from robots.router import build_robots_router
 from runs.bucket import from_env as bucket_from_env
-from runs.reconcile import reconcile_boot
+from runs.reconcile import make_state_hook
 from runs.router import build_runs_router
 from runs.store import DEFAULT_RUNS_DIR
 from tasks.router import build_tasks_router
@@ -132,17 +132,12 @@ scheduler_loop = SchedulerLoop(
 _reconcile_task_store = TaskStore(_tasks_dir)
 
 
-def _reconcile_on_state(robot_id, previous_boot_id, boot_id):
-    # Only on a CHANGED boot id (spec 6.7): the heartbeat republishes the same
-    # id, and a run that ended while the cloud was unreachable must not be
-    # failed as bridgeRestarted just because its run_ended has not arrived yet.
-    if boot_id is None or previous_boot_id == boot_id:
-        return
-    reconcile_boot(runs_router.store, _reconcile_task_store, robot_id, boot_id,
-                   datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-
-
-_reconcile_hook = _reconcile_on_state
+_reconcile_hook = make_state_hook(
+    runs_router.store, _reconcile_task_store,
+    lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    # The copier is bound after the router, and may be absent: same as PUT /runs.
+    on_change=lambda run_id, path: _copier.on_change(run_id, path) if _copier else None,
+)
 # Rejects oversized audio-clip uploads by Content-Length before Starlette's
 # multipart parser spools the body -- see ContentLengthLimitMiddleware's
 # docstring in control/media.py for why this can't live in the handler alone.

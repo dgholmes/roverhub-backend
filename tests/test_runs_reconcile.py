@@ -1,5 +1,5 @@
 """runs/reconcile.py: a bridge restart fails the runs the old process was driving."""
-from runs.reconcile import reconcile_boot
+from runs.reconcile import make_state_hook, reconcile_boot
 from runs.store import RunStore
 from shared.schemas.runs import MissionRun
 from shared.schemas.tasks import TaskOccurrence
@@ -57,3 +57,45 @@ def test_unknown_new_boot_id_changes_nothing(tmp_path):
     _put(runs, "r-1", bridge_boot_id="boot-a")
 
     assert reconcile_boot(runs, tasks, "rvr-01", None, NOW) == []
+
+
+def test_on_change_called_for_each_failed_run_and_not_skipped_ones(tmp_path):
+    runs, tasks = _stores(tmp_path)
+    _put(runs, "r-a", bridge_boot_id="boot-a")
+    _put(runs, "r-b", bridge_boot_id="boot-a")
+    _put(runs, "r-same", bridge_boot_id="boot-b")
+    _put(runs, "r-legacy")
+    calls = []
+
+    changed = reconcile_boot(runs, tasks, "rvr-01", "boot-b", NOW, on_change=lambda r, p: calls.append((r, p)))
+
+    assert sorted(changed) == ["r-a", "r-b"]
+    assert sorted(calls) == [("r-a", None), ("r-b", None)]
+
+
+def test_one_bad_run_does_not_strand_the_others(tmp_path):
+    runs, tasks = _stores(tmp_path)
+    _put(runs, "r-a", bridge_boot_id="boot-a")
+    _put(runs, "r-b", bridge_boot_id="boot-a")
+
+    def boom(run_id, path):
+        if run_id == "r-a":
+            raise RuntimeError("bucket down")
+
+    reconcile_boot(runs, tasks, "rvr-01", "boot-b", NOW, on_change=boom)
+
+    assert runs.get("r-a").result == "failed"
+    assert runs.get("r-b").result == "failed"
+
+
+def test_state_hook_gate(tmp_path):
+    runs, tasks = _stores(tmp_path)
+    _put(runs, "r-1", bridge_boot_id="boot-a")
+    hook = make_state_hook(runs, tasks, lambda: NOW)
+
+    hook("rvr-01", "boot-b", "boot-b")  # heartbeat republishing the same id
+    hook("rvr-01", "boot-b", None)      # old bridge, no boot id
+    assert runs.get("r-1").result == "running"
+
+    hook("rvr-01", None, "boot-b")      # changed (or first seen after backend restart)
+    assert runs.get("r-1").result == "failed"
