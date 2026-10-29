@@ -190,14 +190,10 @@ def _to_utc(day: date, wall_clock: time, zone: ZoneInfo) -> datetime:
 Decision = Literal["dispatch", "skip"]
 
 # The mission kinds something on the edge can actually receive. Configuration,
-# not logic, and EMPTY in this plan: nothing on the edge can accept a route or
-# a program yet (`mission_executor.py` is 0 bytes), so every occurrence skips as
-# `no_executor`. That is the honest state and it is shown to the operator, not
-# hidden. Plan 3 (the edge program executor) makes this {"program"}; the SLAM
-# backpack adds "route". Do not hard-code "route skips, program dispatches" in
-# decide(): until each executor lands, the scheduler must not claim a dispatch
-# no component can accept.
-EXECUTOR_KINDS: frozenset[MissionKind] = frozenset()
+# not logic. The edge's MissionExecutor runs programs (START_MISSION); the SLAM
+# backpack will add "route". Do not hard-code "route skips, program dispatches"
+# in decide(): a kind is dispatched only when it is listed here.
+EXECUTOR_KINDS: frozenset[MissionKind] = frozenset({"program"})
 
 
 class Verdict(NamedTuple):
@@ -229,6 +225,7 @@ def decide(
     *,
     battery_pct: Optional[float] = None,
     robot_busy: bool = False,
+    unattended_enabled: bool = False,
 ) -> Verdict:
     """Dispatch or skip one occurrence that has come due. Pure: no store, no
     clock, no I/O -- everything it judges is a parameter.
@@ -282,6 +279,14 @@ def decide(
         return _skip("no_executor", (
             f"nothing on the edge can run a {mission.kind} mission yet"
         ))
+    # Directly after the executor check, so a kind nothing can run is still
+    # reported as no_executor. Scheduled runs have nobody watching, and E-Stop has
+    # not yet been tested on a moving robot.
+    if not unattended_enabled:
+        return _skip(
+            "unattended_disabled",
+            "Scheduled runs switch on after E-Stop has been tested on a moving robot.",
+        )
 
     # 3. Robot: unset, unreachable (unknown to the registry, or offline), or
     # already running something. Reachability is unconditional: a command
@@ -344,10 +349,9 @@ def decide(
 # The tick
 # ---------------------------------------------------------------------------
 
-# Invoked as publish(occurrence, run) after the MissionRun exists. What it sends
-# is Plan 3's to define: no command type can start a mission on the edge yet,
-# which is also why nothing reaches it while EXECUTOR_KINDS is empty. Sync, and
-# run on a worker thread with the rest of the tick.
+# Invoked as publish(occurrence, run) after the MissionRun exists; api/app.py's
+# `_publish_scheduled` sends START_MISSION. Sync, and run on a worker thread with
+# the rest of the tick. Raising marks the occurrence failed with the message.
 Publish = Callable[[TaskOccurrence, MissionRun], None]
 
 
@@ -435,7 +439,9 @@ class SchedulerLoop:
         *,
         run_store: RunStore,
         executor_kinds: frozenset[MissionKind] = EXECUTOR_KINDS,
+        unattended_enabled: bool = False,
     ):
+        self._unattended_enabled = unattended_enabled
         self._store = store
         self._registry = registry
         self._missions = mission_store
@@ -569,6 +575,7 @@ class SchedulerLoop:
         verdict = decide(
             occ, task, mission, robot, now, self._executor_kinds,
             battery_pct=_battery_pct(robot), robot_busy=occ.robot_id in busy,
+            unattended_enabled=self._unattended_enabled,
         )
         if verdict.decision == "skip":
             self._store.put_occurrence(occ.model_copy(update={
@@ -585,10 +592,13 @@ class SchedulerLoop:
         # The occurrence id is the run id, so two attempts could never produce
         # two runs. Nothing retries: run_once revisits only "scheduled" and "due"
         # occurrences, so this runs at most once per occurrence.
+        robot = self._registry.get(occ.robot_id) if occ.robot_id is not None else None
         run = MissionRun(
             run_id=occ.occurrence_id, mission_id=occ.mission_id, mission=mission,
             robot_id=occ.robot_id, site_id=occ.site_id, started_at=_iso(now),
-            started_by="schedule",
+            started_by="schedule", source="schedule",
+            # So a bridge restart fails this run like any other (runs/reconcile).
+            bridge_boot_id=robot.bridge_boot_id if robot is not None else None,
         )
         # "dispatched" is written before anything is sent, so a failure mid-way
         # leaves a record of the attempt rather than a store that says it never
@@ -615,3 +625,20 @@ class SchedulerLoop:
             return False
         self._store.put_occurrence(dispatched.model_copy(update={"status": "running"}))
         return True
+
+
+def has_spoken_steps(steps) -> bool:
+    """True if any command step, however deeply nested in repeat / repeatUntil /
+    if bodies, speaks (carries `speech`, or is a SPEAK command)."""
+    for step in steps:
+        kind = getattr(step, "kind", None)
+        if kind == "command":
+            if step.speech is not None or step.type == "SPEAK":
+                return True
+        elif kind in ("repeat", "repeatUntil"):
+            if has_spoken_steps(step.body):
+                return True
+        elif kind == "if":
+            if has_spoken_steps(step.then) or has_spoken_steps(step.else_):
+                return True
+    return False

@@ -108,13 +108,127 @@ def test_the_tasks_router_is_mounted():
     assert isinstance(body["items"], list)
 
 
-def test_the_publish_stub_says_what_is_missing():
-    # Unreachable while EXECUTOR_KINDS is empty; when someone makes it reachable
-    # the error must say why, not just that.
-    with pytest.raises(NotImplementedError) as exc:
-        app_module._publish_mission_start(None, None)
-    message = str(exc.value)
-    assert "CommandType" in message and "executor" in message
+def _program_mission(quad=None, wheel=None, version=None):
+    from shared.schemas.missions import (
+        PROGRAM_COMPILER_VERSION, MissionLibraryEntry, ProgramSteps,
+    )
+    steps = None
+    if quad is not None or wheel is not None:
+        steps = ProgramSteps(
+            compiler_version=PROGRAM_COMPILER_VERSION if version is None else version,
+            quad=quad or [], wheel=wheel or [])
+    return MissionLibraryEntry(
+        mission_id="m-1", name="Patrol", type="patrol", kind="program", creator="x",
+        updated_at="2026-10-23T00:00:00Z", map_id="map-1", site_id="site-a",
+        program_state='{"blocks":{}}', program_steps=steps)
+
+
+def _cmd(type_="SNAPSHOT", speech=None):
+    from shared.schemas.missions import CommandStep, SpeechSpec
+    return CommandStep(kind="command", blockId="b", label="x", type=type_,
+                       speech=SpeechSpec(text="hi", untilDone=True) if speech else None)
+
+
+class _Dispatcher:
+    def __init__(self):
+        self.calls = []
+
+    def publish_start(self, run, steps, max_duration_s):
+        self.calls.append((run, steps, max_duration_s))
+
+
+def _scheduled_world(monkeypatch, mission, robot_type="quad", max_duration_min=None):
+    from robots.registry import RobotRecord
+    from shared.schemas.runs import MissionRun
+    from shared.schemas.tasks import MissionTask, TaskOccurrence
+
+    dispatcher = _Dispatcher()
+    monkeypatch.setattr(app_module, "_run_dispatcher", dispatcher)
+    monkeypatch.setattr(app_module, "_scheduler_missions", type("S", (), {"get": lambda self, i: mission})())
+    monkeypatch.setattr(app_module.registry, "get", lambda rid: RobotRecord(
+        robot_id="robot-1", site_id="site-a", robot_type=robot_type, name="R", online=True))
+    task = MissionTask(
+        task_id="t-1", mission_id="m-1", site_id="site-a", robot_id="robot-1",
+        max_duration_min=max_duration_min, created_by="x",
+        created_at="2026-10-23T00:00:00Z", updated_at="2026-10-23T00:00:00Z")
+    monkeypatch.setattr(app_module._reconcile_task_store, "get_task", lambda tid: task)
+    occ = TaskOccurrence(occurrence_id="t-1-x", task_id="t-1", mission_id="m-1",
+                         site_id="site-a", robot_id="robot-1", due_at="2026-10-24T09:00:00Z")
+    run = MissionRun(run_id="t-1-x", mission_id="m-1", mission=mission,
+                     robot_id="robot-1", site_id="site-a", started_at="2026-10-24T09:00:00Z",
+                     started_by="schedule")
+    return dispatcher, occ, run
+
+
+def test_scheduled_publish_sends_the_robot_types_steps_and_the_task_cap(monkeypatch):
+    mission = _program_mission(quad=[_cmd("SNAPSHOT")], wheel=[_cmd("CHANGE_MODE")])
+    dispatcher, occ, run = _scheduled_world(monkeypatch, mission, "wheel", max_duration_min=2)
+    app_module._publish_scheduled(occ, run)
+    (_, steps, cap), = dispatcher.calls
+    assert [s.type for s in steps] == ["CHANGE_MODE"] and cap == 120
+
+
+def test_scheduled_publish_without_a_cap_passes_none(monkeypatch):
+    dispatcher, occ, run = _scheduled_world(monkeypatch, _program_mission(quad=[_cmd()]))
+    app_module._publish_scheduled(occ, run)
+    assert dispatcher.calls[0][2] is None
+
+
+@pytest.mark.parametrize("mission_kwargs", [
+    {},                                        # never compiled
+    {"quad": [_cmd()], "version": 0},          # stale compiler
+    {"wheel": [_cmd()]},                       # nothing for a quad
+])
+def test_scheduled_publish_refuses_uncompiled_or_stale_steps(monkeypatch, mission_kwargs):
+    dispatcher, occ, run = _scheduled_world(monkeypatch, _program_mission(**mission_kwargs))
+    with pytest.raises(RuntimeError, match="open and save this mission once"):
+        app_module._publish_scheduled(occ, run)
+    assert dispatcher.calls == []
+
+
+def test_scheduled_publish_refuses_an_unknown_robot_type(monkeypatch):
+    dispatcher, occ, run = _scheduled_world(monkeypatch, _program_mission(quad=[_cmd()]), robot_type="hexapod")
+    with pytest.raises(RuntimeError, match="open and save this mission once"):
+        app_module._publish_scheduled(occ, run)
+
+
+def test_scheduled_publish_refuses_speech(monkeypatch):
+    from shared.schemas.missions import RepeatStep
+    nested = RepeatStep(kind="repeat", blockId="r", label="r", times=2,
+                        body=[_cmd(), _cmd("SPEAK")])
+    dispatcher, occ, run = _scheduled_world(monkeypatch, _program_mission(quad=[nested]))
+    with pytest.raises(RuntimeError, match="scheduled runs cannot play speech yet"):
+        app_module._publish_scheduled(occ, run)
+    assert dispatcher.calls == []
+
+
+def test_has_spoken_steps_finds_speech_in_every_nested_body():
+    from shared.schemas.missions import Condition, IfStep, RepeatUntilStep
+    from tasks.scheduler import has_spoken_steps
+    cond = Condition(kind="fallen")
+    spoken = _cmd("SNAPSHOT", speech=True)
+    assert not has_spoken_steps([_cmd()])
+    assert has_spoken_steps([spoken])
+    assert has_spoken_steps([RepeatUntilStep(kind="repeatUntil", blockId="a", label="a", condition=cond, body=[spoken])])
+    assert has_spoken_steps([IfStep(kind="if", blockId="a", label="a", condition=cond, then=[_cmd()], **{"else": [spoken]})])
+    deep = IfStep(kind="if", blockId="a", label="a", condition=cond, then=[
+        RepeatUntilStep(kind="repeatUntil", blockId="b", label="b", condition=cond, body=[_cmd("SPEAK")])], **{"else": []})
+    assert has_spoken_steps([deep])
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, False), ("", False), ("false", False), ("0", False), ("true", True), ("1", True), ("ON", True),
+])
+def test_app_reads_unattended_runs_enabled_default_false(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("UNATTENDED_RUNS_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("UNATTENDED_RUNS_ENABLED", value)
+    assert app_module._unattended_runs_enabled() is expected
+
+
+def test_the_app_loop_is_built_with_unattended_off_by_default():
+    assert app_module.scheduler_loop._unattended_enabled is False
 
 
 def test_shutdown_still_disconnects_mqtt_when_the_loop_task_raised(monkeypatch):

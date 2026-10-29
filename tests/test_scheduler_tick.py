@@ -17,7 +17,7 @@ from shared.schemas.missions import MissionEstimates, MissionLibraryEntry
 from shared.schemas.tasks import (
     DispatchRule, MissionSchedule, MissionTask, TaskOccurrence,
 )
-from tasks.scheduler import EXECUTOR_KINDS, SchedulerLoop, _RepeatFilter
+from tasks.scheduler import SchedulerLoop, _RepeatFilter
 from tasks.store import TaskStore
 
 DUE = "2026-10-24T09:00:00Z"
@@ -26,7 +26,7 @@ BEFORE = datetime(2026, 10, 24, 8, 59, 30, tzinfo=timezone.utc)
 
 
 class _World:
-    def __init__(self, tmp_path, executor_kinds=EXECUTOR_KINDS, publish=None):
+    def __init__(self, tmp_path, executor_kinds=frozenset(), publish=None, unattended_enabled=True):
         self.store = TaskStore(str(tmp_path / "tasks"))
         self.registry = RobotRegistry()
         self.registry.upsert_from_registration("robot-1", "site-a", "quad")
@@ -37,6 +37,7 @@ class _World:
             self.store, self.registry, self.missions,
             publish or (lambda occ, run: self.published.append((occ, run))),
             run_store=self.runs, executor_kinds=executor_kinds,
+            unattended_enabled=unattended_enabled,
         )
         self.missions.put(MissionLibraryEntry(
             mission_id="m-1", name="Patrol", type="patrol", kind="program",
@@ -473,3 +474,46 @@ def test_the_tick_leaves_a_paused_tasks_and_decided_runs_alone(tmp_path):
     w.loop.run_once(BEFORE)
     assert w.store.get_occurrence(paused.occurrence_id) is not None
     assert w.store.get_occurrence(decided.occurrence_id) is not None
+
+
+PROGRAMS = frozenset({"program"})
+
+
+def test_program_occurrence_skips_unattended_disabled_by_default(tmp_path):
+    world = _World(tmp_path, executor_kinds=PROGRAMS, unattended_enabled=False)
+    world.task()
+    occ = world.due()
+
+    world.loop.run_once(AT_DUE)
+
+    stored = world.store.get_occurrence(occ.occurrence_id)
+    assert (stored.status, stored.skip_reason) == ("skipped", "unattended_disabled")
+    assert "E-Stop" in stored.message
+    assert world.published == []
+
+
+def test_the_loop_defaults_to_unattended_off(tmp_path):
+    world = _World(tmp_path, executor_kinds=PROGRAMS)
+    loop = SchedulerLoop(
+        world.store, world.registry, world.missions, lambda o, r: None,
+        run_store=world.runs, executor_kinds=PROGRAMS,
+    )
+    world.task()
+    occ = world.due()
+    loop.run_once(AT_DUE)
+    assert world.store.get_occurrence(occ.occurrence_id).skip_reason == "unattended_disabled"
+
+
+def test_unattended_enabled_dispatches_program_with_source_and_boot_id(tmp_path):
+    world = _World(tmp_path, executor_kinds=PROGRAMS, unattended_enabled=True)
+    world.registry.get("robot-1").bridge_boot_id = "boot-7"
+    world.task()
+    occ = world.due()
+
+    world.loop.run_once(AT_DUE)
+
+    assert world.store.get_occurrence(occ.occurrence_id).status == "running"
+    (_, run), = world.published
+    assert (run.source, run.bridge_boot_id, run.started_by) == ("schedule", "boot-7", "schedule")
+    stored = world.runs.get(occ.occurrence_id)
+    assert (stored.source, stored.bridge_boot_id) == ("schedule", "boot-7")

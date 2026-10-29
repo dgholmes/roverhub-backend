@@ -23,8 +23,9 @@ from runs.reconcile import make_state_hook
 from runs.router import build_runs_router
 from runs.store import DEFAULT_RUNS_DIR
 from tasks.router import build_tasks_router
-from tasks.scheduler import EXECUTOR_KINDS, SchedulerLoop
+from tasks.scheduler import EXECUTOR_KINDS, SchedulerLoop, has_spoken_steps
 from tasks.store import DEFAULT_TASKS_DIR, TaskStore
+from shared.schemas.missions import PROGRAM_COMPILER_VERSION
 from shared.schemas.runs import MissionRun
 from shared.schemas.tasks import TaskOccurrence
 
@@ -124,20 +125,39 @@ tasks_router = build_tasks_router(
 app.include_router(tasks_router)
 
 
-def _publish_mission_start(occurrence: TaskOccurrence, run: MissionRun) -> None:
-    # What this would send is Plan 3's to define: no command type can start a
-    # mission on the edge yet, so there is nothing to hand to
-    # mqtt_client.publish_command. Raising -- not logging and returning -- is
-    # what keeps that honest: the loop records the occurrence as failed with this
-    # message instead of calling a dispatch that never reached a robot "running".
-    # Unreachable today, because EXECUTOR_KINDS is empty and every occurrence is
-    # skipped as `no_executor` before it gets here. Whoever adds a kind to
-    # EXECUTOR_KINDS must replace this in the same change.
-    raise NotImplementedError(
-        "cannot dispatch a scheduled mission: no mission-start CommandType exists in "
-        "shared/schemas/commands.py, so there is nothing to publish to the edge. The "
-        "executor plan defines it; add it before adding a kind to EXECUTOR_KINDS."
-    )
+def _unattended_runs_enabled() -> bool:
+    # Scheduled runs have nobody watching. They stay off until E-Stop has been
+    # tested on a moving robot, so the default is off and only an explicit
+    # true/1/yes/on turns them on. (SCHEDULER_ENABLED is the opposite: on unless
+    # switched off.)
+    return os.environ.get("UNATTENDED_RUNS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+_UNCOMPILED = "open and save this mission once, so its program is compiled for the robot"
+_scheduler_missions = MissionStore(os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR))
+
+
+def _publish_scheduled(occurrence: TaskOccurrence, run: MissionRun) -> None:
+    """Send START_MISSION for a scheduled occurrence. Raising is how a refusal
+    reaches the operator: the loop records it as the occurrence's failure."""
+    mission = _scheduler_missions.get(occurrence.mission_id)
+    robot = registry.get(run.robot_id)
+    programs = mission.program_steps if mission is not None else None
+    if programs is None or programs.compiler_version != PROGRAM_COMPILER_VERSION or robot is None:
+        raise RuntimeError(_UNCOMPILED)
+    if robot.robot_type == "quad":
+        steps = programs.quad
+    elif robot.robot_type == "wheel":
+        steps = programs.wheel
+    else:
+        raise RuntimeError(_UNCOMPILED)
+    if not steps:
+        raise RuntimeError(_UNCOMPILED)
+    if has_spoken_steps(steps):
+        raise RuntimeError("scheduled runs cannot play speech yet")
+    task = _reconcile_task_store.get_task(occurrence.task_id)
+    minutes = task.max_duration_min if task is not None else None
+    _run_dispatcher.publish_start(run, steps, minutes * 60 if minutes is not None else None)
 
 
 # Its own MissionStore and TaskStore, not the routers': the directories are the
@@ -147,8 +167,9 @@ def _publish_mission_start(occurrence: TaskOccurrence, run: MissionRun) -> None:
 scheduler_loop = SchedulerLoop(
     TaskStore(_tasks_dir), registry,
     MissionStore(os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR)),
-    _publish_mission_start,
+    _publish_scheduled,
     run_store=runs_router.store, executor_kinds=EXECUTOR_KINDS,
+    unattended_enabled=_unattended_runs_enabled(),
 )
 _reconcile_task_store = TaskStore(_tasks_dir)
 

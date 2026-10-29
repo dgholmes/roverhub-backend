@@ -59,6 +59,7 @@ def _decide(*, occ=None, task=None, mission=None, robot="default", now=NOW,
             executor_kinds=PROGRAMS, **kwargs):
     # A healthy program on a healthy robot unless a test says otherwise, so each
     # test names only what it is breaking.
+    kwargs.setdefault("unattended_enabled", True)
     return decide(
         occ or _occ(), task or _task(), mission or _mission(),
         _robot() if robot == "default" else robot, now, executor_kinds, **kwargs,
@@ -71,15 +72,31 @@ def _skip(verdict, reason):
 
 # -- executor ---------------------------------------------------------------
 
-def test_every_kind_is_skipped_when_no_executor_is_configured():
-    # The module default is empty in this plan: nothing on the edge can receive
-    # either kind, so the scheduler must not claim a dispatch no component can
-    # accept. Called with the default, not with an explicit empty set.
-    assert EXECUTOR_KINDS == frozenset()
-    for kind in ("route", "program"):
-        verdict = decide(_occ(), _task(), _mission(kind), _robot(), NOW)
-        _skip(verdict, "no_executor")
-        assert kind in verdict.message
+def test_the_default_executors_are_programs_only():
+    assert EXECUTOR_KINDS == frozenset({"program"})
+    verdict = decide(_occ(), _task(), _mission("route"), _robot(), NOW, unattended_enabled=True)
+    _skip(verdict, "no_executor")
+
+
+def test_program_skips_unattended_disabled_by_default():
+    verdict = decide(_occ(), _task(), _mission(), _robot(), NOW, PROGRAMS)
+    _skip(verdict, "unattended_disabled")
+    assert "E-Stop" in verdict.message
+
+
+def test_route_still_skips_no_executor_when_unattended_is_off():
+    # The unattended gate comes directly after the executor check.
+    verdict = decide(_occ(), _task(), _mission("route"), _robot(), NOW, PROGRAMS)
+    _skip(verdict, "no_executor")
+
+
+def test_unattended_disabled_is_checked_before_robot_and_rules():
+    verdict = decide(_occ(), _task(), _mission(), None, NOW, PROGRAMS)
+    _skip(verdict, "unattended_disabled")
+
+
+def test_unattended_enabled_dispatches_a_healthy_program():
+    assert _decide(unattended_enabled=True).decision == "dispatch"
 
 
 def test_route_is_skipped_as_no_executor_when_only_programs_have_one():
