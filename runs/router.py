@@ -13,7 +13,9 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from shared.schemas.runs import MissionRun, RunEvent
+from shared.schemas.runs import MissionRun, RunEvent, StartRunRequest
+
+from .dispatch import RunDispatcher, StartRefused
 
 from .store import CONTENT_TYPES, EVENTS_FILE, RUN_FILE, RunStore
 
@@ -31,8 +33,12 @@ def _summary(store: RunStore, run: MissionRun) -> dict:
             "video_count": count("video/"), "detection_count": count("detections/")}
 
 
-def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: None) -> APIRouter:
+def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: None,
+                      dispatcher: Optional[RunDispatcher] = None) -> APIRouter:
     router = APIRouter()
+    # The dispatcher needs this router's store, so the app may also set the
+    # attribute after building both; the route reads it per request.
+    router.dispatcher = dispatcher  # type: ignore[attr-defined]
     store = RunStore(runs_dir)
     router.store = store  # type: ignore[attr-defined]  # for Tasks 5-7
 
@@ -41,6 +47,18 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
         if run is None:
             raise HTTPException(status_code=404, detail="run not found")
         return run
+
+    @router.post("/robots/{robot_id}/runs", status_code=201)
+    def start_run(robot_id: str, request: StartRunRequest):
+        if router.dispatcher is None:  # type: ignore[attr-defined]
+            raise HTTPException(status_code=503, detail="starting runs is not configured")
+        try:
+            run, command = router.dispatcher.start(  # type: ignore[attr-defined]
+                robot_id, request.mission, request.steps, source=request.source,
+                started_by=request.started_by, max_duration_s=request.max_duration_s)
+        except StartRefused as refused:
+            raise HTTPException(status_code=refused.status, detail=refused.message)
+        return {"run": run.model_dump(mode="json"), "command": command.model_dump(mode="json")}
 
     @router.put("/runs/{run_id}")
     def put_run(run_id: str, run: MissionRun):

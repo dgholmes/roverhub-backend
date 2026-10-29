@@ -17,6 +17,7 @@ from missions.router import DEFAULT_MISSIONS_DIR, MissionStore, build_missions_r
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
 from robots.router import build_robots_router
+from runs.dispatch import RunDispatcher
 from runs.bucket import from_env as bucket_from_env
 from runs.reconcile import make_state_hook
 from runs.router import build_runs_router
@@ -48,9 +49,23 @@ def _on_state(robot_id, previous_boot_id, boot_id):
         _reconcile_hook(robot_id, previous_boot_id, boot_id)
 
 
+_run_dispatcher = None  # bound below, once the run store exists
+
+
+def _on_ack(command):
+    command_store.apply_ack(command)
+    # A START_MISSION the bridge refused fails its run (runs/dispatch.py). Kept
+    # apart from apply_ack so a dispatcher error cannot lose the ack itself.
+    if _run_dispatcher is not None:
+        try:
+            _run_dispatcher.on_ack(command)
+        except Exception:
+            logger.exception("could not apply the ack for command %s to its run", command.command_id)
+
+
 mqtt_client = BackendMqttClient(
     os.environ.get("CLOUD_MQTT_URL", "mqtt://localhost:1883"), registry, real_mqtt_client_factory,
-    on_ack=command_store.apply_ack, on_state=_on_state,
+    on_ack=_on_ack, on_state=_on_state,
 )
 
 app = FastAPI(title="RoverHub Backend (dev)")
@@ -138,6 +153,13 @@ _reconcile_hook = make_state_hook(
     # The copier is bound after the router, and may be absent: same as PUT /runs.
     on_change=lambda run_id, path: _copier.on_change(run_id, path) if _copier else None,
 )
+# Starting a run: POST /robots/{id}/runs. Same run store (and bucket hook) as
+# PUT /runs, so its lock and copy behaviour match.
+_run_dispatcher = RunDispatcher(
+    registry, runs_router.store, _reconcile_task_store, command_store, mqtt_client.publish_command,
+    on_change=lambda run_id, path: _copier.on_change(run_id, path) if _copier else None,
+)
+runs_router.dispatcher = _run_dispatcher
 # Rejects oversized audio-clip uploads by Content-Length before Starlette's
 # multipart parser spools the body -- see ContentLengthLimitMiddleware's
 # docstring in control/media.py for why this can't live in the handler alone.

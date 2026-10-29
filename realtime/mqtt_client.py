@@ -35,6 +35,16 @@ def real_mqtt_client_factory():
     return mqtt.Client()
 
 
+def _parse_version(value):
+    """Dotted version as a tuple of ints, or None if it isn't one. Returning
+    None rather than raising keeps an unparseable version a logging problem
+    instead of killing the MQTT callback."""
+    try:
+        return tuple(int(part) for part in str(value).split("."))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 class BackendMqttClient:
     """Subscribes to bridge registration, telemetry, state, heartbeat, and
     ack topics, updating the in-memory RobotRegistry and forwarding acks to
@@ -245,15 +255,9 @@ class BackendMqttClient:
                 self._skew_remedy(reported, SCHEMA_VERSION),
             )
 
-    @staticmethod
-    def _parse_version(value: str):
-        """Dotted version as a tuple of ints, or None if it isn't one. Returning
-        None rather than raising keeps an unparseable version a logging problem
-        instead of killing the MQTT callback."""
-        try:
-            return tuple(int(part) for part in str(value).split("."))
-        except (AttributeError, TypeError, ValueError):
-            return None
+    # Kept as a class attribute for existing callers; the logic is module-level
+    # so runs/dispatch.py can gate on a schema version too.
+    _parse_version = staticmethod(lambda value: _parse_version(value))
 
     @classmethod
     def _skew_remedy(cls, edge: str, cloud: str) -> str:
