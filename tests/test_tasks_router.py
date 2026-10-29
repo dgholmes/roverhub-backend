@@ -514,3 +514,85 @@ def test_an_edit_leaves_other_tasks_runs_alone(tmp_path):
     store.put_occurrence(other)
     client.put("/tasks/t-1", json={**created, "schedule": None})
     assert store.get_occurrence(other.occurrence_id) is not None
+
+
+# -- run-now that starts the mission at once (edge mission runs, spec 5.2) ------
+
+class _DispatchEnv:
+    def __init__(self, tmp_path, online=True):
+        from control.commands import CommandStore
+        from missions.router import MissionStore
+        from robots.registry import RobotRegistry
+        from runs.dispatch import RunDispatcher
+        from runs.store import RunStore
+        from shared.schemas.missions import MissionLibraryEntry
+
+        self.registry = RobotRegistry()
+        self.registry.upsert_from_registration("robot-1", "site-a", "quad", "b-1", "0.0.11")
+        self.registry.update_state("robot-1", "STAND", "stand", bridge_boot_id="boot-a")
+        if not online:
+            self.registry.mark_offline("robot-1")
+        self.runs = RunStore(str(tmp_path / "runs"))
+        self.missions = MissionStore(str(tmp_path / "missions"))
+        self.missions.put(MissionLibraryEntry(
+            mission_id="m-1", name="Patrol", type="patrol", kind="program", creator="x",
+            updated_at="2026-10-23T00:00:00Z", map_id="map-1", site_id="site-a",
+            program_state='{"blocks":{}}'))
+        self.published = []
+        self.tasks_dir = str(tmp_path / "tasks")
+        dispatcher = RunDispatcher(
+            self.registry, self.runs, TaskStore(self.tasks_dir), CommandStore(),
+            lambda robot_id, command: self.published.append(command))
+        app = FastAPI()
+        app.include_router(build_tasks_router(
+            self.tasks_dir, clock=_Clock(), dispatcher=dispatcher, mission_store=self.missions))
+        self.client = TestClient(app)
+        self.client.put("/tasks/t-1", json=_task(max_duration_min=2))
+
+    def post(self, **over):
+        body = {"steps": [{"kind": "command", "blockId": "b1", "label": "Stand",
+                           "type": "SET_STATE", "params": {"target": "stand"}}],
+                "started_by": "operator-dev", **over}
+        return self.client.post("/tasks/t-1/run-now", json=body)
+
+
+def test_run_now_with_steps_dispatches_immediately_and_stores_running_occurrence(tmp_path):
+    env = _DispatchEnv(tmp_path)
+    response = env.post()
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    occurrence, run = body["occurrence"], body["run"]
+    assert occurrence["status"] == "running"
+    assert occurrence["run_id"] == occurrence["occurrence_id"] == run["run_id"]
+    assert (run["result"], run["source"], run["robot_id"]) == ("running", "run_now", "robot-1")
+    assert body["command"]["type"] == "START_MISSION"
+    assert env.published[0].params["max_duration_s"] == 120
+    stored = TaskStore(env.tasks_dir).get_occurrence(occurrence["occurrence_id"])
+    assert stored.status == "running" and stored.run_id == run["run_id"]
+
+
+def test_run_now_refused_stores_no_occurrence(tmp_path):
+    env = _DispatchEnv(tmp_path, online=False)
+    response = env.post()
+
+    assert response.status_code == 409
+    assert "offline" in response.json()["detail"]
+    assert TaskStore(env.tasks_dir).list_occurrences(
+        None, "2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z") == []
+    assert env.runs.list() == []
+
+
+def test_run_now_without_body_still_only_queues(tmp_path):
+    env = _DispatchEnv(tmp_path)
+    response = env.client.post("/tasks/t-1/run-now")
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "due" and response.json()["run_id"] is None
+    assert env.published == []
+
+
+def test_run_now_with_steps_on_a_task_with_no_robot_is_409(tmp_path):
+    env = _DispatchEnv(tmp_path)
+    env.client.put("/tasks/t-1", json={**_task(robot_id=None), "version": 1})
+    assert env.post().status_code == 409

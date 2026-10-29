@@ -177,3 +177,22 @@ class RunDispatcher:
         run_id = (command.params or {}).get("run_id")
         if run_id:
             self.start_failed(run_id, command.failure_reason or command.current_stage)
+
+
+def make_run_ended_hook(task_store: TaskStore) -> Callable[[MissionRun], None]:
+    """The occurrence shares its run's id, so a finished run settles its
+    occurrence: completed is succeeded, an operator stop is cancelled, anything
+    else failed. A run with no occurrence (the editor's) is nothing to do."""
+    def on_run_ended(run: MissionRun) -> None:
+        occurrence = task_store.get_occurrence(run.run_id)
+        if occurrence is None:
+            return
+        if run.result == "completed":
+            occurrence.status = "succeeded"
+        elif run.result == "aborted" and run.end_reason == "stopped":
+            occurrence.status = "cancelled"
+        else:
+            occurrence.status = "failed"
+        occurrence.message = run.end_reason
+        task_store.put_occurrence(occurrence)
+    return on_run_ended

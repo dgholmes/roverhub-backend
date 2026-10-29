@@ -17,7 +17,7 @@ from missions.router import DEFAULT_MISSIONS_DIR, MissionStore, build_missions_r
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
 from robots.router import build_robots_router
-from runs.dispatch import RunDispatcher
+from runs.dispatch import RunDispatcher, make_run_ended_hook
 from runs.bucket import from_env as bucket_from_env
 from runs.reconcile import make_state_hook
 from runs.router import build_runs_router
@@ -96,9 +96,11 @@ app.include_router(build_missions_router(
 # The copier shares the router's own RunStore so its per-run locks coordinate
 # with PUT /runs; hence the forwarding hook, bound once the copier exists.
 _copier = None
+_run_ended = None  # bound below, once the task store exists
 runs_router = build_runs_router(
     runs_dir=os.environ.get("RUNS_DIR", DEFAULT_RUNS_DIR),
     on_change=lambda run_id, path: _copier.on_change(run_id, path) if _copier else None,
+    on_run_ended=lambda run: _run_ended(run) if _run_ended else None,
 )
 _copier = bucket_from_env(runs_router.store)
 app.include_router(runs_router)
@@ -115,7 +117,11 @@ def _scheduler_enabled() -> bool:
 
 # run-now is told whether the loop is on, so it does not promise a tick that
 # will never come.
-app.include_router(build_tasks_router(tasks_dir=_tasks_dir, scheduler_enabled=_scheduler_enabled))
+tasks_router = build_tasks_router(
+    tasks_dir=_tasks_dir, scheduler_enabled=_scheduler_enabled,
+    mission_store=MissionStore(os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR)),
+)
+app.include_router(tasks_router)
 
 
 def _publish_mission_start(occurrence: TaskOccurrence, run: MissionRun) -> None:
@@ -160,6 +166,10 @@ _run_dispatcher = RunDispatcher(
     on_change=lambda run_id, path: _copier.on_change(run_id, path) if _copier else None,
 )
 runs_router.dispatcher = _run_dispatcher
+tasks_router.dispatcher = _run_dispatcher
+# The edge's run_ended closes the run record (runs/router.py); this settles the
+# task occurrence that shares its id.
+_run_ended = make_run_ended_hook(_reconcile_task_store)
 # Rejects oversized audio-clip uploads by Content-Length before Starlette's
 # multipart parser spools the body -- see ContentLengthLimitMiddleware's
 # docstring in control/media.py for why this can't live in the handler alone.

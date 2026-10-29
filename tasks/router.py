@@ -28,11 +28,14 @@ from datetime import timezone
 from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from api.common import now_iso, read_bounded_body
+from missions.router import MissionStore
+from runs.dispatch import RunDispatcher, StartRefused
+from shared.schemas.runs import RunNowRequest
 from shared.schemas.tasks import MissionSchedule, MissionTask, TaskOccurrence
 from tasks.scheduler import materialise, parse_start
 from tasks.store import TaskStore, parse_utc
@@ -110,6 +113,8 @@ def build_tasks_router(
     tasks_dir: str,
     clock: Callable[[], str] = now_iso,
     scheduler_enabled: Callable[[], bool] = lambda: True,
+    dispatcher: Optional[RunDispatcher] = None,
+    mission_store: Optional[MissionStore] = None,
 ) -> APIRouter:
     """`clock` returns the UTC ISO string stamped into `updated_at` and used as
     the due time of a run-now; injectable so both are testable.
@@ -120,6 +125,9 @@ def build_tasks_router(
     occurrence with no loop to decide it would otherwise be promised a tick that
     never comes."""
     router = APIRouter()
+    # The app builds the dispatcher after this router, so it may set the
+    # attribute later; run-now reads it per request.
+    router.dispatcher = dispatcher  # type: ignore[attr-defined]
     store = TaskStore(tasks_dir)
 
     @router.get("/tasks")
@@ -229,7 +237,7 @@ def build_tasks_router(
         return Response(status_code=204)
 
     @router.post("/tasks/{task_id}/run-now", status_code=202)
-    def run_now(task_id: str):
+    def run_now(task_id: str, body: Optional[RunNowRequest] = Body(default=None)):
         task = store.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
@@ -245,6 +253,8 @@ def build_tasks_router(
         # Same id scheme as the scheduler's, to the second: a double click, or a
         # run-now landing on a slot the schedule already materialised, is the
         # same occurrence, not a second one.
+        if body is not None:
+            return _start_now(task, body, occurrence_id, due_at)
         existing = store.get_occurrence(occurrence_id)
         if existing is not None:
             return JSONResponse(status_code=202, content=existing.model_dump(mode="json"))
@@ -265,5 +275,36 @@ def build_tasks_router(
         )
         store.put_occurrence(occurrence)
         return JSONResponse(status_code=202, content=occurrence.model_dump(mode="json"))
+
+    def _start_now(task: MissionTask, body: RunNowRequest, occurrence_id: str, due_at: str):
+        """Run now with the program's steps: start on the robot at once. The
+        occurrence is stored only once the dispatcher accepted, so a refusal
+        leaves nothing on the calendar."""
+        active = router.dispatcher  # type: ignore[attr-defined]
+        if active is None or mission_store is None:
+            raise HTTPException(status_code=503, detail="starting runs is not configured")
+        if not task.robot_id:
+            raise HTTPException(status_code=409, detail="task has no robot assigned")
+        mission = mission_store.get(task.mission_id)
+        if mission is None:
+            raise HTTPException(status_code=404, detail="mission not found")
+        try:
+            run, command = active.start(
+                task.robot_id, mission, body.steps, source="run_now", started_by=body.started_by,
+                max_duration_s=task.max_duration_min * 60 if task.max_duration_min else None,
+                run_id=occurrence_id)
+        except StartRefused as refused:
+            raise HTTPException(status_code=refused.status, detail=refused.message)
+        occurrence = TaskOccurrence(
+            occurrence_id=occurrence_id, task_id=task.task_id, mission_id=task.mission_id,
+            site_id=task.site_id, robot_id=task.robot_id, due_at=due_at, status="running",
+            run_id=occurrence_id, message="Run-now: started on the robot.",
+        )
+        store.put_occurrence(occurrence)
+        return JSONResponse(status_code=201, content={
+            "occurrence": occurrence.model_dump(mode="json"),
+            "run": run.model_dump(mode="json"),
+            "command": command.model_dump(mode="json"),
+        })
 
     return router

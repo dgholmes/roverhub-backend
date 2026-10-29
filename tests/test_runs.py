@@ -1,4 +1,5 @@
 """File-backed run records: runs/store.py, runs/router.py."""
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -155,3 +156,99 @@ def test_file_name_with_trailing_newline_is_rejected(tmp_path):
     with pytest.raises(HTTPException) as exc:
         store.file_path("20261016-060000-m-1-rvr-01", "photos/a.jpg\n")
     assert exc.value.status_code == 400
+
+
+# -- run_ended closes the run and its occurrence (edge mission runs, spec 8) ----
+
+RID = "20261016-060000-m-1-rvr-01"
+
+
+def _ended(seq, result=None, reason=None, at="2026-10-16T06:09:00Z"):
+    return {"run_id": RID, "seq": seq, "at": at, "kind": "run_ended",
+            "result": result, "reason": reason}
+
+
+def _running_client(tmp_path, changes=None, ended=None):
+    app = FastAPI()
+    app.include_router(build_runs_router(
+        str(tmp_path),
+        on_change=(lambda r, p: changes.append((r, p))) if changes is not None else (lambda r, p: None),
+        on_run_ended=(lambda run: ended.append(run)) if ended is not None else (lambda run: None)))
+    client = TestClient(app)
+    assert client.put(f"/runs/{RID}", json=_run()).status_code == 200
+    return client
+
+
+def test_run_ended_event_closes_run(tmp_path):
+    changes, ended = [], []
+    client = _running_client(tmp_path, changes, ended)
+    changes.clear()
+
+    r = client.post(f"/runs/{RID}/events", json={"events": [_ended(1, "completed")]})
+
+    assert r.status_code == 200
+    run = client.get(f"/runs/{RID}").json()["run"]
+    assert (run["result"], run["ended_at"], run["end_reason"]) == ("completed", "2026-10-16T06:09:00Z", None)
+    assert [e.result for e in ended] == ["completed"]
+    assert (RID, None) in changes
+
+
+def test_run_ended_without_a_result_is_failed(tmp_path):
+    client = _running_client(tmp_path)
+    client.post(f"/runs/{RID}/events", json={"events": [_ended(1, None, "estop")]})
+    run = client.get(f"/runs/{RID}").json()["run"]
+    assert (run["result"], run["end_reason"]) == ("failed", "estop")
+
+
+def test_duplicate_run_ended_is_harmless(tmp_path):
+    ended = []
+    client = _running_client(tmp_path, ended=ended)
+    path = f"/runs/{RID}/events"
+    client.post(path, json={"events": [_ended(1, "completed")]})
+    # A resend, and a later conflicting run_ended under a new seq.
+    client.post(path, json={"events": [_ended(1, "completed")]})
+    client.post(path, json={"events": [_ended(2, "failed", "late", "2026-10-16T07:00:00Z")]})
+
+    run = client.get(f"/runs/{RID}").json()["run"]
+    assert (run["result"], run["ended_at"], run["end_reason"]) == ("completed", "2026-10-16T06:09:00Z", None)
+    assert len(ended) == 1
+
+
+@pytest.mark.parametrize("result, reason, status", [
+    ("completed", None, "succeeded"),
+    ("aborted", "stopped", "cancelled"),
+    ("aborted", "estop", "failed"),
+    ("failed", "commandFailed", "failed"),
+])
+def test_run_ended_moves_occurrence_to_succeeded_cancelled_or_failed(tmp_path, result, reason, status):
+    from runs.dispatch import make_run_ended_hook
+    from shared.schemas.tasks import TaskOccurrence
+    from tasks.store import TaskStore
+
+    tasks = TaskStore(str(tmp_path / "tasks"))
+    tasks.put_occurrence(TaskOccurrence(
+        occurrence_id=RID, task_id="t-1", mission_id="m-1", site_id="site-a",
+        robot_id="rvr-01", due_at="2026-10-16T06:00:00Z", status="running", run_id=RID))
+    app = FastAPI()
+    app.include_router(build_runs_router(str(tmp_path / "runs"), on_run_ended=make_run_ended_hook(tasks)))
+    client = TestClient(app)
+    client.put(f"/runs/{RID}", json=_run())
+
+    client.post(f"/runs/{RID}/events", json={"events": [_ended(1, result, reason)]})
+
+    occ = tasks.get_occurrence(RID)
+    assert occ.status == status
+    assert occ.message == reason
+
+
+def test_run_ended_with_no_occurrence_is_fine(tmp_path):
+    from runs.dispatch import make_run_ended_hook
+    from tasks.store import TaskStore
+
+    app = FastAPI()
+    app.include_router(build_runs_router(
+        str(tmp_path / "runs"), on_run_ended=make_run_ended_hook(TaskStore(str(tmp_path / "tasks")))))
+    client = TestClient(app)
+    client.put(f"/runs/{RID}", json=_run())
+    r = client.post(f"/runs/{RID}/events", json={"events": [_ended(1, "completed")]})
+    assert r.status_code == 200

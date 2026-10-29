@@ -34,7 +34,8 @@ def _summary(store: RunStore, run: MissionRun) -> dict:
 
 
 def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: None,
-                      dispatcher: Optional[RunDispatcher] = None) -> APIRouter:
+                      dispatcher: Optional[RunDispatcher] = None,
+                      on_run_ended: Callable[[MissionRun], None] = lambda run: None) -> APIRouter:
     router = APIRouter()
     # The dispatcher needs this router's store, so the app may also set the
     # attribute after building both; the route reads it per request.
@@ -78,9 +79,26 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
         _require(run_id)
         if any(e.run_id != run_id for e in batch.events):
             raise HTTPException(status_code=400, detail="event run_id does not match the path")
-        added = store.add_events(run_id, batch.events)
+        closed: Optional[MissionRun] = None
+        # One lock for the append and the close: the store dedupes by seq, so
+        # "not already stored" is how a resent run_ended is told from a new one.
+        with store.lock(run_id):
+            seen = {e.seq for e in store.events(run_id)}
+            added = store.add_events(run_id, batch.events)
+            ending = next((e for e in batch.events if e.kind == "run_ended" and e.seq not in seen), None)
+            run = store.get(run_id)
+            # A run that already ended keeps the outcome it was first given.
+            if ending is not None and run is not None and run.result == "running":
+                run.result = ending.result or "failed"
+                run.ended_at = ending.at
+                run.end_reason = ending.reason
+                store.put(run)
+                closed = run
         if added > 0:
             on_change(run_id, EVENTS_FILE)
+        if closed is not None:
+            on_change(run_id, None)
+            on_run_ended(closed)
         return {"added": added, "total": len(store.events(run_id))}
 
     @router.get("/runs")
