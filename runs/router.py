@@ -2,6 +2,7 @@
 or write any run, like every endpoint today."""
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 import zipfile
@@ -18,6 +19,8 @@ from shared.schemas.runs import MissionRun, RunEvent, StartRunRequest
 from .dispatch import RunDispatcher, StartRefused
 
 from .store import CONTENT_TYPES, EVENTS_FILE, RUN_FILE, RunStore
+
+logger = logging.getLogger("roverhub.runs")
 
 OnChange = Callable[[str, Optional[str]], None]
 
@@ -80,6 +83,7 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
         if any(e.run_id != run_id for e in batch.events):
             raise HTTPException(status_code=400, detail="event run_id does not match the path")
         closed: Optional[MissionRun] = None
+        resent: Optional[MissionRun] = None
         # One lock for the append and the close: the store dedupes by seq, so
         # "not already stored" is how a resent run_ended is told from a new one.
         with store.lock(run_id):
@@ -94,11 +98,24 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
                 run.end_reason = ending.reason
                 store.put(run)
                 closed = run
+            elif run is not None and run.result != "running" and any(
+                    e.kind == "run_ended" and e.seq in seen for e in batch.events):
+                # A resend of a run_ended we already stored. The run keeps the
+                # outcome it was first given; only the occurrence settling is
+                # retried, in case the first attempt failed after the lock.
+                resent = run
         if added > 0:
             on_change(run_id, EVENTS_FILE)
         if closed is not None:
             on_change(run_id, None)
-            on_run_ended(closed)
+        settle = closed if closed is not None else resent
+        if settle is not None:
+            try:
+                on_run_ended(settle)
+            except Exception:
+                # Settling the occurrence is retried on the edge's resend; it
+                # must not turn a stored event into a failed request.
+                logger.exception("could not settle the occurrence of run %s", run_id)
         return {"added": added, "total": len(store.events(run_id))}
 
     @router.get("/runs")

@@ -187,6 +187,10 @@ def make_run_ended_hook(task_store: TaskStore) -> Callable[[MissionRun], None]:
         occurrence = task_store.get_occurrence(run.run_id)
         if occurrence is None:
             return
+        # A settled occurrence is final: a resent run_ended (or one racing
+        # start_failed) must not rewrite what an operator already saw.
+        if occurrence.status in ("succeeded", "failed", "cancelled", "skipped"):
+            return
         if run.result == "completed":
             occurrence.status = "succeeded"
         elif run.result == "aborted" and run.end_reason == "stopped":

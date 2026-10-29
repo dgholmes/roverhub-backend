@@ -211,7 +211,9 @@ def test_duplicate_run_ended_is_harmless(tmp_path):
 
     run = client.get(f"/runs/{RID}").json()["run"]
     assert (run["result"], run["ended_at"], run["end_reason"]) == ("completed", "2026-10-16T06:09:00Z", None)
-    assert len(ended) == 1
+    # The first close, then the genuine resend (seq 1) which re-settles the
+    # occurrence with the stored run; the conflicting seq 2 is not a resend.
+    assert [e.result for e in ended] == ["completed", "completed"]
 
 
 @pytest.mark.parametrize("result, reason, status", [
@@ -252,3 +254,53 @@ def test_run_ended_with_no_occurrence_is_fine(tmp_path):
     client.put(f"/runs/{RID}", json=_run())
     r = client.post(f"/runs/{RID}/events", json={"events": [_ended(1, "completed")]})
     assert r.status_code == 200
+
+
+def test_a_failing_run_ended_hook_does_not_fail_the_post_and_a_resend_retries_it(tmp_path):
+    calls = []
+
+    def flaky(run):
+        calls.append(run.result)
+        if len(calls) == 1:
+            raise OSError("task store unavailable")
+
+    app = FastAPI()
+    app.include_router(build_runs_router(str(tmp_path), on_run_ended=flaky))
+    client = TestClient(app)
+    client.put(f"/runs/{RID}", json=_run())
+    path = f"/runs/{RID}/events"
+
+    assert client.post(path, json={"events": [_ended(1, "completed")]}).status_code == 200
+    assert client.post(path, json={"events": [_ended(1, "completed")]}).status_code == 200
+
+    assert calls == ["completed", "completed"]
+    run = client.get(f"/runs/{RID}").json()["run"]
+    assert (run["result"], run["ended_at"]) == ("completed", "2026-10-16T06:09:00Z")
+
+
+def test_a_resent_run_ended_never_overwrites_the_stored_outcome(tmp_path):
+    ended = []
+    client = _running_client(tmp_path, ended=ended)
+    path = f"/runs/{RID}/events"
+    client.post(path, json={"events": [_ended(1, "completed")]})
+    client.post(path, json={"events": [_ended(1, "failed", "x", "2026-10-16T09:00:00Z")]})
+    assert ended[-1].result == "completed" and ended[-1].ended_at == "2026-10-16T06:09:00Z"
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed", "cancelled", "skipped"])
+def test_the_run_ended_hook_never_moves_a_settled_occurrence(tmp_path, status):
+    from runs.dispatch import make_run_ended_hook
+    from shared.schemas.runs import MissionRun
+    from shared.schemas.tasks import TaskOccurrence
+    from tasks.store import TaskStore
+
+    tasks = TaskStore(str(tmp_path / "tasks"))
+    tasks.put_occurrence(TaskOccurrence(
+        occurrence_id=RID, task_id="t-1", mission_id="m-1", site_id="site-a",
+        robot_id="rvr-01", due_at="2026-10-16T06:00:00Z", status=status, message="first"))
+    run = MissionRun.model_validate({**_run(), "result": "completed"})
+
+    make_run_ended_hook(tasks)(run)
+
+    occ = tasks.get_occurrence(RID)
+    assert (occ.status, occ.message) == (status, "first")
