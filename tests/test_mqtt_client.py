@@ -408,3 +408,45 @@ def test_heartbeat_carries_host_metrics():
     assert record.host_metrics["cpu_percent"] == 12.5
     assert record.host_metrics["memory_percent"] is None
     assert record.host_metrics_at == "2026-10-15T00:00:05Z"
+
+
+def _state_payload(**extra):
+    return json.dumps({
+        "robot_id": "robot-dev-01", "site_id": "site-dev",
+        "abstract_state": "STAND", "sdk_state": "balance_stand",
+        "updated_at": "2026-07-20T00:00:00Z", **extra,
+    }).encode()
+
+
+def test_state_message_with_new_fields_calls_on_state():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    calls = []
+    client = BackendMqttClient(
+        "mqtt://localhost:1883", registry, _FakeMqttClient,
+        on_state=lambda robot_id, previous, boot: calls.append((robot_id, previous, boot)),
+    )
+    run = {"run_id": "r-1", "status": "running", "started_at": "2026-10-29T00:00:00Z"}
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/state", _state_payload(
+        control_owner="mission:r-1", active_run=run, bridge_boot_id="boot-a"))
+    client.handle_message("roverhub/site-dev/robot-dev-01/state", _state_payload(bridge_boot_id="boot-b"))
+
+    assert calls == [("robot-dev-01", None, "boot-a"), ("robot-dev-01", "boot-a", "boot-b")]
+    record = registry.get("robot-dev-01")
+    assert record.bridge_boot_id == "boot-b"
+
+
+def test_state_message_from_0_0_9_bridge_still_updates_state():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    calls = []
+    client = BackendMqttClient(
+        "mqtt://localhost:1883", registry, _FakeMqttClient,
+        on_state=lambda robot_id, previous, boot: calls.append((robot_id, previous, boot)),
+    )
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/state", _state_payload())
+
+    assert registry.get("robot-dev-01").abstract_state == "STAND"
+    assert calls == [("robot-dev-01", None, None)]

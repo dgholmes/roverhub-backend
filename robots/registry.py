@@ -65,6 +65,10 @@ class RobotRecord:
     acceptance: Acceptance = "accepted"
     acceptance_source: Optional[AcceptanceSource] = None
     acceptance_changed_at: Optional[datetime] = None
+    # From /state (schema 0.0.11). active_run is an ActiveRun as a plain dict.
+    control_owner: Optional[str] = None
+    active_run: Optional[dict] = None
+    bridge_boot_id: Optional[str] = None
 
 
 class RobotRegistry:
@@ -144,12 +148,25 @@ class RobotRegistry:
             if record is not None:
                 record.online = False
 
-    def update_state(self, robot_id: str, abstract_state: str, sdk_state: str) -> None:
+    def update_state(
+        self, robot_id: str, abstract_state: str, sdk_state: str, *,
+        control_owner: Optional[str] = None, active_run: Optional[dict] = None,
+        bridge_boot_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Returns the PREVIOUS bridge boot id, so the caller can tell a restart.
+        Owner and active run are replaced each time: a state message that omits
+        them means there is none, and stale ones would show a finished run."""
         with self._lock:
             record = self._robots.get(robot_id)
-            if record is not None:
-                record.abstract_state = abstract_state
-                record.sdk_state = sdk_state
+            if record is None:
+                return None
+            previous = record.bridge_boot_id
+            record.abstract_state = abstract_state
+            record.sdk_state = sdk_state
+            record.control_owner = control_owner
+            record.active_run = active_run
+            record.bridge_boot_id = bridge_boot_id
+            return previous
 
     def update_host_metrics(self, robot_id: str, metrics: Optional[dict], at: Optional[str]) -> None:
         """From each heartbeat. A heartbeat without metrics (old bridge, or a

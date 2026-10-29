@@ -114,3 +114,30 @@ def test_a_heartbeat_without_metrics_clears_stale_ones():
 def test_an_unknown_acceptance_mode_is_refused():
     with pytest.raises(ValueError):
         RobotRegistry(acceptance_mode="strict")
+
+
+# --- Run ownership and bridge boot id (edge mission runs, Task 10) -----------
+
+
+def test_update_state_stores_owner_active_run_boot_and_returns_previous_boot():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    active = {"run_id": "r-1", "status": "running", "started_at": "2026-10-29T00:00:00Z"}
+
+    first = registry.update_state(
+        "robot-dev-01", "STAND", "balance_stand",
+        control_owner="mission:r-1", active_run=active, bridge_boot_id="boot-a",
+    )
+    second = registry.update_state("robot-dev-01", "STAND", "balance_stand", bridge_boot_id="boot-b")
+
+    assert first is None
+    assert second == "boot-a"
+    record = registry.get("robot-dev-01")
+    assert record.bridge_boot_id == "boot-b"
+    # A state message without the new fields clears them rather than keeping stale ones.
+    assert record.control_owner is None
+    assert record.active_run is None
+
+
+def test_update_state_on_unknown_robot_returns_none_for_boot():
+    assert RobotRegistry().update_state("ghost", "STAND", "x", bridge_boot_id="b") is None

@@ -47,10 +47,13 @@ class BackendMqttClient:
         registry,
         mqtt_client_factory: MqttClientFactory,
         on_ack: Optional[Callable] = None,
+        on_state: Optional[Callable[[str, Optional[str], Optional[str]], None]] = None,
     ):
         self._broker_url = broker_url
         self._registry = registry
         self._on_ack = on_ack
+        # (robot_id, previous_boot_id, boot_id), after the registry is updated.
+        self._on_state = on_state
         self._client = mqtt_client_factory()
         self._client.on_message = self._on_message
         self._client.on_connect = self._on_connect
@@ -166,9 +169,14 @@ class BackendMqttClient:
                     at=data.get("timestamp"),
                 )
         elif message_kind == "state":
-            self._registry.update_state(
+            boot_id = data.get("bridge_boot_id")
+            previous = self._registry.update_state(
                 data["robot_id"], abstract_state=data["abstract_state"], sdk_state=data["sdk_state"],
+                control_owner=data.get("control_owner"), active_run=data.get("active_run"),
+                bridge_boot_id=boot_id,
             )
+            if self._on_state is not None:
+                self._on_state(data["robot_id"], previous, boot_id)
         elif message_kind == "ack" and self._on_ack is not None:
             from shared.schemas.commands import Command
 

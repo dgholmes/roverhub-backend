@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -17,6 +18,7 @@ from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry
 from robots.router import build_robots_router
 from runs.bucket import from_env as bucket_from_env
+from runs.reconcile import reconcile_boot
 from runs.router import build_runs_router
 from runs.store import DEFAULT_RUNS_DIR
 from tasks.router import build_tasks_router
@@ -38,9 +40,17 @@ registry = RobotRegistry(
     preaccepted=os.environ.get("ACCEPTED_DEVICES", "").split(","),
 )
 command_store = CommandStore()
+_reconcile_hook = None  # bound below, once the run and task stores exist
+
+
+def _on_state(robot_id, previous_boot_id, boot_id):
+    if _reconcile_hook is not None:
+        _reconcile_hook(robot_id, previous_boot_id, boot_id)
+
+
 mqtt_client = BackendMqttClient(
     os.environ.get("CLOUD_MQTT_URL", "mqtt://localhost:1883"), registry, real_mqtt_client_factory,
-    on_ack=command_store.apply_ack,
+    on_ack=command_store.apply_ack, on_state=_on_state,
 )
 
 app = FastAPI(title="RoverHub Backend (dev)")
@@ -119,6 +129,20 @@ scheduler_loop = SchedulerLoop(
     _publish_mission_start,
     run_store=runs_router.store, executor_kinds=EXECUTOR_KINDS,
 )
+_reconcile_task_store = TaskStore(_tasks_dir)
+
+
+def _reconcile_on_state(robot_id, previous_boot_id, boot_id):
+    # Only on a CHANGED boot id (spec 6.7): the heartbeat republishes the same
+    # id, and a run that ended while the cloud was unreachable must not be
+    # failed as bridgeRestarted just because its run_ended has not arrived yet.
+    if boot_id is None or previous_boot_id == boot_id:
+        return
+    reconcile_boot(runs_router.store, _reconcile_task_store, robot_id, boot_id,
+                   datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
+_reconcile_hook = _reconcile_on_state
 # Rejects oversized audio-clip uploads by Content-Length before Starlette's
 # multipart parser spools the body -- see ContentLengthLimitMiddleware's
 # docstring in control/media.py for why this can't live in the handler alone.
