@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Literal, Optional
 
 # Device acceptance (2026-10-15). INFORMATIONAL ONLY -- read this before
@@ -44,6 +45,26 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# A robot is offline once nothing has been heard from it for this long. Every
+# bridge message refreshes last_seen -- registration and heartbeat every
+# HEARTBEAT_INTERVAL_S (5 s by default on the edge), telemetry at 10 Hz -- so
+# 15 s is three heartbeat intervals: two lost heartbeats are tolerated, a third
+# is not. The bridge sets no MQTT last will, so silence is the only signal a
+# dead bridge, a dead link or a dead broker connection gives.
+DEFAULT_OFFLINE_AFTER_S = 15.0
+
+
+def offline_after_s_from_env() -> Optional[float]:
+    """ROBOT_OFFLINE_AFTER_S, in seconds. 0 (or less) disables aging, which
+    restores the old never-offline behaviour; a non-number refuses to start
+    rather than silently picking a value."""
+    raw = os.environ.get("ROBOT_OFFLINE_AFTER_S", "").strip()
+    if not raw:
+        return DEFAULT_OFFLINE_AFTER_S
+    value = float(raw)
+    return value if value > 0 else None
+
+
 @dataclass
 class RobotRecord:
     robot_id: str
@@ -80,6 +101,7 @@ class RobotRegistry:
         acceptance_mode: AcceptanceMode = "auto",
         preaccepted: Iterable[str] = (),
         clock: Callable[[], datetime] = _now,
+        offline_after_s: Optional[float] = DEFAULT_OFFLINE_AFTER_S,
     ):
         if acceptance_mode not in ("auto", "manual"):
             raise ValueError(f"acceptance_mode must be 'auto' or 'manual', not {acceptance_mode!r}")
@@ -87,6 +109,14 @@ class RobotRegistry:
         self._mode = acceptance_mode
         self._preaccepted = {item.strip() for item in preaccepted if item and item.strip()}
         self._clock = clock
+        # None (or 0) disables aging. Aging is applied when a record is read,
+        # not by a background sweep: every reader -- dispatch, the scheduler,
+        # the reaper, GET /robots -- goes through get()/list_all(), so they all
+        # see the same answer at the same moment, with no task to start and no
+        # sweep interval adding latency.
+        self._offline_after = (
+            timedelta(seconds=offline_after_s) if offline_after_s and offline_after_s > 0 else None
+        )
         # paho's network thread writes; FastAPI's threadpool reads and decides.
         self._lock = threading.RLock()
 
@@ -197,9 +227,21 @@ class RobotRegistry:
         with self._lock:
             return self._robots.pop(robot_id, None) is not None
 
+    def _age(self, record: RobotRecord) -> RobotRecord:
+        """Mark a record offline if it has gone quiet. Only ever clears
+        online: the next registration, heartbeat or telemetry sets it again
+        (mark_seen / upsert_from_registration). Caller holds the lock."""
+        if (self._offline_after is not None and record.online
+                and record.last_seen is not None
+                and self._clock() - record.last_seen > self._offline_after):
+            record.online = False
+        return record
+
     def get(self, robot_id: str) -> Optional[RobotRecord]:
-        return self._robots.get(robot_id)
+        with self._lock:
+            record = self._robots.get(robot_id)
+            return self._age(record) if record is not None else None
 
     def list_all(self) -> List[RobotRecord]:
         with self._lock:
-            return list(self._robots.values())
+            return [self._age(record) for record in self._robots.values()]

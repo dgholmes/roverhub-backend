@@ -15,7 +15,7 @@ from control.snapshots import DEFAULT_SNAPSHOTS_DIR, build_snapshot_router
 from control.router import build_router
 from missions.router import DEFAULT_MISSIONS_DIR, MissionStore, build_missions_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
-from robots.registry import RobotRegistry
+from robots.registry import RobotRegistry, offline_after_s_from_env
 from robots.router import build_robots_router
 from runs.dispatch import RunDispatcher, make_run_ended_hook
 from runs.bucket import from_env as bucket_from_env
@@ -41,6 +41,9 @@ load_dotenv()  # loads .env in the working directory, if present; real env vars 
 registry = RobotRegistry(
     acceptance_mode=os.environ.get("DEVICE_ACCEPTANCE", "auto").strip().lower() or "auto",
     preaccepted=os.environ.get("ACCEPTED_DEVICES", "").split(","),
+    # A robot unheard from for ROBOT_OFFLINE_AFTER_S (default 15 s, three
+    # heartbeats) reads as offline; dispatch and the scheduler refuse it.
+    offline_after_s=offline_after_s_from_env(),
 )
 command_store = CommandStore()
 _reconcile_hook = None  # bound below, once the run and task stores exist

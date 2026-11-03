@@ -154,3 +154,34 @@ def test_grace_restarts_when_the_robot_comes_back_online(env):
     env.now = T0 + 1000 + NAMED_GRACE_S + 1
     env.reaper.sweep()
     assert env.failed == [("r-1", "noAnswer")]
+
+
+def test_a_robot_that_went_silent_is_not_judged_until_it_returns(tmp_path):
+    """A bridge that stops talking ages offline in the registry. Its run is
+    neither reaped while it is silent (nothing can vouch either way) nor the
+    moment it returns: the grace period restarts on its return."""
+    from datetime import timedelta
+
+    wall = [datetime(2026, 10, 29, 10, 0, 0, tzinfo=timezone.utc)]
+    env = Env(tmp_path)
+    env.registry = RobotRegistry(clock=lambda: wall[0], offline_after_s=15.0)
+    env.registry.upsert_from_registration("rvr-01", "site-a", "quad", "b-1", "0.0.11")
+    env.set_state(active_run=None)
+    env.reaper._registry = env.registry
+    env.put()
+
+    def at(seconds):
+        env.now = T0 + seconds
+        wall[0] = datetime.fromtimestamp(T0 + seconds, tz=timezone.utc)
+
+    at(0)
+    env.reaper.sweep()
+    at(NAMED_GRACE_S * 5)                    # silent all along: aged offline
+    assert env.registry.get("rvr-01").online is False
+    env.reaper.sweep()
+    assert env.failed == []
+
+    env.registry.mark_seen("rvr-01")         # its next heartbeat
+    assert env.registry.get("rvr-01").online is True
+    env.reaper.sweep()
+    assert env.failed == []                  # grace restarted, not reaped on return

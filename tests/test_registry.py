@@ -143,3 +143,112 @@ def test_update_state_stores_owner_active_run_boot_and_returns_previous_boot():
 
 def test_update_state_on_unknown_robot_returns_none_for_boot():
     assert RobotRegistry().update_state("ghost", "STAND", "x", bridge_boot_id="b") is None
+
+
+# --- Aging to offline (WBS 2.5.1) ---------------------------------------------
+# Nothing used to clear `online`: a bridge that died stayed online forever, so
+# dispatch, the scheduler and the reaper all trusted a robot nobody could reach.
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+
+class _Clock:
+    def __init__(self):
+        self.now = datetime(2026, 11, 3, 12, 0, 0, tzinfo=timezone.utc)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += timedelta(seconds=seconds)
+
+
+def _aging_registry(offline_after_s=15.0):
+    clock = _Clock()
+    registry = RobotRegistry(clock=clock, offline_after_s=offline_after_s)
+    registry.upsert_from_registration("robot-a", "site-dev", "quad")
+    return registry, clock
+
+
+def test_robot_stays_online_within_the_threshold():
+    registry, clock = _aging_registry()
+    clock.advance(15.0)
+    assert registry.get("robot-a").online is True
+
+
+def test_robot_goes_offline_once_last_seen_is_older_than_the_threshold():
+    registry, clock = _aging_registry()
+    clock.advance(15.1)
+    assert registry.get("robot-a").online is False
+
+
+def test_list_all_reports_aged_robots_offline():
+    registry, clock = _aging_registry()
+    registry.upsert_from_registration("robot-b", "site-dev", "wheel")
+    clock.advance(10)
+    registry.mark_seen("robot-b")
+    clock.advance(10)
+    online = {r.robot_id: r.online for r in registry.list_all()}
+    assert online == {"robot-a": False, "robot-b": True}
+
+
+def test_next_heartbeat_brings_an_aged_robot_back_online():
+    registry, clock = _aging_registry()
+    clock.advance(60)
+    assert registry.get("robot-a").online is False
+    registry.mark_seen("robot-a")
+    assert registry.get("robot-a").online is True
+
+
+def test_re_registration_brings_an_aged_robot_back_online():
+    registry, clock = _aging_registry()
+    clock.advance(60)
+    assert registry.get("robot-a").online is False
+    registry.upsert_from_registration("robot-a", "site-dev", "quad")
+    assert registry.get("robot-a").online is True
+
+
+def test_aging_keeps_last_seen_and_the_rest_of_the_record():
+    registry, clock = _aging_registry()
+    registry.update_state("robot-a", abstract_state="STAND", sdk_state="balance_stand")
+    seen = registry.get("robot-a").last_seen
+    clock.advance(60)
+    record = registry.get("robot-a")
+    assert record.online is False
+    assert record.last_seen == seen
+    assert record.abstract_state == "STAND"
+
+
+@pytest.mark.parametrize("disabled", [None, 0])
+def test_aging_can_be_disabled(disabled):
+    registry, clock = _aging_registry(offline_after_s=disabled)
+    clock.advance(3600)
+    assert registry.get("robot-a").online is True
+
+
+def test_default_threshold_is_a_few_heartbeat_intervals():
+    # The bridge heartbeats every 5 s (HEARTBEAT_INTERVAL_S); 15 s tolerates
+    # two lost heartbeats before calling the robot offline.
+    clock = _Clock()
+    registry = RobotRegistry(clock=clock)
+    registry.upsert_from_registration("robot-a", "site-dev", "quad")
+    clock.advance(14)
+    assert registry.get("robot-a").online is True
+    clock.advance(2)
+    assert registry.get("robot-a").online is False
+
+
+def test_offline_after_s_reads_the_environment(monkeypatch):
+    from robots.registry import offline_after_s_from_env
+
+    monkeypatch.setenv("ROBOT_OFFLINE_AFTER_S", "30")
+    assert offline_after_s_from_env() == 30.0
+    monkeypatch.setenv("ROBOT_OFFLINE_AFTER_S", "0")
+    assert offline_after_s_from_env() is None
+    monkeypatch.delenv("ROBOT_OFFLINE_AFTER_S")
+    assert offline_after_s_from_env() == 15.0
+    monkeypatch.setenv("ROBOT_OFFLINE_AFTER_S", "soon")
+    with pytest.raises(ValueError):
+        offline_after_s_from_env()
