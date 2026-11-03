@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: roverhub-backend
+      # roverhub-shared is the wire contract, cloned as a sibling exactly as on a
+      # dev machine (../shared). Use its branch of the same name when one exists,
+      # so a change that spans both repos is tested together; otherwise master.
+      # The repo is private: ROVERHUB_READ_TOKEN is a fine-grained PAT with
+      # read-only Contents access to dgholmes/roverhub-shared and
+      # dgholmes/roverhub-edge (one token, set in each repo that uses it).
+      - name: Pick roverhub-shared ref
+        id: shared
+        env:
+          TOKEN: ${{ secrets.ROVERHUB_READ_TOKEN }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Secret ROVERHUB_READ_TOKEN is not set (fine-grained PAT, Contents: read on roverhub-shared and roverhub-edge)."
+            exit 1
+          fi
+          if git ls-remote --exit-code --heads "https://x-access-token:${TOKEN}@github.com/dgholmes/roverhub-shared.git" "$BRANCH" >/dev/null; then
+            echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=master" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: dgholmes/roverhub-shared
+          ref: ${{ steps.shared.outputs.ref }}
+          token: ${{ secrets.ROVERHUB_READ_TOKEN }}
+          path: shared
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: roverhub-backend/requirements.txt
+      - name: Install
+        working-directory: roverhub-backend
+        run: |
+          pip install -r requirements.txt   # includes -e ../shared
+          pip install ruff mypy
+      - name: Lint (ruff)
+        working-directory: roverhub-backend
+        run: ruff check --output-format github .
+      - name: Test
+        working-directory: roverhub-backend
+        run: pytest -q
+      # Advisory until the existing errors (22 on 2026-11-03) are fixed; then
+      # drop continue-on-error so a new type error fails the build.
+      - name: Type-check (mypy, advisory)
+        working-directory: roverhub-backend
+        continue-on-error: true
+        run: mypy

@@ -61,7 +61,7 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
                 robot_id, request.mission, request.steps, source=request.source,
                 started_by=request.started_by, max_duration_s=request.max_duration_s)
         except StartRefused as refused:
-            raise HTTPException(status_code=refused.status, detail=refused.message)
+            raise HTTPException(status_code=refused.status, detail=refused.message) from refused
         return {"run": run.model_dump(mode="json"), "command": command.model_dump(mode="json")}
 
     @router.put("/runs/{run_id}")
@@ -169,7 +169,7 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
                 else:
                     start = max(0, size - int(last))
             except ValueError:
-                raise HTTPException(status_code=416, detail="bad range")
+                raise HTTPException(status_code=416, detail="bad range") from None
             end = min(end, size - 1)
             if start > end or start >= size:
                 return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})

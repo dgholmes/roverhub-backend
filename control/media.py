@@ -201,9 +201,9 @@ def build_media_router(clips_dir: str) -> APIRouter:
             wav = synthesize_wav(request.text)
         except TtsUnavailable as exc:
             # 501: the request is fine, this deployment cannot serve it.
-            raise HTTPException(status_code=501, detail=str(exc))
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
         except TtsError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         return Response(content=wav, media_type="audio/wav")
 

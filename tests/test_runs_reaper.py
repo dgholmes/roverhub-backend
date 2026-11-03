@@ -7,7 +7,6 @@ from robots.registry import RobotRegistry
 from runs.reaper import RunReaper, NAMED_GRACE_S
 from runs.store import RunStore
 from shared.schemas.runs import MissionRun
-from shared.schemas.tasks import TaskOccurrence
 from tasks.store import TaskStore
 from tests.test_runs import _run
 

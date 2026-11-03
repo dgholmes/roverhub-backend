@@ -52,7 +52,7 @@ def build_router(command_store: CommandStore, mqtt_client) -> APIRouter:
                 )
             )
             command_store.add(command)
-            raise HTTPException(status_code=503, detail=str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         return command
 
     @router.get("/robots/{robot_id}/commands/{command_id}")

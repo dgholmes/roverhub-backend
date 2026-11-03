@@ -303,7 +303,7 @@ def build_tasks_router(
                 max_duration_s=task.max_duration_min * 60 if task.max_duration_min else None,
                 run_id=occurrence_id, before_publish=store_dispatched)
         except StartRefused as refused:
-            raise HTTPException(status_code=refused.status, detail=refused.message)
+            raise HTTPException(status_code=refused.status, detail=refused.message) from refused
         occurrence = store.get_occurrence(occurrence_id)
         # Only a still-"dispatched" occurrence becomes running: a refusal or a
         # finished run that raced ahead of this line has already settled it.

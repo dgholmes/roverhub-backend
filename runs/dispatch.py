@@ -188,7 +188,7 @@ class RunDispatcher:
                 stage="execution_failed", at=datetime.now(timezone.utc).isoformat()))
             self._commands.add(command)
             self.start_failed(run.run_id, str(exc))
-            raise StartRefused(str(exc), 503)
+            raise StartRefused(str(exc), 503) from exc
         self._unanswered[run.run_id] = self._clock_s()
         return command
 
