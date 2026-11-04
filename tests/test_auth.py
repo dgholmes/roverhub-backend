@@ -161,6 +161,44 @@ def test_an_expired_token_is_refused(auth_on, monkeypatch):
     assert auth_on.user_for_token(token) is None
 
 
+def test_refresh_extends_a_live_session_and_keeps_revocation(auth_on):
+    user = _user(auth_on, "ana", {"site-a": "operator"})
+    clock = {"t": 1000.0}
+    auth_on.issuer = TokenIssuer("test-secret", ttl_s=100, clock=lambda: clock["t"])
+    client = TestClient(backend.app)
+    first = _login(client, "ana").json()
+    clock["t"] = 1060.0
+    r = client.post("/auth/refresh", headers={"Authorization": f"Bearer {first['access_token']}"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["expires_at"] == 1160 > first["expires_at"]
+    assert body["user"]["user_id"] == user.user_id and "password_hash" not in body["user"]
+    assert "rh_session" in r.headers.get("set-cookie", "")
+    # Past the first token's expiry, the refreshed one still works.
+    clock["t"] = 1120.0
+    assert client.get("/robots", headers={"Authorization": f"Bearer {body['access_token']}"}).status_code == 200
+    assert client.post("/auth/refresh",
+                       headers={"Authorization": f"Bearer {first['access_token']}"}).status_code == 401
+    # Signing out everywhere ends the refreshed token too: refresh never outlives revocation.
+    auth_on.users.revoke_tokens(user.user_id)
+    assert client.post("/auth/refresh",
+                       headers={"Authorization": f"Bearer {body['access_token']}"}).status_code == 401
+
+
+def test_refresh_needs_a_user_session(auth_on):
+    client = TestClient(backend.app)
+    assert client.post("/auth/refresh").status_code == 401
+    assert client.post("/auth/refresh", headers={"Authorization": "Bearer device-key-a"}).status_code == 403
+    # The cookie alone never authorises a POST, so another page cannot keep a session alive.
+    _user(auth_on, "ana", {"site-a": "operator"})
+    _login(client, "ana")
+    assert client.post("/auth/refresh").status_code == 401
+
+
+def test_refresh_is_not_found_with_sign_in_off():
+    assert TestClient(backend.app).post("/auth/refresh").status_code == 404
+
+
 # --- roles ------------------------------------------------------------------
 
 

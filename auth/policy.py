@@ -94,6 +94,7 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("GET", "/auth/config"): Rule(public=True),
     ("POST", "/auth/logout"): Rule(public=True),
     ("GET", "/auth/me"): Rule(signed_in=True),
+    ("POST", "/auth/refresh"): Rule(signed_in=True),
     ("POST", "/auth/password"): Rule(signed_in=True),
     # The broker's own checks. They take credentials in the body and answer
     # yes or no, so they are public in the same way /auth/login is.

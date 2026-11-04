@@ -87,6 +87,12 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None) -> A
         response.set_cookie(SESSION_COOKIE, token, max_age=max_age, httponly=True,
                             samesite="lax", secure=auth.secure_cookie, path="/")
 
+    def _session(response: Response, user) -> dict:
+        token, expires_at = auth.issuer.issue(user.user_id, user.token_version)
+        _set_cookie(response, token, max(0, expires_at - int(time.time())))
+        return {"access_token": token, "token_type": "bearer", "expires_at": expires_at,
+                "user": user.public()}
+
     @router.get("/auth/config")
     def config():
         """Lets the console decide whether to show the sign-in page at all."""
@@ -107,10 +113,24 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None) -> A
             raise HTTPException(status_code=401, detail="wrong username or password")
         throttle.succeeded(name)
         auth.users.record_login(user.user_id)
-        token, expires_at = auth.issuer.issue(user.user_id, user.token_version)
-        _set_cookie(response, token, max(0, expires_at - int(time.time())))
-        return {"access_token": token, "token_type": "bearer", "expires_at": expires_at,
-                "user": auth.users.get(user.user_id).public()}
+        return _session(response, auth.users.get(user.user_id))
+
+    @router.post("/auth/refresh")
+    def refresh(request: Request, response: Response):
+        """A fresh token for a session that is still valid, so a console left
+        open is never cut off at the token's expiry -- mid-drive included.
+
+        Only a live Bearer token gets here (the guard checks it, its version
+        and that the user is still enabled; the cookie never authorises a
+        POST), so revocation still ends everything: a password change, a
+        disable or "sign out everywhere" makes the next refresh fail. A console
+        that is closed for longer than the token's life signs in again."""
+        if not auth.enabled:
+            raise HTTPException(status_code=404, detail="sign-in is off on this server")
+        principal = principal_of(request)
+        if principal is None or principal.kind != "user":
+            raise HTTPException(status_code=403, detail="only a signed-in person can refresh a session")
+        return _session(response, principal.user)
 
     @router.post("/auth/logout", status_code=204)
     def logout():
