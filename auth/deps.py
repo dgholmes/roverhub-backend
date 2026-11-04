@@ -80,7 +80,8 @@ class Principal:
 class Auth:
     def __init__(self, *, enabled: bool, users: UserStore, issuer: TokenIssuer,
                  device_keys: Optional[Dict[str, str]] = None, broker_service_password: str = "",
-                 resolve_site: Optional[SiteResolver] = None, secure_cookie: bool = False):
+                 resolve_site: Optional[SiteResolver] = None, secure_cookie: bool = False,
+                 allow_unkeyed_bridges: bool = False):
         self.enabled = enabled
         self.users = users
         self.issuer = issuer
@@ -88,6 +89,9 @@ class Auth:
         self.broker_service_password = broker_service_password
         self.resolve_site: SiteResolver = resolve_site or (lambda params: (None, None))
         self.secure_cookie = secure_cookie
+        # Development only: people sign in, but bridges that have no device key
+        # yet may still call the device routes, as they could before sign-in.
+        self.allow_unkeyed_bridges = allow_unkeyed_bridges
 
     @classmethod
     def from_env(cls, resolve_site: Optional[SiteResolver] = None) -> "Auth":
@@ -103,11 +107,16 @@ class Auth:
             broker_service_password=os.environ.get("BROKER_SERVICE_PASSWORD", ""),
             resolve_site=resolve_site,
             secure_cookie=_truthy(os.environ.get("AUTH_COOKIE_SECURE")),
+            allow_unkeyed_bridges=_truthy(os.environ.get("AUTH_ALLOW_UNKEYED_BRIDGES")),
         )
         if enabled and auth.users.is_empty():
             logger.warning("sign-in is on and there are no users yet. Create the first owner with: "
                            "python -m auth.manage create-owner <username>")
-        if enabled and not auth.device_keys:
+        if enabled and auth.allow_unkeyed_bridges:
+            logger.warning("AUTH_ALLOW_UNKEYED_BRIDGES is on: anyone on the network can upload snapshots, "
+                           "post run events and fetch Speak clips without a key. Development only -- "
+                           "give each bridge CLOUD_API_KEY and turn this off before production.")
+        elif enabled and not auth.device_keys:
             logger.warning("sign-in is on and DEVICE_KEYS is empty: edge bridges cannot upload "
                            "snapshots, report run events or fetch Speak clips")
         return auth
@@ -164,6 +173,8 @@ class Auth:
         site_id, robot_id = self.resolve_site(dict(request.path_params))
         request.state.site_id = site_id
         if rule.public or (principal is not None and principal.kind == "dev"):
+            return
+        if principal is None and rule.device and self.allow_unkeyed_bridges:
             return
         if principal is None:
             raise HTTPException(status_code=401, detail="sign in to continue",

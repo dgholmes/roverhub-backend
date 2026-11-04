@@ -263,6 +263,17 @@ def test_a_device_key_works_only_for_its_own_robot_and_device_routes(auth_on):
 # --- user management --------------------------------------------------------
 
 
+def test_unkeyed_bridges_reach_only_device_routes_when_allowed(auth_on, monkeypatch):
+    client = TestClient(backend.app)
+    assert client.post("/runs/run-x/events", json=[]).status_code == 401
+    monkeypatch.setattr(auth_on, "allow_unkeyed_bridges", True)
+    assert client.post("/runs/run-x/events", json=[]).status_code not in (401, 403)
+    # Everything a person does still needs signing in.
+    assert client.get("/robots").status_code == 401
+    assert _command(client, {}).status_code == 401
+    assert client.get("/users").status_code == 401
+
+
 def test_members_cannot_manage_users(auth_on):
     _user(auth_on, "ana", {"site-a": "operator"})
     client = TestClient(backend.app)
