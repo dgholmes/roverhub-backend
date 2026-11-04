@@ -3,7 +3,10 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+
+from auth.deps import acting_user_id, principal_of
+from auth.policy import command_capabilities
 
 from control.commands import CommandStore
 from realtime.mqtt_client import CommandPublishError
@@ -14,7 +17,7 @@ def build_router(command_store: CommandStore, mqtt_client) -> APIRouter:
     router = APIRouter()
 
     @router.post("/robots/{robot_id}/commands")
-    def issue_command(robot_id: str, request: CommandRequest):
+    def issue_command(robot_id: str, request: CommandRequest, http: Request):
         if request.type not in WIRED_COMMAND_TYPES:
             raise HTTPException(
                 status_code=400,
@@ -27,6 +30,12 @@ def build_router(command_store: CommandStore, mqtt_client) -> APIRouter:
             raise HTTPException(
                 status_code=409, detail=f"use POST /robots/{robot_id}/runs to start a mission")
 
+        principal = principal_of(http)
+        needed = command_capabilities(request.type)
+        site_id = getattr(http.state, "site_id", None)
+        if principal is not None and not any(principal.can(c, site_id) for c in needed):
+            raise HTTPException(status_code=403, detail=f"your role does not allow {request.type}")
+
         command = Command(
             command_id=str(uuid.uuid4()),
             robot_id=robot_id,
@@ -35,7 +44,7 @@ def build_router(command_store: CommandStore, mqtt_client) -> APIRouter:
             params=request.params,
             current_stage="requested",
             stages=[CommandStageEvent(stage="requested", at=datetime.now(timezone.utc).isoformat())],
-            initiated_by=request.initiated_by,
+            initiated_by=acting_user_id(http, request.initiated_by),
         )
         command_store.add(command)
         try:

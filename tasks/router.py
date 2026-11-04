@@ -30,6 +30,8 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+
+from auth.deps import acting_user_id
 from pydantic import ValidationError
 
 from api.common import now_iso, read_bounded_body
@@ -237,7 +239,7 @@ def build_tasks_router(
         return Response(status_code=204)
 
     @router.post("/tasks/{task_id}/run-now", status_code=202)
-    def run_now(task_id: str, body: Optional[RunNowRequest] = Body(default=None)):
+    def run_now(task_id: str, http: Request, body: Optional[RunNowRequest] = Body(default=None)):
         task = store.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
@@ -254,6 +256,7 @@ def build_tasks_router(
         # run-now landing on a slot the schedule already materialised, is the
         # same occurrence, not a second one.
         if body is not None:
+            body = body.model_copy(update={"started_by": acting_user_id(http, body.started_by)})
             return _start_now(task, body, occurrence_id, due_at)
         existing = store.get_occurrence(occurrence_id)
         if existing is not None:

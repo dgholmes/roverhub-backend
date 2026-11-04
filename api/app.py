@@ -6,9 +6,12 @@ import os
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from auth.deps import Auth
+from auth.mqtt_hooks import build_mqtt_hooks_router
+from auth.router import build_auth_router
 from control.commands import CommandStore
 from control.media import DEFAULT_AUDIO_CLIPS_DIR, MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router
 from control.snapshots import DEFAULT_SNAPSHOTS_DIR, build_snapshot_router
@@ -73,7 +76,35 @@ mqtt_client = BackendMqttClient(
     on_ack=_on_ack, on_state=_on_state,
 )
 
-app = FastAPI(title="RoverHub Backend (dev)")
+
+def _resolve_site(params):
+    """The (site_id, robot_id) a request's path refers to, for role checks.
+    Bound late: the stores it reads are built further down this module."""
+    try:
+        if "robot_id" in params:
+            record = registry.get(params["robot_id"])
+            return (record.site_id if record else None), params["robot_id"]
+        if "run_id" in params:
+            run = runs_router.store.get(params["run_id"])
+            return (run.site_id, run.robot_id) if run else (None, None)
+        if "task_id" in params:
+            task = _reconcile_task_store.get_task(params["task_id"])
+            return (task.site_id, task.robot_id) if task else (None, None)
+        if "mission_id" in params:
+            mission = _scheduler_missions.get(params["mission_id"])
+            return (getattr(mission, "site_id", None) if mission else None), None
+    except NameError:
+        pass  # a request during startup, before the stores exist
+    return None, None
+
+
+# Sign-in (auth/). Off unless AUTH_ENABLED=true. The guard is an app-wide
+# dependency, so every route -- including ones added later -- is checked
+# against auth/policy.py, and a route with no rule there is refused.
+auth = Auth.from_env(resolve_site=_resolve_site)
+app = FastAPI(title="RoverHub Backend (dev)", dependencies=[Depends(auth.guard)])
+app.include_router(build_auth_router(auth))
+app.include_router(build_mqtt_hooks_router(auth))
 app.include_router(build_router(command_store, mqtt_client))
 app.include_router(build_robots_router(registry))
 app.include_router(build_media_router(clips_dir=os.environ.get("AUDIO_CLIPS_DIR", DEFAULT_AUDIO_CLIPS_DIR)))
@@ -247,7 +278,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("FRONTEND_ORIGINS", "http://localhost:5173").split(","),
     allow_origin_regex=os.environ.get("FRONTEND_ORIGIN_REGEX", _PRIVATE_LAN_ORIGIN_REGEX),
-    allow_credentials=False,
+    # The session cookie lets <img>/<video>/download links load signed-in.
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
