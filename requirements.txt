@@ -7,6 +7,8 @@ paho-mqtt>=1.6,<2
 pydantic>=2
 python-dotenv>=1.0
 python-multipart>=0.0.9
+# Session tokens for sign-in (auth/tokens.py).
+PyJWT>=2.8
 
 # The shared wire-contract schemas (shared/schemas/), imported throughout this
 # service -- e.g. `from shared.schemas.commands import Command` in

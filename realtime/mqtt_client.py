@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import logging
 from typing import Callable, Optional, Tuple
 
@@ -75,6 +76,11 @@ class BackendMqttClient:
         # its own as long as it is alive -- keeping it alive is what _on_message
         # below is about.
         self._client.reconnect_delay_set(min_delay=1, max_delay=30)
+        # With broker sign-in on (infra/mosquitto.auth.conf) this service logs
+        # in as the superuser `roverhub-backend`; auth/mqtt_hooks.py checks it.
+        service_password = os.environ.get("BROKER_SERVICE_PASSWORD", "")
+        if service_password:
+            self._client.username_pw_set("roverhub-backend", service_password)
         self._client.connect(host, port)
         self._client.loop_start()
 

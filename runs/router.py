@@ -9,6 +9,8 @@ import zipfile
 from typing import Callable, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
+
+from auth.deps import acting_user_id
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -53,13 +55,13 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
         return run
 
     @router.post("/robots/{robot_id}/runs", status_code=201)
-    def start_run(robot_id: str, request: StartRunRequest):
+    def start_run(robot_id: str, request: StartRunRequest, http: Request):
         if router.dispatcher is None:  # type: ignore[attr-defined]
             raise HTTPException(status_code=503, detail="starting runs is not configured")
         try:
             run, command = router.dispatcher.start(  # type: ignore[attr-defined]
                 robot_id, request.mission, request.steps, source=request.source,
-                started_by=request.started_by, max_duration_s=request.max_duration_s)
+                started_by=acting_user_id(http, request.started_by), max_duration_s=request.max_duration_s)
         except StartRefused as refused:
             raise HTTPException(status_code=refused.status, detail=refused.message)
         return {"run": run.model_dump(mode="json"), "command": command.model_dump(mode="json")}
