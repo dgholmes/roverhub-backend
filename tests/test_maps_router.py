@@ -276,7 +276,7 @@ def test_a_part_that_is_not_a_file_is_a_400(client, tmp_path):
 
 def test_every_maps_route_has_an_auth_policy_rule(router):
     routes = [(m, r.path) for r in router.routes if isinstance(r, APIRoute) for m in r.methods]
-    assert len(routes) == 5
+    assert len(routes) == 7
     for key in routes:
         assert key in ROUTES, key
 
@@ -284,7 +284,8 @@ def test_every_maps_route_has_an_auth_policy_rule(router):
 def test_the_maps_routes_are_registered_on_the_app():
     app_routes = {(m, r.path) for r in backend.app.routes if isinstance(r, APIRoute) for m in r.methods}
     for key in [("GET", "/maps"), ("GET", "/maps/{map_id}"), ("POST", "/maps"),
-                ("GET", "/maps/{map_id}/floors/{index}/{kind}"), ("DELETE", "/maps/{map_id}")]:
+                ("GET", "/maps/{map_id}/floors/{index}/{kind}"), ("DELETE", "/maps/{map_id}"),
+                ("PUT", "/maps/{map_id}/zones"), ("PUT", "/maps/{map_id}/status")]:
         assert key in app_routes, key
 
 

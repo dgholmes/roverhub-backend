@@ -25,17 +25,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import tempfile
 import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, get_args
 
 from pydantic import ValidationError
 
-from shared.schemas.maps import SiteMap
+from shared.schemas.maps import MapStatus, MapZone, SiteMap
 
 logger = logging.getLogger("roverhub.maps")
 
@@ -46,6 +47,12 @@ DEFAULT_MAPS_DIR = str(Path(__file__).resolve().parents[1] / "data" / "maps")
 # so the two figures must stay the same expression: 8_000_000 here would let a
 # cloud pass packing and fail serving by 388,608 bytes.
 MAX_CLOUD_BYTES = 8 * 1024 * 1024
+
+# Bounds on what a curator may store in one map. Generous for a building (a
+# zone is a room or a doorway), small enough that a request cannot fill the disk
+# or make every map read slow.
+MAX_ZONES = 256
+MAX_VERTICES_PER_ZONE = 1000
 
 BUNDLE_FILE = "site_map.json"
 MAP_FILE = "map.json"
@@ -77,6 +84,10 @@ class BundleError(ValueError):
     """The bundle is not a usable map. The message is safe to show the uploader."""
 
 
+class MapNotFound(LookupError):
+    """No map by that id (or an id that cannot name one)."""
+
+
 def valid_map_id(map_id: object) -> bool:
     return (isinstance(map_id, str) and bool(MAP_ID_RE.fullmatch(map_id))
             and not _WINDOWS_DEVICES.fullmatch(map_id))
@@ -97,18 +108,40 @@ class MapStore:
         died between moving it aside and moving the new one in), so its map is
         put back first unless a map by that id exists again.
         """
-        for name in os.listdir(self.root):
+        # This runs when the store is built, which `api/app.py` does at import: a
+        # failure here would be a backend that does not start, over housekeeping.
+        # So nothing in it propagates -- each directory is handled on its own, and
+        # what could not be handled is logged and left for the next start.
+        try:
+            names = os.listdir(self.root)
+        except OSError:
+            logger.exception("could not list the map store at %s", self.root)
+            return
+        for name in names:
             path = self.root / name
-            if not path.is_dir():
-                continue
-            if name.startswith(_OLD_PREFIX):
-                for child in path.iterdir():
-                    if valid_map_id(child.name) and not (self.root / child.name).exists():
-                        os.replace(child, self.root / child.name)
-                        logger.warning("recovered map %s from an interrupted replace", child.name)
-                shutil.rmtree(path, ignore_errors=True)
-            elif name.startswith((_SCRATCH_PREFIX, UPLOAD_PREFIX, _DELETED_PREFIX)):
-                shutil.rmtree(path, ignore_errors=True)
+            try:
+                if not path.is_dir():
+                    continue
+                if name.startswith(_OLD_PREFIX):
+                    restored_all = True
+                    for child in path.iterdir():
+                        if not (valid_map_id(child.name) and not (self.root / child.name).exists()):
+                            continue
+                        try:
+                            os.replace(child, self.root / child.name)
+                            logger.warning("recovered map %s from an interrupted replace", child.name)
+                        except OSError:
+                            restored_all = False
+                            logger.exception("could not recover map %s from %s; leaving it there",
+                                             child.name, path)
+                    # That directory may hold the only copy of a map: remove it
+                    # only once everything in it has been put back.
+                    if restored_all:
+                        shutil.rmtree(path, ignore_errors=True)
+                elif name.startswith((_SCRATCH_PREFIX, UPLOAD_PREFIX, _DELETED_PREFIX)):
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                logger.exception("could not sweep %s", path)
 
     # --- reading -----------------------------------------------------------
 
@@ -198,14 +231,20 @@ class MapStore:
                     shutil.copyfile(source, floor_dir / file_name)
 
             with self._lock:
-                # What operators have done to a map is not in a bundle, and when
-                # it was first made is not a property of its latest survey.
+                # The zones operators drew are not in a bundle, and when a map
+                # was first made is not a property of its latest survey.
                 # `updated_at` is the new bundle's.
                 existing = self.get(site_map.map_id)
+                # A replaced or new survey is always a draft, whatever the bundle
+                # says. The zones from the old survey are kept (work is not thrown
+                # away), but they were drawn in its frame and may now fall outside
+                # the new extent or on a different floor; "active" is what
+                # missions plan against and says a person has checked them.
+                # Nobody has.
+                site_map = site_map.model_copy(update={"status": "draft"})
                 if existing is not None:
                     site_map = site_map.model_copy(update={
                         "created_at": existing.created_at,
-                        "status": existing.status,
                         "zones": existing.zones,
                     })
                 (scratch / MAP_FILE).write_text(site_map.model_dump_json(indent=2), encoding="utf-8")
@@ -231,6 +270,67 @@ class MapStore:
             shutil.rmtree(scratch, ignore_errors=True)
             raise
         return site_map
+
+    # --- curating ------------------------------------------------------------
+
+    def save_zones(self, map_id: str, zones: List[MapZone]) -> SiteMap:
+        """Replace a map's zones with `zones`. Raises MapNotFound for an unknown
+        map and ValueError for a list that cannot be stored (a zone belonging to
+        another map, a repeated id, a non-finite vertex, too many)."""
+        zones = list(zones)
+        if len(zones) > MAX_ZONES:
+            raise ValueError("a map holds at most %d zones" % MAX_ZONES)
+        seen = set()
+        for z in zones:
+            if z.map_id != map_id:
+                raise ValueError("zone %r belongs to map %r, not %r" % (z.zone_id, z.map_id, map_id))
+            if z.zone_id in seen:
+                raise ValueError("zone id %r is used twice" % (z.zone_id,))
+            seen.add(z.zone_id)
+            if len(z.polygon) > MAX_VERTICES_PER_ZONE:
+                raise ValueError("zone %r has more than %d vertices" % (z.zone_id, MAX_VERTICES_PER_ZONE))
+            if not all(math.isfinite(c) for point in z.polygon for c in point):
+                raise ValueError("zone %r has a vertex that is not a finite number" % (z.zone_id,))
+        return self._update(map_id, lambda current: {"zones": zones})
+
+    def set_status(self, map_id: str, status: MapStatus) -> SiteMap:
+        """Set a map's status. Raises MapNotFound for an unknown map and
+        ValueError for a status that is not one, or for activating a map with no
+        floors -- there would be nothing for a mission to plan on."""
+        if status not in get_args(MapStatus):
+            raise ValueError("%r is not a map status" % (status,))
+
+        def change(current: SiteMap) -> dict:
+            if status == "active" and not current.floors:
+                raise ValueError("a map with no floors cannot be activated")
+            return {"status": status}
+
+        return self._update(map_id, change)
+
+    def _update(self, map_id: str, change) -> SiteMap:
+        """Re-read the map under the lock, apply `change(map) -> fields`, and
+        write map.json atomically (a temp file in the same directory, then
+        os.replace), so a reader sees the old file or the new one and a
+        concurrent re-upload or other edit cannot be lost to a stale read."""
+        directory = self._dir(map_id)
+        if directory is None:
+            raise MapNotFound(map_id)
+        with self._lock:
+            current = self.get(map_id)
+            if current is None:
+                raise MapNotFound(map_id)
+            updated = current.model_copy(update=change(current))
+            scratch = directory / (MAP_FILE + ".tmp")
+            try:
+                scratch.write_text(updated.model_dump_json(indent=2), encoding="utf-8")
+                os.replace(scratch, directory / MAP_FILE)
+            except BaseException:
+                try:
+                    scratch.unlink()
+                except OSError:
+                    pass
+                raise
+        return updated
 
     def delete(self, map_id: str) -> bool:
         directory = self._dir(map_id)

@@ -144,12 +144,17 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("POST", "/tasks/{task_id}/run-now"): Rule(capabilities=("dispatchPatrols",)),
 
     # Site maps: everyone who can see a site may see its floor plans; uploading
-    # a survey or deleting a map is site configuration. (Zone editing will be
-    # its own rule when it lands: `editZones`.)
+    # a survey or deleting a map is site configuration. Drawing zones and freezing
+    # a map are one judgement -- a person has looked at it, and "active" is what
+    # missions plan against -- so both need `editZones`, which supervisors hold
+    # and engineers do not: the engineer who uploads a survey (`configure`) does
+    # not also sign it off, and a re-upload drops an active map back to draft.
     ("GET", "/maps"): _READ,
     ("GET", "/maps/{map_id}"): _READ,
     ("GET", "/maps/{map_id}/floors/{index}/{kind}"): _READ,
     ("POST", "/maps"): Rule(capabilities=("configure",)),
+    ("PUT", "/maps/{map_id}/zones"): Rule(capabilities=("editZones",)),
+    ("PUT", "/maps/{map_id}/status"): Rule(capabilities=("editZones",)),
     ("DELETE", "/maps/{map_id}"): Rule(capabilities=("configure",)),
 
     # Runs

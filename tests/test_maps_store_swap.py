@@ -124,7 +124,10 @@ def _edit_stored(root, edit):
     path.write_text(json.dumps(doc))
 
 
-def test_a_reupload_keeps_status_zones_and_creation_date(tmp_path):
+def test_a_reupload_keeps_zones_and_creation_date_but_drops_active_to_draft(tmp_path):
+    # Zones were drawn in the old survey's frame, so they are kept (work is not
+    # thrown away). "active" says a person checked them against *that* survey and
+    # is what missions plan against, so it does not survive a new one.
     root = tmp_path / "maps"
     store = MapStore(root)
     store.save_bundle(make_bundle(tmp_path / "first", created_at="2026-11-01T00:00:00Z",
@@ -138,7 +141,7 @@ def test_a_reupload_keeps_status_zones_and_creation_date(tmp_path):
                                           updated_at="2026-11-08T00:00:00Z"))
 
     for loaded in (saved, store.get("map-venue")):
-        assert loaded.status == "active"
+        assert loaded.status == "draft"
         assert [z.zone_id for z in loaded.zones] == ["z1"]
         assert loaded.created_at == "2026-11-01T00:00:00Z"
         assert loaded.updated_at == "2026-11-08T00:00:00Z"   # this one moves
@@ -171,3 +174,32 @@ def test_the_store_accepts_a_cloud_right_at_the_limit(tmp_path):
     (bundle / "floor0" / "cloud.bin").write_bytes(b"\x00" * MAX_CLOUD_BYTES)
     store.save_bundle(bundle)
     assert store.artifact_path("map-venue", 0, "cloud").stat().st_size == MAX_CLOUD_BYTES
+
+
+# --- a store that cannot clean up must still start --------------------------
+
+
+def test_a_failure_restoring_a_map_at_start_does_not_stop_the_store(tmp_path, monkeypatch, caplog):
+    # `api/app.py` builds the store at import: an OSError here is a backend that
+    # does not start. The one copy of the map is in `.replaced-*` and must stay
+    # there, for the next start.
+    root = tmp_path / "maps"
+    store = MapStore(root)
+    store.save_bundle(make_bundle(tmp_path / "b"))
+    (root / ".replaced-abc").mkdir()
+    os.replace(root / "map-venue", root / ".replaced-abc" / "map-venue")
+    assert os.listdir(root) == [".replaced-abc"]
+
+    real = os.replace
+
+    def failing(src, dst, *a, **k):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(os, "replace", failing)
+    with caplog.at_level("ERROR", logger="roverhub.maps"):
+        MapStore(root)  # must not raise
+    monkeypatch.setattr(os, "replace", real)
+
+    assert (root / ".replaced-abc" / "map-venue" / "map.json").is_file()
+    assert any("map-venue" in r.getMessage() for r in caplog.records)
+    assert MapStore(root).get("map-venue") is not None  # and the next start recovers it

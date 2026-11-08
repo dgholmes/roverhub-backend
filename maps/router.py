@@ -7,6 +7,12 @@
                                                    (PNG) or `cloud` (float32 xyz); 404 if
                                                    there is no such file, 413 if a cloud is
                                                    over 8 MiB
+- PUT    /maps/{map_id}/zones                   -> SiteMap; body {"zones": [MapZone, ...]}
+                                                   replaces the map's zones; 404 if unknown,
+                                                   400 if a zone cannot be stored
+- PUT    /maps/{map_id}/status                  -> SiteMap; body {"status": "draft" | "active"
+                                                   | "archived"}; 400 to activate a map with no
+                                                   floors
 - DELETE /maps/{map_id}                         -> 204, 404 if unknown
 
 POST takes the bundle tools/map_prep/pack_map.py writes as multipart form data,
@@ -24,11 +30,13 @@ so a part can never choose where it is written. The parts are written into a
 scratch directory and handed to `MapStore.save_bundle`, which validates and
 stores them.
 
-Access is the rules in auth/policy.py: reading is open to every role, changing
-a map is site configuration.
+Access is the rules in auth/policy.py: reading is open to every role, uploading
+or deleting a map is site configuration, and drawing zones and freezing a map
+(`editZones`) is the supervisor's review of it.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -36,13 +44,17 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from pydantic import BaseModel, ValidationError
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
-from shared.schemas.maps import SiteMap
+from api.common import read_bounded_body
+from shared.schemas.maps import MapStatus, MapZone, SiteMap
 
-from .store import DEFAULT_MAPS_DIR, MAX_CLOUD_BYTES, UPLOAD_PREFIX, BundleError, MapStore
+from .store import (
+    DEFAULT_MAPS_DIR, MAX_CLOUD_BYTES, UPLOAD_PREFIX, BundleError, MapNotFound, MapStore,
+)
 
 # Per-part limits. A cloud's is the packer's own figure (see store.MAX_CLOUD_BYTES).
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -53,6 +65,10 @@ MAX_IMAGE_BYTES = 32 * 1024 * 1024
 # is received, which the multipart parser would otherwise spool to disk unchecked.
 MAX_UPLOAD_BYTES = 128 * 1024 * 1024
 
+# The zone list as the console sends it. A zone is a label and a few dozen
+# points, so this is room for hundreds of them.
+MAX_ZONES_BODY_BYTES = 1024 * 1024
+
 PART_NAME_RE = re.compile(r"site_map\.json|floor[0-9]{1,3}/(?:grid\.pgm|grid\.png|cloud\.bin)")
 MEDIA_TYPES = {"grid": "image/x-portable-graymap", "preview": "image/png",
                "cloud": "application/octet-stream"}
@@ -61,6 +77,10 @@ _CHUNK = 1024 * 1024
 
 class _TooLarge(Exception):
     pass
+
+
+class _StatusBody(BaseModel):
+    status: MapStatus
 
 
 def _limit_for(name: str) -> int:
@@ -94,6 +114,14 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                             raise _TooLarge("%s exceeds %d bytes" % (name, limit))
                         handle.write(chunk)
             return store.save_bundle(Path(scratch))
+
+    def _curate(write):
+        try:
+            return write()
+        except MapNotFound:
+            raise HTTPException(status_code=404, detail="map not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
 
     @router.get("/maps")
     def list_maps(site_id: Optional[str] = None):
@@ -160,6 +188,23 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
         # A re-upload replaces the files under the same URL, so make the browser
         # revalidate (FileResponse supplies the ETag) rather than guess.
         return FileResponse(path, media_type=MEDIA_TYPES[kind], headers={"Cache-Control": "no-cache"})
+
+    # The zone list is read by hand, as the missions router does, so the size cap
+    # applies before pydantic parses anything.
+    @router.put("/maps/{map_id}/zones")
+    async def put_zones(map_id: str, request: Request):
+        raw = await read_bounded_body(request, MAX_ZONES_BODY_BYTES, "zones")
+        try:
+            zones = [MapZone.model_validate(z) for z in json.loads(raw)["zones"]]
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=json.loads(exc.json(include_url=False))) from None
+        except (ValueError, KeyError, TypeError):
+            raise HTTPException(status_code=422, detail='body must be {"zones": [...]}') from None
+        return _curate(lambda: store.save_zones(map_id, zones))
+
+    @router.put("/maps/{map_id}/status")
+    def put_status(map_id: str, body: _StatusBody):
+        return _curate(lambda: store.set_status(map_id, body.status))
 
     @router.delete("/maps/{map_id}", status_code=204)
     def delete_map(map_id: str):
