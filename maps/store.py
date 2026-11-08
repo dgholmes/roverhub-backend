@@ -63,7 +63,13 @@ MAP_ID_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,126}[A-Za-z0-9_-])?")
 # A directory named like a Windows device ("con", "nul.x") is not a directory.
 _WINDOWS_DEVICES = re.compile(r"(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?", re.IGNORECASE)
 
+# Working directories beside the maps. All start with "." so MAP_ID_RE cannot
+# produce one. `.incoming-` is a bundle being assembled; `.upload-` is the
+# router's copy of an upload; `.deleted-` is a map on its way out; `.replaced-`
+# holds the OLD map for the instant a re-upload swaps the new one in.
 _SCRATCH_PREFIX = ".incoming-"
+UPLOAD_PREFIX = ".upload-"
+_DELETED_PREFIX = ".deleted-"
 _OLD_PREFIX = ".replaced-"
 
 
@@ -81,6 +87,28 @@ class MapStore:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._sweep_stale()
+
+    def _sweep_stale(self) -> None:
+        """Clear what a crash left behind. Assumes one process owns the store.
+
+        Scratch, upload and deleted directories are just removed. A
+        `.replaced-*` directory may hold the *only* copy of a map (the process
+        died between moving it aside and moving the new one in), so its map is
+        put back first unless a map by that id exists again.
+        """
+        for name in os.listdir(self.root):
+            path = self.root / name
+            if not path.is_dir():
+                continue
+            if name.startswith(_OLD_PREFIX):
+                for child in path.iterdir():
+                    if valid_map_id(child.name) and not (self.root / child.name).exists():
+                        os.replace(child, self.root / child.name)
+                        logger.warning("recovered map %s from an interrupted replace", child.name)
+                shutil.rmtree(path, ignore_errors=True)
+            elif name.startswith((_SCRATCH_PREFIX, UPLOAD_PREFIX, _DELETED_PREFIX)):
+                shutil.rmtree(path, ignore_errors=True)
 
     # --- reading -----------------------------------------------------------
 
@@ -158,24 +186,43 @@ class MapStore:
                 floor_dir.mkdir()
                 for kind, file_name in ARTIFACT_FILES.items():
                     source = bundle_dir / ("floor%d" % floor.index) / file_name
-                    if source.is_file():
-                        shutil.copyfile(source, floor_dir / file_name)
-                    elif kind in _REQUIRED:
-                        raise BundleError("floor %d has no %s" % (floor.index, file_name))
-            (scratch / MAP_FILE).write_text(site_map.model_dump_json(indent=2), encoding="utf-8")
+                    if not source.is_file():
+                        if kind in _REQUIRED:
+                            raise BundleError("floor %d has no %s" % (floor.index, file_name))
+                        continue
+                    # The router refuses this on upload and on serving too; a
+                    # direct caller (a seeding script) must not be able to store
+                    # a map whose cloud can never be served.
+                    if kind == "cloud" and source.stat().st_size > MAX_CLOUD_BYTES:
+                        raise BundleError("floor %d's cloud exceeds %d bytes" % (floor.index, MAX_CLOUD_BYTES))
+                    shutil.copyfile(source, floor_dir / file_name)
 
             with self._lock:
+                # What operators have done to a map is not in a bundle, and when
+                # it was first made is not a property of its latest survey.
+                # `updated_at` is the new bundle's.
+                existing = self.get(site_map.map_id)
+                if existing is not None:
+                    site_map = site_map.model_copy(update={
+                        "created_at": existing.created_at,
+                        "status": existing.status,
+                        "zones": existing.zones,
+                    })
+                (scratch / MAP_FILE).write_text(site_map.model_dump_json(indent=2), encoding="utf-8")
+
                 aside = None
-                if directory.exists():
-                    aside = Path(tempfile.mkdtemp(dir=self.root, prefix=_OLD_PREFIX))
-                    os.replace(directory, aside / directory.name)
                 try:
+                    if directory.exists():
+                        aside = Path(tempfile.mkdtemp(dir=self.root, prefix=_OLD_PREFIX))
+                        os.replace(directory, aside / directory.name)
                     os.replace(scratch, directory)
                 except BaseException:
                     if aside is not None:
-                        # Put the old map back. If even that fails the old map
-                        # stays in `aside` for someone to recover; do not delete it.
-                        os.replace(aside / directory.name, directory)
+                        if (aside / directory.name).exists():
+                            # Put the old map back. If even that fails it stays
+                            # in `aside`, which is not deleted, and the next
+                            # start of the store restores it.
+                            os.replace(aside / directory.name, directory)
                         shutil.rmtree(aside, ignore_errors=True)
                     raise
                 if aside is not None:
@@ -194,7 +241,7 @@ class MapStore:
                 return False
             # Move out of the namespace first, so a half-deleted map is never
             # visible, then remove.
-            aside = Path(tempfile.mkdtemp(dir=self.root, prefix=_OLD_PREFIX))
+            aside = Path(tempfile.mkdtemp(dir=self.root, prefix=_DELETED_PREFIX))
             os.replace(directory, aside / directory.name)
         shutil.rmtree(aside, ignore_errors=True)
         return True

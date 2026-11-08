@@ -24,7 +24,9 @@ def floor_doc(index: int) -> dict:
 
 
 def make_bundle(directory: Path, map_id: str = "map-venue", floors: int = 1,
-                cloud: bool = False, name: str = "Venue", site_id: str = "site-venue") -> Path:
+                cloud: bool = False, name: str = "Venue", site_id: str = "site-venue",
+                created_at: str = "2026-11-08T00:00:00Z",
+                updated_at: str = "2026-11-08T00:00:00Z") -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     docs = [floor_doc(i) for i in range(floors)]
     for i in range(floors):
@@ -39,7 +41,7 @@ def make_bundle(directory: Path, map_id: str = "map-venue", floors: int = 1,
         "site_map": {
             "map_id": map_id, "site_id": site_id, "name": name, "source": "slam",
             "extent_min": [-5.4753, -17.8671], "extent_max": [-5.2753, -17.7671],
-            "created_at": "2026-11-08T00:00:00Z", "updated_at": "2026-11-08T00:00:00Z",
+            "created_at": created_at, "updated_at": updated_at,
         },
         "floors": docs,
         "provenance": {"generated_by": "tools/map_prep/pack_map.py"},

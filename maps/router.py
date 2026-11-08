@@ -42,16 +42,18 @@ from starlette.datastructures import UploadFile
 
 from shared.schemas.maps import SiteMap
 
-from .store import DEFAULT_MAPS_DIR, MAX_CLOUD_BYTES, BundleError, MapStore
+from .store import DEFAULT_MAPS_DIR, MAX_CLOUD_BYTES, UPLOAD_PREFIX, BundleError, MapStore
 
 # Per-part limits. A cloud's is the packer's own figure (see store.MAX_CLOUD_BYTES).
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
-# The request as a whole: the largest bundle this accepts, one floor's worth
-# of everything at its limit, with room for a second floor's grid and preview.
+# The request as a whole, counted as it arrives (see `upload_map`): one floor's
+# worth of everything at its limit, with room for a second floor's grid and
+# preview. The per-part limits above apply to what is kept; this one bounds what
+# is received, which the multipart parser would otherwise spool to disk unchecked.
 MAX_UPLOAD_BYTES = 128 * 1024 * 1024
 
-PART_NAME_RE = re.compile(r"site_map\.json|floor\d{1,3}/(?:grid\.pgm|grid\.png|cloud\.bin)")
+PART_NAME_RE = re.compile(r"site_map\.json|floor[0-9]{1,3}/(?:grid\.pgm|grid\.png|cloud\.bin)")
 MEDIA_TYPES = {"grid": "image/x-portable-graymap", "preview": "image/png",
                "cloud": "application/octet-stream"}
 _CHUNK = 1024 * 1024
@@ -76,7 +78,7 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
     router.store = store  # type: ignore[attr-defined]  # tests and the app share it
 
     def _ingest(parts: Dict[str, UploadFile]) -> SiteMap:
-        with tempfile.TemporaryDirectory(dir=store.root, prefix=".upload-") as scratch:
+        with tempfile.TemporaryDirectory(dir=store.root, prefix=UPLOAD_PREFIX) as scratch:
             for name, part in parts.items():
                 target = Path(scratch) / name  # `name` passed PART_NAME_RE: no ".." or absolute
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -110,7 +112,23 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
         declared = request.headers.get("content-length")
         if declared is not None and declared.isdigit() and int(declared) > max_upload_bytes:
             raise HTTPException(status_code=413, detail="upload exceeds %d bytes" % max_upload_bytes)
-        form = await request.form()
+        # The declared length only covers a client that declares one. A chunked
+        # body has none, so also count the bytes as they are read and stop at the
+        # cap, before the multipart parser can spool the rest to disk. The same two
+        # layers as api/common.read_bounded_body, for a body that is parsed rather
+        # than read whole.
+        received = 0
+
+        async def counting_receive():
+            nonlocal received
+            message = await request.receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="upload exceeds %d bytes" % max_upload_bytes)
+            return message
+
+        form = await Request(request.scope, counting_receive).form()
         try:
             parts: Dict[str, UploadFile] = {}
             for name, part in form.multi_items():

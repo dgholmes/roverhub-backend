@@ -1,6 +1,11 @@
 """Map routes (maps/router.py): upload a bundle, list, read, serve, delete."""
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import urllib.parse
+
 import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
@@ -127,15 +132,45 @@ def test_unknown_floor_kind_or_missing_cloud_returns_404(client, tmp_path):
     assert client.get("/maps/map-venue/floors/zero/preview").status_code == 422
 
 
+def _plant_copies_outside_the_store(tmp_path):
+    """Copies of a real, servable map where a traversal would land: the store's
+    parent (reached by the id "..") and a sibling directory (reached by
+    "..\\outside", or by its absolute path). If the id guard is removed these are
+    read; the router's own path matching has nothing to do with it."""
+    stored = tmp_path / "maps" / "map-venue"
+    sibling = tmp_path / "outside"
+    for target, map_id in ((tmp_path, ".."), (sibling, str(sibling))):
+        target.mkdir(exist_ok=True)
+        for name in ("floor0",):
+            shutil.copytree(stored / name, target / name, dirs_exist_ok=True)
+        doc = json.loads((stored / "map.json").read_text())
+        doc["map_id"] = map_id
+        (target / "map.json").write_text(json.dumps(doc))
+    return sibling
+
+
+def test_an_id_that_climbs_out_of_the_store_reads_nothing(client, tmp_path):
+    _upload(client, tmp_path, cloud=True)
+    sibling = _plant_copies_outside_the_store(tmp_path)
+    assert (tmp_path / "floor0" / "grid.pgm").read_bytes() == PGM  # the bait is real
+    absolute = urllib.parse.quote(str(sibling), safe="")
+    for map_id in ("%2E%2E", "..%5Coutside", absolute):
+        for suffix in ("", "/floors/0/grid", "/floors/0/preview", "/floors/0/cloud"):
+            response = client.get("/maps/" + map_id + suffix)
+            assert response.status_code == 404, (map_id, suffix, response.status_code)
+        assert client.delete("/maps/" + map_id).status_code == 404
+    assert (tmp_path / "floor0" / "grid.pgm").exists()  # and DELETE did not reach it
+    assert (sibling / "floor0" / "grid.pgm").exists()
+
+
 @pytest.mark.parametrize("path", [
-    "/maps/..%2F..%2Fetc/floors/0/grid",
-    "/maps/%2E%2E/floors/0/grid",
-    "/maps/map-venue/floors/0/..%2F..%2F..%2Fmap.json",
+    "/maps/map-venue/floors/0/..%2Fmap.json",
+    "/maps/map-venue/floors/0/..%5Cmap.json",
     "/maps/map-venue/floors/0/grid.pgm",
-    "/maps/..%5Cmaps",
-    "/maps/C%3A%5CWindows",
+    "/maps/map-venue/floors/0/map.json",
+    "/maps/map-venue/floors/0/%2E%2E",
 ])
-def test_traversal_in_the_url_reads_nothing(client, tmp_path, path):
+def test_a_kind_that_is_not_one_of_the_three_reads_nothing(client, tmp_path, path):
     _upload(client, tmp_path, cloud=True)
     assert client.get(path).status_code in (404, 422)
 
@@ -181,6 +216,7 @@ def test_post_with_nothing_is_a_400(client):
 @pytest.mark.parametrize("name", [
     "../evil.bin", "floor0/../../evil", "/etc/passwd", "floor0/notes.txt", "notes.txt",
     "floor0/grid.pgm/", "floor-1/grid.pgm", "floor0\\grid.pgm", "C:/x",
+    "floor\u0661/grid.pgm",  # an Arabic-Indic digit is not one of 0-9
 ])
 def test_post_refuses_a_part_the_layout_does_not_name(client, router, tmp_path, name):
     parts = bundle_parts(make_bundle(tmp_path / "bundle"))
@@ -204,6 +240,29 @@ def test_post_over_the_request_cap_is_refused_before_it_is_read(tmp_path):
     response = client.post("/maps", files=_files(bundle_parts(make_bundle(tmp_path / "bundle"))))
     assert response.status_code == 413
     assert small.store.list() == []
+
+
+def test_a_chunked_upload_with_no_content_length_is_cut_off_at_the_cap(tmp_path):
+    # No Content-Length at all, which is what the declared-length check cannot
+    # see. The body is counted as it is read and refused once it passes the cap.
+    small = build_maps_router(str(tmp_path / "maps"), max_upload_bytes=1000)
+    app = FastAPI()
+    app.include_router(small)
+    client = TestClient(app)
+
+    def body():
+        yield b'--x\r\nContent-Disposition: form-data; name="site_map.json"; filename="a"\r\n\r\n'
+        for _ in range(40):
+            yield b"y" * 500
+
+    request = client.build_request("POST", "/maps", content=body(),
+                                   headers={"content-type": "multipart/form-data; boundary=x"})
+    assert "content-length" not in request.headers  # httpx sends an iterator chunked
+    assert request.headers["transfer-encoding"] == "chunked"
+    response = client.send(request)
+    assert response.status_code == 413
+    assert small.store.list() == []
+    assert os.listdir(tmp_path / "maps") == []  # no spooled leftovers in the store
 
 
 def test_a_part_that_is_not_a_file_is_a_400(client, tmp_path):
