@@ -173,6 +173,46 @@ def test_a_bundle_that_does_not_validate_is_refused(tmp_path, edit):
     assert store.list() == []
 
 
+@pytest.mark.parametrize("resolution", [0, -0.05, float("nan"), float("inf")])
+def test_a_floor_whose_resolution_is_not_a_positive_number_is_refused(tmp_path, resolution):
+    # MapFloor carries no value constraints; the bundle is where these get caught.
+    store = MapStore(tmp_path / "maps")
+    bundle = make_bundle(tmp_path / "b")
+    _break(bundle, lambda d: d["floors"][0].update(resolution_m=resolution))
+    with pytest.raises(BundleError, match="resolution"):
+        store.save_bundle(bundle)
+    assert store.list() == []
+
+
+def test_a_floor_with_a_negative_cell_count_is_refused(tmp_path):
+    # unknown 5 + free 1 + occupied 2 still fills a 4 x 2 grid: only the sign is wrong.
+    store = MapStore(tmp_path / "maps")
+    bundle = make_bundle(tmp_path / "b")
+    _break(bundle, lambda d: d["floors"][0].update(free_cells=-1, unknown_cells=7))
+    with pytest.raises(BundleError, match="negative"):
+        store.save_bundle(bundle)
+    assert store.list() == []
+
+
+@pytest.mark.parametrize("edit", [
+    lambda f: f.update(unknown_cells=4),        # counts add up to 9 on an 8-cell grid
+    lambda f: f.update(size_cells=[4, 3]),      # grid is 12 cells, counts add up to 8
+    lambda f: f.update(size_cells=[0, 0], free_cells=0, occupied_cells=0, unknown_cells=0),
+])
+def test_a_floor_whose_counts_do_not_fill_its_grid_is_refused(tmp_path, edit):
+    store = MapStore(tmp_path / "maps")
+    bundle = make_bundle(tmp_path / "b")
+    _break(bundle, lambda d: edit(d["floors"][0]))
+    with pytest.raises(BundleError):
+        store.save_bundle(bundle)
+    assert store.list() == []
+
+
+def test_a_floor_whose_numbers_all_hold_is_still_stored(tmp_path):
+    store = MapStore(tmp_path / "maps")
+    assert store.save_bundle(make_bundle(tmp_path / "b", floors=2)).floors[1].resolution_m == 0.05
+
+
 def test_a_bundle_with_no_site_map_json_is_refused(tmp_path):
     store = MapStore(tmp_path / "maps")
     bundle = make_bundle(tmp_path / "b")

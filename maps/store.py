@@ -36,7 +36,7 @@ from typing import List, Optional, get_args
 
 from pydantic import ValidationError
 
-from shared.schemas.maps import MapStatus, MapZone, SiteMap
+from shared.schemas.maps import MapFloor, MapStatus, MapZone, SiteMap
 
 logger = logging.getLogger("roverhub.maps")
 
@@ -82,6 +82,32 @@ _OLD_PREFIX = ".replaced-"
 
 class BundleError(ValueError):
     """The bundle is not a usable map. The message is safe to show the uploader."""
+
+
+def _check_floor(floor: MapFloor) -> None:
+    """Refuse a floor whose numbers cannot all be true at once.
+
+    MapFloor takes whatever it is given, by design: the bundle is where corrupt
+    numbers get caught, at both ends. This is the store's end, mirroring
+    tools/map_prep/pack_map.py's check_floor, because a hand-edited bundle skips
+    the packer. A zero resolution collapses the console's bounds, and counts
+    that do not fill the grid make the surveyed percentage meaningless.
+    """
+    where = "floor %d" % floor.index
+    if not math.isfinite(floor.resolution_m) or floor.resolution_m <= 0:
+        raise BundleError("%s: resolution_m is %r; it must be a positive number of metres per cell"
+                          % (where, floor.resolution_m))
+    width, height = floor.size_cells
+    if width < 1 or height < 1:
+        raise BundleError("%s: size_cells is %d x %d; both must be at least 1" % (where, width, height))
+    counts = (("free", floor.free_cells), ("occupied", floor.occupied_cells), ("unknown", floor.unknown_cells))
+    for label, count in counts:
+        if count < 0:
+            raise BundleError("%s: the %s cell count is negative (%d)" % (where, label, count))
+    counted = sum(count for _, count in counts)
+    if counted != width * height:
+        raise BundleError("%s: the grid is %d x %d = %d cells, but free + occupied + unknown add up to %d"
+                          % (where, width, height, width * height, counted))
 
 
 class MapNotFound(LookupError):
@@ -356,8 +382,11 @@ class MapStore:
             raise BundleError("%s is not readable JSON: %s" % (BUNDLE_FILE, exc)) from None
         try:
             # `floors` sits beside the `site_map` block in the bundle, not in it.
-            return SiteMap(**{**doc["site_map"], "floors": doc["floors"]})
+            site_map = SiteMap(**{**doc["site_map"], "floors": doc["floors"]})
         except (KeyError, TypeError) as exc:
             raise BundleError("%s is missing %s" % (BUNDLE_FILE, exc)) from None
         except ValidationError as exc:
             raise BundleError("%s is not a valid map: %s" % (BUNDLE_FILE, exc)) from None
+        for floor in site_map.floors:
+            _check_floor(floor)
+        return site_map
