@@ -143,6 +143,15 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("DELETE", "/tasks/{task_id}"): Rule(capabilities=("dispatchPatrols",)),
     ("POST", "/tasks/{task_id}/run-now"): Rule(capabilities=("dispatchPatrols",)),
 
+    # Site maps: everyone who can see a site may see its floor plans; uploading
+    # a survey or deleting a map is site configuration. (Zone editing will be
+    # its own rule when it lands: `editZones`.)
+    ("GET", "/maps"): _READ,
+    ("GET", "/maps/{map_id}"): _READ,
+    ("GET", "/maps/{map_id}/floors/{index}/{kind}"): _READ,
+    ("POST", "/maps"): Rule(capabilities=("configure",)),
+    ("DELETE", "/maps/{map_id}"): Rule(capabilities=("configure",)),
+
     # Runs
     ("POST", "/robots/{robot_id}/runs"): Rule(capabilities=("dispatchPatrols",)),
     ("PUT", "/runs/{run_id}"): Rule(capabilities=("dispatchPatrols",)),
