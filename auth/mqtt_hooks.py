@@ -30,8 +30,11 @@ SERVICE_USERNAME = "roverhub-backend"
 # mosquitto-go-auth's `acc` values (mosquitto's MOSQ_ACL_*).
 ACC_READ, ACC_WRITE, ACC_READWRITE, ACC_SUBSCRIBE = 1, 2, 3, 4
 
-# Per-robot topic suffixes, from docs/02-system-architecture.md.
-_ROBOT_TOPICS = {"telemetry", "state", "heartbeat", "lower_state", "commands", "ack", "run"}
+# Per-robot topic suffixes (everything after roverhub/{site}/{robot}/), from
+# docs/02-system-architecture.md. incidents and perception/status come from the
+# perception service, which signs in with the same device key as the bridge.
+_ROBOT_TOPICS = {"telemetry", "state", "heartbeat", "lower_state", "commands", "ack", "run",
+                 "incidents", "perception/status"}
 # What a bridge receives rather than sends.
 _BRIDGE_READS = {"commands"}
 
@@ -65,6 +68,14 @@ def _segment_matches(filter_segment: str, value: str) -> bool:
     return filter_segment in ("+", "#") or filter_segment == value
 
 
+def _robot_suffix(parts: list) -> str:
+    """The per-robot suffix of roverhub/{site}/{robot}/<suffix>, or "" if the
+    topic is not of that shape. Multi-level suffixes must match exactly."""
+    if len(parts) < 4 or parts[0] != "roverhub":
+        return ""
+    return "/".join(parts[3:])
+
+
 def _bridge_allowed(robot_id: str, topic: str, acc: int) -> bool:
     parts = topic.split("/")
     if parts[:2] == ["roverhub", "admin"] and len(parts) == 4 and parts[3] == "register":
@@ -72,9 +83,10 @@ def _bridge_allowed(robot_id: str, topic: str, acc: int) -> bool:
         # id; the payload names the robot. A known limit: a device key can
         # write any registration. It cannot touch another robot's commands.
         return acc in (ACC_WRITE, ACC_READ, ACC_READWRITE, ACC_SUBSCRIBE)
-    if len(parts) != 4 or parts[0] != "roverhub" or parts[2] != robot_id or parts[3] not in _ROBOT_TOPICS:
+    suffix = _robot_suffix(parts)
+    if parts[2:3] != [robot_id] or suffix not in _ROBOT_TOPICS:
         return False
-    if parts[3] in _BRIDGE_READS:
+    if suffix in _BRIDGE_READS:
         return acc in (ACC_READ, ACC_SUBSCRIBE)
     return acc in (ACC_WRITE, ACC_READ, ACC_SUBSCRIBE, ACC_READWRITE)
 
@@ -90,7 +102,7 @@ def _browser_allowed(auth: Auth, user_id: str, topic: str, acc: int) -> bool:
         # Registrations say which robots exist and at which site. Seeing the
         # list is the same as GET /robots, which any signed-in user may call.
         return len(parts) == 4 and _segment_matches(parts[2], "x") and parts[3] == "register"
-    if len(parts) != 4 or parts[0] != "roverhub" or parts[3] not in _ROBOT_TOPICS - {"commands"}:
+    if _robot_suffix(parts) not in _ROBOT_TOPICS - {"commands"}:
         return False
     site = parts[1]
     if site in ("+", "#"):
