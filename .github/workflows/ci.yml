@@ -48,6 +48,28 @@ jobs:
           ref: ${{ steps.shared.outputs.ref }}
           token: ${{ secrets.ROVERHUB_READ_TOKEN }}
           path: shared
+      # roverhub-edge, beside it as on a dev machine, for tests/test_route_steps_contract.py:
+      # the steps this backend compiles from a route are run by the bridge's own
+      # program_runner. Same branch-or-master rule as shared. No submodules: the
+      # vendored SDK is not imported by the modules the test loads. Under CI the
+      # test fails rather than skips if this checkout is missing.
+      - name: Pick roverhub-edge ref
+        id: edge
+        env:
+          TOKEN: ${{ secrets.ROVERHUB_READ_TOKEN }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if git ls-remote --exit-code --heads "https://x-access-token:${TOKEN}@github.com/dgholmes/roverhub-edge.git" "$BRANCH" >/dev/null; then
+            echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=master" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: dgholmes/roverhub-edge
+          ref: ${{ steps.edge.outputs.ref }}
+          token: ${{ secrets.ROVERHUB_READ_TOKEN }}
+          path: roverhub-edge
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"

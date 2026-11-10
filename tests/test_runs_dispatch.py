@@ -125,8 +125,13 @@ def test_a_running_run_in_the_store_blocks_a_second_start(env):
     assert len(env.published) == 1
 
 
-def test_only_program_missions_and_nonempty_steps_start(env):
-    assert env.post(mission=_mission("route")).status_code == 409
+def test_a_program_needs_steps_and_a_route_must_come_without_them(env):
+    # A route is compiled by the backend (schema 0.0.16, tests/test_runs_route.py):
+    # one sent with steps is a malformed request, and this robot (0.0.11) is too
+    # old to walk one anyway.
+    assert env.post(mission=_mission("route")).status_code == 422
+    route_refused = env.post(mission=_mission("route"), steps=[])
+    assert route_refused.status_code == 409 and "routes need 0.0.16" in route_refused.json()["detail"]
     assert env.post(steps=[]).status_code == 409
     assert env.published == []
 

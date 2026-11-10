@@ -188,6 +188,7 @@ class BackendMqttClient:
                 bridge_id=data.get("bridge_id"),
                 schema_version=data.get("schema_version"),
                 host=self._validated(EdgeHostInfo, data.get("host"), data["robot_id"], "host"),
+                nav_map_id=data.get("nav_map_id") if isinstance(data.get("nav_map_id"), str) else None,
             )
             return
 

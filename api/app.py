@@ -130,7 +130,11 @@ app.include_router(build_snapshot_router(
 ))
 # Site maps: a surveyed floor plan packed by tools/map_prep/pack_map.py, kept as
 # one directory per map. See maps/.
-app.include_router(build_maps_router(maps_dir=os.environ.get("MAPS_DIR", DEFAULT_MAPS_DIR)))
+# The dispatcher reads maps through this router's own store (a route is compiled
+# against its map when a run starts), so there is one MapStore per process: it
+# assumes it owns its directory.
+maps_router = build_maps_router(maps_dir=os.environ.get("MAPS_DIR", DEFAULT_MAPS_DIR))
+app.include_router(maps_router)
 _tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)
 # Missions authored in the console, stored as one JSON file each so they
 # survive a refresh and are shared between browsers. See missions/router.py.
@@ -187,6 +191,16 @@ def _publish_scheduled(occurrence: TaskOccurrence, run: MissionRun) -> None:
     """Send START_MISSION for a scheduled occurrence. Raising is how a refusal
     reaches the operator: the loop records it as the occurrence's failure."""
     mission = _scheduler_missions.get(occurrence.mission_id)
+    task = _reconcile_task_store.get_task(occurrence.task_id)
+    minutes = task.max_duration_min if task is not None else None
+    cap_s = minutes * 60 if minutes is not None else None
+    if mission is not None and mission.kind == "route":
+        # The dispatcher compiles a route against its map and refuses one that
+        # cannot run; with no task cap it uses the compiled one. A route's
+        # announcements are clips already made, so the speech rule below does
+        # not apply to them.
+        _run_dispatcher.start_scheduled(run, [], cap_s)
+        return
     robot = registry.get(run.robot_id)
     programs = mission.program_steps if mission is not None else None
     if programs is None or programs.compiler_version != PROGRAM_COMPILER_VERSION or robot is None:
@@ -201,9 +215,7 @@ def _publish_scheduled(occurrence: TaskOccurrence, run: MissionRun) -> None:
         raise RuntimeError(_UNCOMPILED)
     if has_spoken_steps(steps):
         raise RuntimeError("scheduled runs cannot play speech yet")
-    task = _reconcile_task_store.get_task(occurrence.task_id)
-    minutes = task.max_duration_min if task is not None else None
-    _run_dispatcher.start_scheduled(run, steps, minutes * 60 if minutes is not None else None)
+    _run_dispatcher.start_scheduled(run, steps, cap_s)
 
 
 # Its own MissionStore and TaskStore, not the routers': the directories are the
@@ -232,6 +244,7 @@ _reconcile_hook = make_state_hook(
 _run_dispatcher = RunDispatcher(
     registry, runs_router.store, _reconcile_task_store, command_store, mqtt_client.publish_command,
     on_change=lambda run_id, path: _copier.on_change(run_id, path) if _copier else None,
+    map_lookup=maps_router.store.get,
 )
 runs_router.dispatcher = _run_dispatcher
 # Runs that never close: a START_MISSION nobody answered, or a run its bridge

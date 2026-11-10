@@ -64,6 +64,9 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     # watch-only viewer may not take one.
     "SNAPSHOT": ("estop",),
     "START_MISSION": ("dispatchPatrols",),
+    # Retry a run the robot paused as blocked (0.0.16): it sets a patrol going
+    # again, so it is the same capability as starting one.
+    "RESUME": ("dispatchPatrols",),
 }
 
 

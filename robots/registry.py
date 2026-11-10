@@ -93,6 +93,10 @@ class RobotRecord:
     # From /state (schema 0.0.15): a NavGoalStatus as a plain dict. The goal the
     # operator last tapped, terminal until the next one; None means no goal.
     nav_goal: Optional[dict] = None
+    # From the registration (schema 0.0.16): the map the bridge's nav stack is
+    # localised on (its NAV_MAP_ID), None with nav off or from an older bridge.
+    # Lets a route on another map be refused before START_MISSION.
+    nav_map_id: Optional[str] = None
 
 
 class RobotRegistry:
@@ -142,6 +146,7 @@ class RobotRegistry:
         bridge_id: Optional[str] = None,
         schema_version: Optional[str] = None,
         host: Optional[dict] = None,
+        nav_map_id: Optional[str] = None,
     ) -> None:
         now = self._clock()
         with self._lock:
@@ -152,7 +157,7 @@ class RobotRegistry:
                     robot_id=robot_id, site_id=site_id, robot_type=robot_type,
                     name=robot_id, last_seen=now, online=True,
                     bridge_id=bridge_id, schema_version=schema_version,
-                    first_seen=now, host=host,
+                    first_seen=now, host=host, nav_map_id=nav_map_id,
                     acceptance=acceptance, acceptance_source=source,
                     acceptance_changed_at=now,
                 )
@@ -167,6 +172,9 @@ class RobotRegistry:
             existing.bridge_id = bridge_id
             existing.schema_version = schema_version
             existing.host = host
+            # Replaced, not kept: a registration without it is a bridge whose
+            # nav is off (or older than 0.0.16), which is on no map.
+            existing.nav_map_id = nav_map_id
 
     def mark_seen(self, robot_id: str) -> None:
         with self._lock:

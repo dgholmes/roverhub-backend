@@ -191,10 +191,11 @@ def _to_utc(day: date, wall_clock: time, zone: ZoneInfo) -> datetime:
 Decision = Literal["dispatch", "skip"]
 
 # The mission kinds something on the edge can actually receive. Configuration,
-# not logic. The edge's MissionExecutor runs programs (START_MISSION); the SLAM
-# backpack will add "route". Do not hard-code "route skips, program dispatches"
-# in decide(): a kind is dispatched only when it is listed here.
-EXECUTOR_KINDS: frozenset[MissionKind] = frozenset({"program"})
+# not logic. The edge's MissionExecutor runs programs (START_MISSION), and since
+# schema 0.0.16 routes too: the dispatcher compiles a route into walk-to-point
+# steps at start (missions/route_steps.py). A kind is dispatched only when it is
+# listed here, and scheduled runs of either stay behind UNATTENDED_RUNS_ENABLED.
+EXECUTOR_KINDS: frozenset[MissionKind] = frozenset({"program", "route"})
 
 
 class Verdict(NamedTuple):
@@ -638,11 +639,13 @@ class SchedulerLoop:
 
 def has_spoken_steps(steps) -> bool:
     """True if any command step, however deeply nested in repeat / repeatUntil /
-    if bodies, speaks (carries `speech`, or is a SPEAK command)."""
+    if bodies, needs speech made at run time: it carries `speech`, or is a SPEAK
+    command, and has no `clip_id` yet. A clip already made (a route's
+    announcement) is just played, so it does not count."""
     for step in steps:
         kind = getattr(step, "kind", None)
         if kind == "command":
-            if step.speech is not None or step.type == "SPEAK":
+            if (step.speech is not None or step.type == "SPEAK") and not step.params.get("clip_id"):
                 return True
         elif kind in ("repeat", "repeatUntil"):
             if has_spoken_steps(step.body):

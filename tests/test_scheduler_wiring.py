@@ -310,3 +310,31 @@ def test_the_settler_closes_runs_through_the_dispatcher_and_hears_every_state(mo
     app_module._sweep_runs()
 
     assert noted == ["rvr-01"] and swept == [1]
+
+
+def _route_mission():
+    from tests.test_route_steps import route
+    return route()
+
+
+def test_scheduled_publish_of_a_route_sends_no_steps_and_the_task_cap(monkeypatch):
+    # The dispatcher compiles a route; the app neither looks for program steps
+    # nor refuses its pre-made announcement clips as speech.
+    dispatcher, occ, run = _scheduled_world(monkeypatch, _route_mission(), max_duration_min=3)
+    app_module._publish_scheduled(occ, run)
+    (_, steps, cap), = dispatcher.calls
+    assert steps == [] and cap == 180
+
+
+def test_a_spoken_step_with_a_clip_already_made_is_not_speech_to_synthesise():
+    from shared.schemas.missions import CommandStep, SpeechSpec
+    from tasks.scheduler import has_spoken_steps
+    made = CommandStep(kind="command", blockId="b", label="x", type="SPEAK", params={"clip_id": "c.wav"})
+    typed = CommandStep(kind="command", blockId="b", label="x", type="SPEAK", params={"clip_id": "c.wav"},
+                        speech=SpeechSpec(text="hi", untilDone=False))
+    assert not has_spoken_steps([made])
+    assert not has_spoken_steps([typed])
+
+
+def test_the_dispatcher_reads_maps_from_the_maps_routers_store():
+    assert app_module._run_dispatcher._map_lookup == app_module.maps_router.store.get

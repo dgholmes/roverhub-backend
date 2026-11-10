@@ -37,6 +37,7 @@ def robot_json(record: RobotRecord) -> dict:
         "host_metrics": record.host_metrics,
         "host_metrics_at": record.host_metrics_at,
         "nav_goal": record.nav_goal,
+        "nav_map_id": record.nav_map_id,
     }
 
 

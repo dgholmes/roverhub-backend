@@ -14,11 +14,13 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 from control.commands import CommandStore
+from missions.route_steps import RouteNotRunnable, compile_route
 from realtime.mqtt_client import CommandPublishError, UnknownRobotError, _parse_version
 from robots.registry import RobotRegistry
 from runs import occurrences
 from runs.store import RunStore
-from shared.schemas.commands import Command, CommandStageEvent
+from shared.schemas.commands import Command, CommandStageEvent, command_ttl_s
+from shared.schemas.maps import SiteMap
 from shared.schemas.missions import MissionLibraryEntry, ProgramStep
 from shared.schemas.runs import MissionRun, RunSource
 from tasks.store import TaskStore
@@ -27,6 +29,22 @@ logger = logging.getLogger("roverhub.runs")
 
 # The first schema in which the edge understands START_MISSION.
 MISSION_SCHEMA_VERSION = "0.0.11"
+# The first in which it understands a route's walk-to-point step (NavStep).
+ROUTE_SCHEMA_VERSION = "0.0.16"
+
+# Refusals of a route (or of a program pretending to be one) that are about the
+# run rather than the route's content; missions/route_steps.py has the rest. The
+# console shows each verbatim.
+R_ROUTE_WITH_STEPS = "a route is compiled into steps by the backend when it starts; send it with no steps"
+R_ROUTE_SCHEMA = "update the edge device: it runs schema {version}, routes need " + ROUTE_SCHEMA_VERSION
+R_MAP_MISSING = ("the map {map_id} this route is drawn on is not in the map store; "
+                 "upload it in Missions › Maps or draw the route on another map")
+R_MAP_DRAFT = "the map {map_name} is a draft; activate it in Missions › Maps"
+R_MAP_ARCHIVED = "the map {map_name} is archived; make it active again in Missions › Maps"
+R_NAV_MAP = ("{robot_id} is localised on the map {robot_map}, not on {map_name}, which this route is drawn on; "
+             "load that map on the robot or pick a robot that has it")
+R_PROGRAM_NAVIGATES = ("this program contains a walk-to-point step, which only a route can carry; "
+                       "remove it, or draw the walk as a route")
 
 OnChange = Callable[[str, Optional[str]], None]
 
@@ -63,8 +81,12 @@ class RunDispatcher:
         new_run_id: Callable[[str, str], str] = default_run_id,
         on_change: Optional[OnChange] = None,
         clock_s: Callable[[], float] = time.time,
+        map_lookup: Optional[Callable[[str], Optional[SiteMap]]] = None,
     ):
         self._registry = registry
+        # map_id -> SiteMap, None if there is none: the maps router's store. A
+        # dispatcher without one refuses every route as "map not in the store".
+        self._map_lookup = map_lookup
         self._runs = run_store
         self._tasks = task_store
         self._commands = command_store
@@ -111,11 +133,46 @@ class RunDispatcher:
             raise StartRefused(f"{robot_id} is already running a mission")
         if robot.control_owner:
             raise StartRefused(f"someone has control of {robot_id}; release control first")
-        if mission.kind != "program":
-            raise StartRefused("only program missions can run on a robot")
-        if not steps:
-            raise StartRefused("the program has no steps to run")
         return robot
+
+    def _prepare(
+        self, robot, mission: MissionLibraryEntry, steps: List[ProgramStep],
+        max_duration_s: Optional[float],
+    ) -> Tuple[List[ProgramStep], Optional[float]]:
+        """The steps to send and the run's cap. A program's steps are the
+        browser's (or the stored compile's) and its cap is the caller's; a route
+        is compiled here, and with no cap from the caller it gets the compiled
+        one. Raises StartRefused."""
+        if mission.kind != "route":
+            if not steps:
+                raise StartRefused("the program has no steps to run")
+            if _navigates(steps):
+                # Only the route compiler makes these: a browser-built walk is
+                # untrusted input with no map check behind it.
+                raise StartRefused(R_PROGRAM_NAVIGATES)
+            return steps, max_duration_s
+        if steps:
+            raise StartRefused(R_ROUTE_WITH_STEPS, 422)
+        version = _parse_version(robot.schema_version)
+        if version is None or version < _parse_version(ROUTE_SCHEMA_VERSION):
+            raise StartRefused(R_ROUTE_SCHEMA.format(version=robot.schema_version or "unknown"))
+        site_map = self._map_lookup(mission.map_id) if self._map_lookup is not None else None
+        if site_map is None:
+            raise StartRefused(R_MAP_MISSING.format(map_id=mission.map_id))
+        if site_map.status == "draft":
+            raise StartRefused(R_MAP_DRAFT.format(map_name=site_map.name))
+        if site_map.status != "active":
+            raise StartRefused(R_MAP_ARCHIVED.format(map_name=site_map.name))
+        # Only when the bridge says which map it is on (0.0.16, nav enabled);
+        # the bridge checks every goal's map again itself.
+        if robot.nav_map_id is not None and robot.nav_map_id != site_map.map_id:
+            raise StartRefused(R_NAV_MAP.format(
+                robot_id=robot.robot_id, robot_map=robot.nav_map_id, map_name=site_map.name))
+        try:
+            compiled = compile_route(mission, site_map, robot.robot_type)
+        except RouteNotRunnable as refused:
+            raise StartRefused(refused.message) from refused
+        return compiled.steps, max_duration_s if max_duration_s is not None else compiled.cap_s
 
     def _is_running(self, robot, robot_id: str, exclude_run_id: Optional[str]) -> bool:
         # registry.active_run is the live truth for bridge runs. A stored run
@@ -136,6 +193,7 @@ class RunDispatcher:
     ) -> Tuple[MissionRun, Command]:
         with self._start_lock:
             robot = self._check(robot_id, mission, steps)
+            steps, max_duration_s = self._prepare(robot, mission, steps, max_duration_s)
             run_id = run_id or self._new_run_id(mission.mission_id, robot_id)
             if self._runs.get(run_id) is not None:
                 raise StartRefused(f"run {run_id} already exists")
@@ -162,7 +220,8 @@ class RunDispatcher:
         refusals and the same lock apply as for an operator's start. Raises
         StartRefused, which the scheduler loop records as the occurrence's failure."""
         with self._start_lock:
-            self._check(run.robot_id, run.mission, steps, exclude_run_id=run.run_id)
+            robot = self._check(run.robot_id, run.mission, steps, exclude_run_id=run.run_id)
+            steps, max_duration_s = self._prepare(robot, run.mission, steps, max_duration_s)
             return self.publish_start(run, steps, max_duration_s)
 
     def publish_start(
@@ -181,6 +240,9 @@ class RunDispatcher:
             },
             current_stage="requested", stages=[CommandStageEvent(stage="requested", at=now)],
             initiated_by=run.started_by,
+            # Matches ACK_TIMEOUT_S: a START_MISSION delivered after the run was
+            # failed noAnswer must not start it (the bridge only logs this yet).
+            ttl_s=command_ttl_s("START_MISSION"),
         )
         self._commands.add(command)
         try:
@@ -258,6 +320,19 @@ class RunDispatcher:
             run.bridge_boot_id = robot.bridge_boot_id
             self._runs.put(run)
         self._changed(run_id)
+
+
+def _navigates(steps) -> bool:
+    """True if any step, however deeply nested, is a walk-to-point (NavStep)."""
+    for step in steps:
+        kind = getattr(step, "kind", None)
+        if kind == "navigate":
+            return True
+        if kind in ("repeat", "repeatUntil") and _navigates(step.body):
+            return True
+        if kind == "if" and (_navigates(step.then) or _navigates(step.else_)):
+            return True
+    return False
 
 
 def make_run_ended_hook(

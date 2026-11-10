@@ -534,3 +534,16 @@ def test_publish_command_still_publishes_to_a_known_robot_that_is_offline():
     client.publish_command("robot-dev-01", command)
 
     assert fake.published[-1][0] == "roverhub/site-dev/robot-dev-01/commands"
+
+
+def test_registration_records_the_map_the_bridge_navigates_on():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    base = {"robot_id": "rover-j", "site_id": "site-a", "robot_type": "quad", "schema_version": "0.0.16"}
+
+    client.handle_message("roverhub/admin/rover-j/register", json.dumps({**base, "nav_map_id": "map-office"}).encode())
+    assert registry.get("rover-j").nav_map_id == "map-office"
+
+    # A bridge with nav off (or older than 0.0.16) says nothing: none, not the last value.
+    client.handle_message("roverhub/admin/rover-j/register", json.dumps(base).encode())
+    assert registry.get("rover-j").nav_map_id is None

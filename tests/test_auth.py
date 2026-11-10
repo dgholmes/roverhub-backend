@@ -431,3 +431,18 @@ def test_a_user_added_by_the_cli_while_the_server_runs_is_seen_and_kept(tmp_path
     assert server.check_credentials("from-cli", PASSWORD) is not None
     server.create(username="later", display_name="", password=PASSWORD)
     assert {u.username for u in UserStore(path).list()} == {"first", "from-cli", "later"}
+
+
+# --- RESUME (schema 0.0.16) ----------------------------------------------------
+
+
+def test_resume_needs_dispatch_patrols(auth_on):
+    from auth.policy import command_capabilities
+
+    assert command_capabilities("RESUME") == ("dispatchPatrols",)
+    _user(auth_on, "ana", {"site-a": "operator"})
+    _user(auth_on, "sue", {"site-a": "supervisor"})
+    client = TestClient(backend.app)
+    params = {"run_id": "run-1"}
+    assert _command(client, _bearer(client, "ana"), type_="RESUME", params=params).status_code == 403
+    assert _command(client, _bearer(client, "sue"), type_="RESUME", params=params).status_code == 200

@@ -11,7 +11,10 @@ from auth.policy import command_capabilities
 
 from control.commands import CommandStore
 from realtime.mqtt_client import CommandPublishError, UnknownRobotError
-from shared.schemas.commands import Command, CommandRequest, CommandStageEvent, NavGotoParams, ResetPositionParams, WIRED_COMMAND_TYPES
+from shared.schemas.commands import (
+    WIRED_COMMAND_TYPES, Command, CommandRequest, CommandStageEvent, NavGotoParams,
+    ResetPositionParams, ResumeParams, command_ttl_s,
+)
 
 
 def build_router(command_store: CommandStore, mqtt_client, registry=None) -> APIRouter:
@@ -62,6 +65,13 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None) -> API
                 fields = ", ".join(".".join(str(p) for p in e["loc"]) or "params" for e in exc.errors())
                 raise HTTPException(
                     status_code=422, detail=f"RESET_POSITION params are not a usable pose ({fields})") from exc
+        elif request.type == "RESUME":
+            # The run_id is what stops a late Retry restarting some other paused run.
+            try:
+                ResumeParams.model_validate(request.params or {}, strict=True)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=422, detail="RESUME needs the run_id of the run to retry") from exc
 
         command = Command(
             command_id=str(uuid.uuid4()),
@@ -72,6 +82,9 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None) -> API
             current_stage="requested",
             stages=[CommandStageEvent(stage="requested", at=datetime.now(timezone.utc).isoformat())],
             initiated_by=acting_user_id(http, request.initiated_by),
+            # None for a stop: a late stop is still a stop. The bridge only logs
+            # an expired command for now, so nothing may depend on it dropping one.
+            ttl_s=command_ttl_s(request.type),
         )
         command_store.add(command)
         try:

@@ -244,3 +244,46 @@ def test_a_robot_forgotten_between_the_check_and_the_publish_is_404_not_sent():
     assert response.json() == {"detail": "robot not found"}
     (command,) = store._commands.values()
     assert command.current_stage == "execution_failed"
+
+
+# -- command time limits and RESUME (schema 0.0.16) ----------------------------
+
+def test_a_published_command_carries_its_time_limit():
+    from shared.schemas.commands import command_ttl_s
+
+    client, registry, _, mqtt_client = _make_app_with_registry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    for type_ in ("SET_STATE", "DRIVE", "SNAPSHOT"):
+        client.post("/robots/robot-dev-01/commands", json={"type": type_, "label": type_, "initiated_by": "x"})
+    sent = {command.type: command.ttl_s for _, command in mqtt_client.published_commands}
+    assert sent == {t: command_ttl_s(t) for t in ("SET_STATE", "DRIVE", "SNAPSHOT")}
+    assert all(v is not None and v > 0 for v in sent.values())
+
+
+def test_a_stop_is_published_with_no_time_limit():
+    from shared.schemas.commands import COMMAND_TTL_EXEMPT
+
+    client, registry, _, mqtt_client = _make_app_with_registry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    for type_ in ("ESTOP", "STOP_MISSION", "NAV_CANCEL", "RELEASE_CONTROL"):
+        assert type_ in COMMAND_TTL_EXEMPT
+        client.post("/robots/robot-dev-01/commands", json={"type": type_, "label": type_, "initiated_by": "x"})
+    assert [command.ttl_s for _, command in mqtt_client.published_commands] == [None] * 4
+
+
+def test_resume_needs_the_run_id_of_the_paused_run():
+    client, registry, _, mqtt_client = _make_app_with_registry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    for params in (None, {}, {"run_id": ""}, {"run_id": 7}):
+        response = client.post("/robots/robot-dev-01/commands",
+                               json={"type": "RESUME", "label": "Retry", "initiated_by": "x", "params": params})
+        assert response.status_code == 422, params
+        assert response.json()["detail"] == "RESUME needs the run_id of the run to retry", params
+    assert mqtt_client.published_commands == []
+
+    response = client.post("/robots/robot-dev-01/commands",
+                           json={"type": "RESUME", "label": "Retry", "initiated_by": "x",
+                                 "params": {"run_id": "run-1"}})
+    assert response.status_code == 200
+    (_, command), = mqtt_client.published_commands
+    assert command.params == {"run_id": "run-1"} and command.ttl_s == 10.0

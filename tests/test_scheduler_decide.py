@@ -72,10 +72,11 @@ def _skip(verdict, reason):
 
 # -- executor ---------------------------------------------------------------
 
-def test_the_default_executors_are_programs_only():
-    assert EXECUTOR_KINDS == frozenset({"program"})
+def test_the_default_executors_are_programs_and_routes():
+    # Routes since schema 0.0.16: the dispatcher compiles them at start.
+    assert EXECUTOR_KINDS == frozenset({"program", "route"})
     verdict = decide(_occ(), _task(), _mission("route"), _robot(), NOW, unattended_enabled=True)
-    _skip(verdict, "no_executor")
+    assert verdict.decision == "dispatch"
 
 
 def test_program_skips_unattended_disabled_by_default():

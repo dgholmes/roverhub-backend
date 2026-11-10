@@ -265,3 +265,14 @@ def test_update_state_stores_nav_goal_and_clears_it_when_omitted():
 
     registry.update_state("robot-dev-01", "STAND", "balance_stand")
     assert registry.get("robot-dev-01").nav_goal is None
+
+
+def test_nav_map_id_is_kept_from_registration_and_listed():
+    from robots.router import robot_json
+
+    registry = RobotRegistry()
+    registry.upsert_from_registration("rover-j", "site-a", "quad", nav_map_id="map-office")
+    assert registry.get("rover-j").nav_map_id == "map-office"
+    assert robot_json(registry.get("rover-j"))["nav_map_id"] == "map-office"
+    registry.upsert_from_registration("rover-j", "site-a", "quad")
+    assert registry.get("rover-j").nav_map_id is None
