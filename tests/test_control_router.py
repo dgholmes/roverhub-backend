@@ -117,3 +117,43 @@ def test_stop_mission_is_still_allowed_here():
         json={"type": "STOP_MISSION", "label": "Stop", "initiated_by": "x"})
     assert response.status_code == 200
     assert len(mqtt_client.published_commands) == 1
+
+
+_NAV_GOAL = {"x_m": 3.5, "y_m": -1.25, "yaw_rad": None, "map_id": "map-venue", "floor_id": "f1"}
+
+
+def test_issue_command_accepts_nav_goto_and_publishes_its_params_unchanged():
+    app, _, mqtt_client = _make_app()
+    response = TestClient(app).post(
+        "/robots/robot-dev-01/commands",
+        json={"type": "NAV_GOTO", "label": "Go to point", "initiated_by": "operator-1",
+              "params": _NAV_GOAL})
+
+    assert response.status_code == 200
+    assert response.json()["type"] == "NAV_GOTO"
+    (_, command), = mqtt_client.published_commands
+    assert command.params == _NAV_GOAL
+
+
+def test_nav_goto_with_a_goal_the_bridge_could_not_use_is_refused_before_publish():
+    app, _, mqtt_client = _make_app()
+    client = TestClient(app)
+    for params in (None, {"x_m": 1.0, "y_m": 2.0}, {**_NAV_GOAL, "x_m": "far"},
+                   {**_NAV_GOAL, "floor_id": None}):
+        response = client.post(
+            "/robots/robot-dev-01/commands",
+            json={"type": "NAV_GOTO", "label": "Go", "initiated_by": "x", "params": params})
+        assert response.status_code == 422, params
+        # Refused by our own check, not by CommandRequest's type literal.
+        assert "NAV_GOTO params are not a usable goal" in response.json()["detail"], params
+    assert mqtt_client.published_commands == []
+
+
+def test_issue_command_accepts_nav_cancel():
+    app, _, mqtt_client = _make_app()
+    response = TestClient(app).post(
+        "/robots/robot-dev-01/commands",
+        json={"type": "NAV_CANCEL", "label": "Cancel goal", "initiated_by": "operator-1"})
+
+    assert response.status_code == 200
+    assert len(mqtt_client.published_commands) == 1

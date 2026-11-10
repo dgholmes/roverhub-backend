@@ -50,9 +50,10 @@ def _bearer(client, username):
     return {"Authorization": f"Bearer {token}"}
 
 
-def _command(client, headers, robot="rover-a", type_="DRIVE"):
+def _command(client, headers, robot="rover-a", type_="DRIVE", params=None):
     return client.post(f"/robots/{robot}/commands", headers=headers,
-                       json={"type": type_, "label": type_, "params": {}, "initiated_by": "someone-else"})
+                       json={"type": type_, "label": type_, "params": {} if params is None else params,
+                             "initiated_by": "someone-else"})
 
 
 # --- every route has a rule -------------------------------------------------
@@ -225,6 +226,25 @@ def test_a_technician_may_stop_and_recover_but_not_drive(auth_on):
     assert _command(client, headers, type_="ESTOP").status_code == 200
     assert _command(client, headers, type_="RESET_ESTOP").status_code == 200
     assert _command(client, headers, type_="DRIVE").status_code == 403
+
+
+_NAV_GOAL = {"x_m": 1.0, "y_m": 2.0, "yaw_rad": None, "map_id": "m", "floor_id": "f"}
+
+
+def test_a_nav_goal_needs_drive_but_cancelling_it_only_needs_estop(auth_on):
+    # Walking the robot to a point is driving it; stopping that walk is never
+    # harder than moving, so anyone who may E-Stop may cancel the goal.
+    _user(auth_on, "ana", {"site-a": "operator"})
+    _user(auth_on, "tom", {"site-a": "technician"})
+    _user(auth_on, "vic", {"site-a": "viewer"})
+    client = TestClient(backend.app)
+    ana, tom, vic = (_bearer(client, n) for n in ("ana", "tom", "vic"))
+    assert _command(client, ana, type_="NAV_GOTO", params=_NAV_GOAL).status_code == 200
+    assert _command(client, ana, type_="NAV_CANCEL").status_code == 200
+    assert _command(client, tom, type_="NAV_GOTO", params=_NAV_GOAL).status_code == 403
+    assert _command(client, tom, type_="NAV_CANCEL").status_code == 200
+    assert _command(client, vic, type_="NAV_GOTO", params=_NAV_GOAL).status_code == 403
+    assert _command(client, vic, type_="NAV_CANCEL").status_code == 403
 
 
 def test_a_command_is_attributed_to_the_signed_in_user_whatever_the_body_says(auth_on):

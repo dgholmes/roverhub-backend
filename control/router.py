@@ -4,13 +4,14 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import ValidationError
 
 from auth.deps import acting_user_id, principal_of
 from auth.policy import command_capabilities
 
 from control.commands import CommandStore
 from realtime.mqtt_client import CommandPublishError
-from shared.schemas.commands import Command, CommandRequest, CommandStageEvent, WIRED_COMMAND_TYPES
+from shared.schemas.commands import Command, CommandRequest, CommandStageEvent, NavGotoParams, WIRED_COMMAND_TYPES
 
 
 def build_router(command_store: CommandStore, mqtt_client) -> APIRouter:
@@ -35,6 +36,16 @@ def build_router(command_store: CommandStore, mqtt_client) -> APIRouter:
         site_id = getattr(http.state, "site_id", None)
         if principal is not None and not any(principal.can(c, site_id) for c in needed):
             raise HTTPException(status_code=403, detail=f"your role does not allow {request.type}")
+
+        if request.type == "NAV_GOTO":
+            # After the permission check, so a role that may not drive learns
+            # nothing about what a valid goal looks like.
+            try:
+                NavGotoParams.model_validate(request.params)
+            except ValidationError as exc:
+                fields = ", ".join(".".join(str(p) for p in e["loc"]) or "params" for e in exc.errors())
+                raise HTTPException(
+                    status_code=422, detail=f"NAV_GOTO params are not a usable goal ({fields})") from exc
 
         command = Command(
             command_id=str(uuid.uuid4()),

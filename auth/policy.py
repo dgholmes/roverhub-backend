@@ -50,6 +50,9 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     "ESTOP": _STOPPING,
     "STOP_MISSION": _STOPPING,
     "STOP_SPEAK": _STOPPING,
+    # Cancelling a walk-to-point is stopping, so it is never harder than starting
+    # one. NAV_GOTO itself is driving the robot and takes the `drive` default.
+    "NAV_CANCEL": _STOPPING,
     # Releasing an E-Stop leaves the robot lying down (`ready`); standing it
     # up again is the "get a robot back up" capability technicians hold.
     "RESET_ESTOP": ("getUp",),
