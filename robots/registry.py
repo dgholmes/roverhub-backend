@@ -90,6 +90,9 @@ class RobotRecord:
     control_owner: Optional[str] = None
     active_run: Optional[dict] = None
     bridge_boot_id: Optional[str] = None
+    # From /state (schema 0.0.14): a NavGoalStatus as a plain dict. The goal the
+    # operator last tapped, terminal until the next one; None means no goal.
+    nav_goal: Optional[dict] = None
 
 
 class RobotRegistry:
@@ -181,7 +184,7 @@ class RobotRegistry:
     def update_state(
         self, robot_id: str, abstract_state: str, sdk_state: str, *,
         control_owner: Optional[str] = None, active_run: Optional[dict] = None,
-        bridge_boot_id: Optional[str] = None,
+        bridge_boot_id: Optional[str] = None, nav_goal: Optional[dict] = None,
     ) -> Optional[str]:
         """Returns the PREVIOUS bridge boot id, so the caller can tell a restart.
         Owner and active run are replaced each time: a state message that omits
@@ -195,6 +198,7 @@ class RobotRegistry:
             record.sdk_state = sdk_state
             record.control_owner = control_owner
             record.active_run = active_run
+            record.nav_goal = nav_goal
             record.bridge_boot_id = bridge_boot_id
             return previous
 

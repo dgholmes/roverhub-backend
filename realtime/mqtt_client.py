@@ -7,7 +7,7 @@ from typing import Callable, Optional, Tuple
 
 from pydantic import ValidationError
 
-from shared.schemas.bridge_status import EdgeHostInfo, EdgeHostMetrics
+from shared.schemas.bridge_status import EdgeHostInfo, EdgeHostMetrics, NavGoalStatus
 from shared.schemas.version import SCHEMA_VERSION
 
 logger = logging.getLogger("backend.realtime.mqtt_client")
@@ -190,6 +190,7 @@ class BackendMqttClient:
                 data["robot_id"], abstract_state=data["abstract_state"], sdk_state=data["sdk_state"],
                 control_owner=data.get("control_owner"), active_run=data.get("active_run"),
                 bridge_boot_id=boot_id,
+                nav_goal=self._validated(NavGoalStatus, data.get("nav_goal"), data["robot_id"], "nav_goal"),
             )
             if self._on_state is not None:
                 self._on_state(data["robot_id"], previous, boot_id)

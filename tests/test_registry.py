@@ -252,3 +252,16 @@ def test_offline_after_s_reads_the_environment(monkeypatch):
     monkeypatch.setenv("ROBOT_OFFLINE_AFTER_S", "soon")
     with pytest.raises(ValueError):
         offline_after_s_from_env()
+
+
+def test_update_state_stores_nav_goal_and_clears_it_when_omitted():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    goal = {"goal_id": "c-1", "x_m": 1.0, "y_m": 2.0, "yaw_rad": None, "map_id": "m",
+            "state": "active", "reason": None, "updated_at": "2026-11-10T00:00:00Z"}
+
+    registry.update_state("robot-dev-01", "STAND", "balance_stand", nav_goal=goal)
+    assert registry.get("robot-dev-01").nav_goal == goal
+
+    registry.update_state("robot-dev-01", "STAND", "balance_stand")
+    assert registry.get("robot-dev-01").nav_goal is None

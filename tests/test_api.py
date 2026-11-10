@@ -116,3 +116,14 @@ def test_a_rejected_robot_can_still_be_commanded(monkeypatch):
 
     assert response.status_code == 200, response.text
     assert published == ["robot-new"]
+
+
+def test_robots_listing_exposes_nav_goal_or_null():
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    assert TestClient(app).get("/robots").json()[0]["nav_goal"] is None
+
+    goal = {"goal_id": "c-1", "x_m": 1.0, "y_m": 2.0, "yaw_rad": None, "map_id": "m",
+            "state": "active", "reason": None, "updated_at": "t"}
+    registry.update_state("robot-dev-01", "STAND", "balance_stand", nav_goal=goal)
+
+    assert TestClient(app).get("/robots").json()[0]["nav_goal"] == goal
