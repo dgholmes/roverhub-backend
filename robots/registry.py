@@ -90,7 +90,7 @@ class RobotRecord:
     control_owner: Optional[str] = None
     active_run: Optional[dict] = None
     bridge_boot_id: Optional[str] = None
-    # From /state (schema 0.0.14): a NavGoalStatus as a plain dict. The goal the
+    # From /state (schema 0.0.15): a NavGoalStatus as a plain dict. The goal the
     # operator last tapped, terminal until the next one; None means no goal.
     nav_goal: Optional[dict] = None
 
