@@ -247,6 +247,22 @@ def test_a_nav_goal_needs_drive_but_cancelling_it_only_needs_estop(auth_on):
     assert _command(client, vic, type_="NAV_CANCEL").status_code == 403
 
 
+_POSE = {"x_m": 1.0, "y_m": 2.0, "heading_deg": 90.0, "map_id": "m", "floor_id": "f"}
+
+
+def test_placing_the_robot_on_the_map_needs_drive(auth_on):
+    # RESET_POSITION redirects every later goal, so it is not a stop: a technician
+    # (who may E-Stop and recover, not drive) and a viewer are both refused.
+    _user(auth_on, "ana", {"site-a": "operator"})
+    _user(auth_on, "tom", {"site-a": "technician"})
+    _user(auth_on, "vic", {"site-a": "viewer"})
+    client = TestClient(backend.app)
+    ana, tom, vic = (_bearer(client, n) for n in ("ana", "tom", "vic"))
+    assert _command(client, ana, type_="RESET_POSITION", params=_POSE).status_code == 200
+    assert _command(client, tom, type_="RESET_POSITION", params=_POSE).status_code == 403
+    assert _command(client, vic, type_="RESET_POSITION", params=_POSE).status_code == 403
+
+
 def test_a_command_is_attributed_to_the_signed_in_user_whatever_the_body_says(auth_on):
     user = _user(auth_on, "ana", {"site-a": "operator"})
     client = TestClient(backend.app)

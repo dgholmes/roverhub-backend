@@ -157,3 +157,33 @@ def test_issue_command_accepts_nav_cancel():
 
     assert response.status_code == 200
     assert len(mqtt_client.published_commands) == 1
+
+
+_POSE = {"x_m": 3.5, "y_m": -1.25, "heading_deg": 90.0, "map_id": "map-venue", "floor_id": "f1"}
+
+
+def test_issue_command_accepts_reset_position_and_publishes_its_params_unchanged():
+    app, _, mqtt_client = _make_app()
+    response = TestClient(app).post(
+        "/robots/robot-dev-01/commands",
+        json={"type": "RESET_POSITION", "label": "Set position", "initiated_by": "operator-1",
+              "params": _POSE})
+
+    assert response.status_code == 200
+    assert response.json()["type"] == "RESET_POSITION"
+    (_, command), = mqtt_client.published_commands
+    assert command.params == _POSE
+
+
+def test_reset_position_with_a_pose_the_bridge_could_not_use_is_refused_before_publish():
+    app, _, mqtt_client = _make_app()
+    client = TestClient(app)
+    for params in (None, {"x_m": 1.0, "y_m": 2.0, "map_id": "m", "floor_id": "f"},
+                   {**_POSE, "heading_deg": "north"}, {**_POSE, "x_m": None},
+                   {**_POSE, "map_id": None}):
+        response = client.post(
+            "/robots/robot-dev-01/commands",
+            json={"type": "RESET_POSITION", "label": "Set", "initiated_by": "x", "params": params})
+        assert response.status_code == 422, params
+        assert "RESET_POSITION params are not a usable pose" in response.json()["detail"], params
+    assert mqtt_client.published_commands == []

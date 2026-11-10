@@ -53,6 +53,9 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     # Cancelling a walk-to-point is stopping, so it is never harder than starting
     # one. NAV_GOTO itself is driving the robot and takes the `drive` default.
     "NAV_CANCEL": _STOPPING,
+    # Placing the robot on the map is not a stop: it changes where the robot
+    # believes it is, which redirects every goal that follows. Same as driving.
+    "RESET_POSITION": ("drive",),
     # Releasing an E-Stop leaves the robot lying down (`ready`); standing it
     # up again is the "get a robot back up" capability technicians hold.
     "RESET_ESTOP": ("getUp",),
