@@ -10,11 +10,14 @@ from auth.deps import acting_user_id, principal_of
 from auth.policy import command_capabilities
 
 from control.commands import CommandStore
-from realtime.mqtt_client import CommandPublishError
+from realtime.mqtt_client import CommandPublishError, UnknownRobotError
 from shared.schemas.commands import Command, CommandRequest, CommandStageEvent, NavGotoParams, ResetPositionParams, WIRED_COMMAND_TYPES
 
 
-def build_router(command_store: CommandStore, mqtt_client) -> APIRouter:
+def build_router(command_store: CommandStore, mqtt_client, registry=None) -> APIRouter:
+    """`registry` lets an unknown robot be refused before the command is even
+    recorded. Without it the MQTT client still refuses to publish one
+    (UnknownRobotError), so the answer is the same 404, just after the store."""
     router = APIRouter()
 
     @router.post("/robots/{robot_id}/commands")
@@ -36,6 +39,12 @@ def build_router(command_store: CommandStore, mqtt_client) -> APIRouter:
         site_id = getattr(http.state, "site_id", None)
         if principal is not None and not any(principal.can(c, site_id) for c in needed):
             raise HTTPException(status_code=403, detail=f"your role does not allow {request.type}")
+
+        # Known means registered, online or not: an offline robot is still sent
+        # the command exactly as before. Unknown has no site, so no topic to send
+        # it to; it used to go to roverhub/unknown/... and be reported as sent.
+        if registry is not None and registry.get(robot_id) is None:
+            raise HTTPException(status_code=404, detail="robot not found")
 
         # After the permission check, so a role that may not drive learns nothing
         # about what a valid goal or pose looks like.
@@ -79,7 +88,8 @@ def build_router(command_store: CommandStore, mqtt_client) -> APIRouter:
                 )
             )
             command_store.add(command)
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            status = 404 if isinstance(exc, UnknownRobotError) else 503
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
         return command
 
     @router.get("/robots/{robot_id}/commands/{command_id}")

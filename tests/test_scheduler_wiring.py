@@ -267,3 +267,46 @@ def test_startup_runs_the_run_watchdog_and_shutdown_stops_it(monkeypatch):
 
 def test_the_reaper_closes_runs_through_the_dispatcher():
     assert app_module.run_reaper._fail == app_module._run_dispatcher.start_failed
+
+
+def test_startup_settles_orphans_before_the_scheduler_or_mqtt_starts(monkeypatch):
+    # Before the first tick, or a robot wedged by the last process is skipped as
+    # robot_busy once more; before MQTT, so the snapshot is the old process's.
+    order = []
+
+    class _Settler:
+        def start(self):
+            order.append("settle")
+
+        def note_state(self, robot_id):
+            pass
+
+        def sweep(self):
+            pass
+
+    class _Loop(_FakeLoop):
+        async def run(self):
+            order.append("scheduler")
+            await super().run()
+
+    monkeypatch.setattr(app_module, "orphan_settler", _Settler())
+    monkeypatch.setattr(app_module, "scheduler_loop", _Loop())
+    monkeypatch.setattr(app_module.mqtt_client, "connect", lambda: order.append("mqtt"))
+    monkeypatch.setattr(app_module.mqtt_client, "disconnect", lambda: None)
+
+    with TestClient(app_module.app) as client:
+        assert client.get("/healthz").status_code == 200
+    assert order[0] == "settle" and set(order) == {"settle", "mqtt", "scheduler"}
+
+
+def test_the_settler_closes_runs_through_the_dispatcher_and_hears_every_state(monkeypatch):
+    assert app_module.orphan_settler._fail == app_module._run_dispatcher.start_failed
+    noted, swept = [], []
+    monkeypatch.setattr(app_module.orphan_settler, "note_state", noted.append)
+    monkeypatch.setattr(app_module.orphan_settler, "sweep", lambda: swept.append(1))
+    monkeypatch.setattr(app_module, "_reconcile_hook", None)
+
+    app_module._on_state("rvr-01", None, "boot-a")
+    app_module._sweep_runs()
+
+    assert noted == ["rvr-01"] and swept == [1]

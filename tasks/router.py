@@ -307,13 +307,11 @@ def build_tasks_router(
                 run_id=occurrence_id, before_publish=store_dispatched)
         except StartRefused as refused:
             raise HTTPException(status_code=refused.status, detail=refused.message) from refused
-        occurrence = store.get_occurrence(occurrence_id)
         # Only a still-"dispatched" occurrence becomes running: a refusal or a
         # finished run that raced ahead of this line has already settled it.
-        if occurrence is not None and occurrence.status == "dispatched":
-            occurrence = occurrence.model_copy(update={
-                "status": "running", "message": "Run-now: started on the robot."})
-            store.put_occurrence(occurrence)
+        # Compare-and-set under the run's lock (runs/occurrences.py), the same
+        # transition the scheduler makes after it publishes.
+        occurrence = active.mark_running(occurrence_id, "Run-now: started on the robot.")
         return JSONResponse(status_code=201, content={
             "occurrence": occurrence.model_dump(mode="json"),
             "run": run.model_dump(mode="json"),

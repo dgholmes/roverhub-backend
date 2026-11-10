@@ -117,11 +117,6 @@ def test_refusals(env, setup, phrase):
     assert env.published == [] and env.runs.list() == []
 
 
-def test_unknown_robot_is_refused_as_offline(env):
-    response = env.client.post("/robots/ghost/runs", json=_body())
-    assert response.status_code == 409 and "ghost is offline" in response.json()["detail"]
-
-
 def test_a_running_run_in_the_store_blocks_a_second_start(env):
     assert env.post().status_code == 201
     second = env.post()
@@ -365,3 +360,24 @@ def test_ack_records_the_bridges_current_boot_id_on_the_run(env):
 
     assert env.runs.get(RUN_ID).bridge_boot_id == "boot-b"
     assert (RUN_ID, None) in env.changes
+
+
+# -- a robot the registry does not know (audit 2026-11-10) ---------------------
+
+def test_starting_a_run_on_an_unknown_robot_is_404_and_nothing_is_published_or_stored(env):
+    response = env.client.post("/robots/ghost/runs", json=_body())
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "robot not found"}
+    assert env.published == []
+    assert env.runs.list() == []
+
+
+def test_starting_a_run_on_a_known_offline_robot_is_still_409_offline(env):
+    env.registry.mark_offline("rover-pi")
+
+    response = env.post()
+
+    assert response.status_code == 409
+    assert "offline" in response.json()["detail"]
+    assert env.published == []

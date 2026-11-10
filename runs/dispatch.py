@@ -14,8 +14,9 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 from control.commands import CommandStore
-from realtime.mqtt_client import CommandPublishError, _parse_version
+from realtime.mqtt_client import CommandPublishError, UnknownRobotError, _parse_version
 from robots.registry import RobotRegistry
+from runs import occurrences
 from runs.store import RunStore
 from shared.schemas.commands import Command, CommandStageEvent
 from shared.schemas.missions import MissionLibraryEntry, ProgramStep
@@ -92,7 +93,12 @@ class RunDispatcher:
         exclude_run_id is a run that already exists for this very start (the
         scheduler writes its run before publishing), so it is not "another"."""
         robot = self._registry.get(robot_id)
-        if robot is None or not robot.online:
+        if robot is None:
+            # Unknown is not offline: there is no topic to send it to at all
+            # (realtime/mqtt_client.py), and the API's answer for a robot it
+            # does not know is a 404 (robots/router.py).
+            raise StartRefused("robot not found", 404)
+        if not robot.online:
             raise StartRefused(f"{robot_id} is offline")
         version = _parse_version(robot.schema_version)
         if version is None or version < _parse_version(MISSION_SCHEMA_VERSION):
@@ -188,7 +194,9 @@ class RunDispatcher:
                 stage="execution_failed", at=datetime.now(timezone.utc).isoformat()))
             self._commands.add(command)
             self.start_failed(run.run_id, str(exc))
-            raise StartRefused(str(exc), 503) from exc
+            # Unknown here means forgotten since _check: refused, not unavailable.
+            status = 404 if isinstance(exc, UnknownRobotError) else 503
+            raise StartRefused(str(exc), status) from exc
         self._unanswered[run.run_id] = self._clock_s()
         return command
 
@@ -211,12 +219,16 @@ class RunDispatcher:
             run.ended_at = self._clock()
             run.end_reason = reason
             self._runs.put(run)
-        occurrence = self._tasks.get_occurrence(run_id)
-        if occurrence is not None:
-            occurrence.status = "failed"
-            self._tasks.put_occurrence(occurrence)
+            # Still under the run's lock, and only if still in flight: a settled
+            # occurrence is final (runs/occurrences.py).
+            occurrences.fail(self._runs, self._tasks, run_id, reason)
         self._changed(run_id)
         logger.warning("run %s failed to start: %s", run_id, reason)
+
+    def mark_running(self, run_id: str, message: Optional[str] = None):
+        """After START_MISSION went out: the run's occurrence becomes running
+        unless the run already ended (runs/occurrences.mark_running)."""
+        return occurrences.mark_running(self._runs, self._tasks, run_id, message)
 
     def on_ack(self, command: Command) -> None:
         """Ack hook: a START_MISSION the bridge refused or never answered."""
@@ -248,24 +260,26 @@ class RunDispatcher:
         self._changed(run_id)
 
 
-def make_run_ended_hook(task_store: TaskStore) -> Callable[[MissionRun], None]:
+def make_run_ended_hook(
+    task_store: TaskStore, run_store: Optional[RunStore] = None,
+) -> Callable[[MissionRun], None]:
     """The occurrence shares its run's id, so a finished run settles its
     occurrence: completed is succeeded, an operator stop is cancelled, anything
-    else failed. A run with no occurrence (the editor's) is nothing to do."""
+    else failed (runs/occurrences.outcome). A run with no occurrence (the
+    editor's) is nothing to do. A settled occurrence is final: a resent
+    run_ended (or one racing start_failed) must not rewrite what an operator
+    already saw.
+
+    run_store is the one whose per-run lock the other occurrence writers hold;
+    the app passes it. Without it the write is unlocked, which is still safe for
+    this writer alone: it only runs once the run has ended, and every other
+    writer leaves an ended run's occurrence alone or gives it this same outcome."""
     def on_run_ended(run: MissionRun) -> None:
+        if run_store is not None:
+            occurrences.settle(run_store, task_store, run)
+            return
+        status, message = occurrences.outcome(run)
         occurrence = task_store.get_occurrence(run.run_id)
-        if occurrence is None:
-            return
-        # A settled occurrence is final: a resent run_ended (or one racing
-        # start_failed) must not rewrite what an operator already saw.
-        if occurrence.status in ("succeeded", "failed", "cancelled", "skipped"):
-            return
-        if run.result == "completed":
-            occurrence.status = "succeeded"
-        elif run.result == "aborted" and run.end_reason == "stopped":
-            occurrence.status = "cancelled"
-        else:
-            occurrence.status = "failed"
-        occurrence.message = run.end_reason
-        task_store.put_occurrence(occurrence)
+        if occurrence is not None and occurrence.status in occurrences.IN_FLIGHT:
+            task_store.put_occurrence(occurrence.model_copy(update={"status": status, "message": message}))
     return on_run_ended

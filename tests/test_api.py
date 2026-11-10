@@ -127,3 +127,17 @@ def test_robots_listing_exposes_nav_goal_or_null():
     registry.update_state("robot-dev-01", "STAND", "balance_stand", nav_goal=goal)
 
     assert TestClient(app).get("/robots").json()[0]["nav_goal"] == goal
+
+
+def test_the_app_refuses_a_command_for_a_robot_it_does_not_know(monkeypatch):
+    from api.app import mqtt_client
+
+    published = []
+    monkeypatch.setattr(mqtt_client._client, "publish", lambda *a, **k: published.append(a))
+
+    response = TestClient(app).post("/robots/ghost/commands", json={
+        "type": "ESTOP", "label": "E-Stop", "initiated_by": "operator-dev"})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "robot not found"}
+    assert published == []

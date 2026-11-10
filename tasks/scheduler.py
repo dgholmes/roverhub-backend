@@ -33,6 +33,7 @@ from fastapi import HTTPException
 
 from missions.router import MissionStore
 from robots.registry import RobotRecord, RobotRegistry
+from runs import occurrences
 from runs.store import RunStore
 from shared.schemas.missions import MissionKind, MissionLibraryEntry
 from shared.schemas.runs import MissionRun
@@ -605,25 +606,33 @@ class SchedulerLoop:
         # tried. The cost, stated plainly: there is no recovery. If `runs.put`
         # (or the process) fails after this write, the occurrence stays
         # "dispatched" with no run, `run_once` seeds `busy` from "dispatched",
-        # and that robot is skipped as `robot_busy` from then on. Only a publish
-        # failure is cleaned up (below). Nothing can reach this while
-        # EXECUTOR_KINDS is empty; reaping stuck dispatches belongs with the
-        # executor's dispatched/running -> terminal lifecycle (Plan 3).
+        # and that robot is skipped as `robot_busy` until the backend restarts:
+        # runs/orphans.py fails an in-flight occurrence with no run at start-up.
+        # Only a publish failure is cleaned up here (below).
         dispatched = occ.model_copy(update={"status": "dispatched", "run_id": run.run_id})
         self._store.put_occurrence(dispatched)
         self._runs.put(run)
+        # Everything after publish re-reads under the run's lock and moves only
+        # what is still in flight (runs/occurrences.py). The run can end between
+        # publish and the next line -- a refusal ack applied on paho's thread, a
+        # run that finished at once -- and writing from `dispatched`, the copy
+        # read before publishing, used to resurrect it as "running" and wedge
+        # the robot: `busy` is seeded from running occurrences.
         try:
             self._publish(dispatched, run)
         except Exception as exc:
             logger.exception("occurrence %s: publish failed", occ.occurrence_id)
-            self._runs.put(run.model_copy(update={
-                "result": "failed", "ended_at": _iso(now), "end_reason": f"publish failed: {exc}",
-            }))
-            self._store.put_occurrence(dispatched.model_copy(update={
-                "status": "failed", "message": f"the dispatch could not be sent: {exc}",
-            }))
+            with self._runs.lock(run.run_id):
+                current = self._runs.get(run.run_id)
+                if current is not None and current.result == "running":
+                    self._runs.put(current.model_copy(update={
+                        "result": "failed", "ended_at": _iso(now),
+                        "end_reason": f"publish failed: {exc}",
+                    }))
+                occurrences.fail(self._runs, self._store, run.run_id,
+                                 f"the dispatch could not be sent: {exc}")
             return False
-        self._store.put_occurrence(dispatched.model_copy(update={"status": "running"}))
+        occurrences.mark_running(self._runs, self._store, run.run_id)
         return True
 
 

@@ -504,3 +504,33 @@ def test_state_message_with_a_malformed_nav_goal_still_updates_state():
     record = registry.get("robot-dev-01")
     assert record.abstract_state == "STAND"
     assert record.nav_goal is None
+
+
+def test_publish_command_refuses_a_robot_the_registry_does_not_know():
+    # It used to publish to roverhub/unknown/<robot>/commands -- a topic no
+    # bridge subscribes to -- and report the command as sent.
+    from realtime.mqtt_client import CommandPublishError, UnknownRobotError
+
+    fake = _FakeMqttClient()
+    client = BackendMqttClient("mqtt://localhost:1883", RobotRegistry(), lambda: fake)
+    command = Command(command_id="cmd-1", robot_id="ghost", type="ESTOP", label="E-Stop", initiated_by="x")
+
+    with pytest.raises(UnknownRobotError):
+        client.publish_command("ghost", command)
+    assert fake.published == []
+    # A CommandPublishError, so every caller that already settles an unsent
+    # command (marks it failed, fails its run) does so for this one too.
+    assert issubclass(UnknownRobotError, CommandPublishError)
+
+
+def test_publish_command_still_publishes_to_a_known_robot_that_is_offline():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    registry.mark_offline("robot-dev-01")
+    fake = _FakeMqttClient()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, lambda: fake)
+    command = Command(command_id="cmd-1", robot_id="robot-dev-01", type="ESTOP", label="E-Stop", initiated_by="x")
+
+    client.publish_command("robot-dev-01", command)
+
+    assert fake.published[-1][0] == "roverhub/site-dev/robot-dev-01/commands"

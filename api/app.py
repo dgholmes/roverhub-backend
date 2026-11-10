@@ -23,6 +23,7 @@ from robots.registry import RobotRegistry, offline_after_s_from_env
 from robots.router import build_robots_router
 from runs.dispatch import RunDispatcher, make_run_ended_hook
 from runs.bucket import from_env as bucket_from_env
+from runs.orphans import OrphanSettler
 from runs.reaper import RunReaper
 from runs.reconcile import make_state_hook
 from runs.router import build_runs_router
@@ -51,9 +52,15 @@ registry = RobotRegistry(
 )
 command_store = CommandStore()
 _reconcile_hook = None  # bound below, once the run and task stores exist
+orphan_settler = None  # bound below, once the run and task stores exist
 
 
 def _on_state(robot_id, previous_boot_id, boot_id):
+    if orphan_settler is not None:
+        try:
+            orphan_settler.note_state(robot_id)
+        except Exception:
+            logger.exception("could not note the state of %s for the orphan pass", robot_id)
     if _reconcile_hook is not None:
         _reconcile_hook(robot_id, previous_boot_id, boot_id)
 
@@ -106,7 +113,7 @@ auth = Auth.from_env(resolve_site=_resolve_site)
 app = FastAPI(title="RoverHub Backend (dev)", dependencies=[Depends(auth.guard)])
 app.include_router(build_auth_router(auth))
 app.include_router(build_mqtt_hooks_router(auth))
-app.include_router(build_router(command_store, mqtt_client))
+app.include_router(build_router(command_store, mqtt_client, registry=registry))
 app.include_router(build_robots_router(registry))
 app.include_router(build_media_router(clips_dir=os.environ.get("AUDIO_CLIPS_DIR", DEFAULT_AUDIO_CLIPS_DIR)))
 # Camera snapshots travel the other way from audio clips -- edge to cloud. Unlike
@@ -230,12 +237,17 @@ runs_router.dispatcher = _run_dispatcher
 # Runs that never close: a START_MISSION nobody answered, or a run its bridge
 # stopped naming. Checked every few seconds by the watchdog task below.
 run_reaper = RunReaper(registry, runs_router.store, _run_dispatcher.start_failed)
+# What the previous backend process left in flight: settled at startup, then
+# judged by the watchdog from what each robot reports (runs/orphans.py).
+orphan_settler = OrphanSettler(
+    registry, runs_router.store, _reconcile_task_store, _run_dispatcher.start_failed)
 _RUN_WATCH_INTERVAL_S = 5.0
 
 
 def _sweep_runs() -> None:
     _run_dispatcher.sweep_unanswered()
     run_reaper.sweep()
+    orphan_settler.sweep()
 
 
 async def _run_watchdog() -> None:
@@ -249,7 +261,7 @@ async def _run_watchdog() -> None:
 tasks_router.dispatcher = _run_dispatcher
 # The edge's run_ended closes the run record (runs/router.py); this settles the
 # task occurrence that shares its id.
-_run_ended = make_run_ended_hook(_reconcile_task_store)
+_run_ended = make_run_ended_hook(_reconcile_task_store, runs_router.store)
 # Rejects oversized audio-clip uploads by Content-Length before Starlette's
 # multipart parser spools the body -- see ContentLengthLimitMiddleware's
 # docstring in control/media.py for why this can't live in the handler alone.
@@ -291,6 +303,14 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _on_startup() -> None:
+    # First: before MQTT, so what it snapshots is the previous process's, and
+    # before the scheduler's first tick, so a robot that process wedged is not
+    # skipped as robot_busy once more. File I/O, so on a worker thread.
+    try:
+        await asyncio.to_thread(orphan_settler.start)
+    except Exception:
+        # A bad record must not keep the backend (and E-Stop) from starting.
+        logger.exception("could not settle what the previous process left in flight")
     mqtt_client.connect()
     app.state.run_watch_task = asyncio.create_task(_run_watchdog())
     if _scheduler_enabled():

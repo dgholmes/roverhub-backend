@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, List, Optional
 
+from runs import occurrences
 from runs.store import RunStore
 from tasks.store import TaskStore
 
@@ -62,10 +63,8 @@ def _fail_if_lost(run_store, task_store, run_id: str, boot_id: str, now_iso: str
         run.ended_at = now_iso
         run.end_reason = "bridgeRestarted"
         run_store.put(run)
-    occurrence = task_store.get_occurrence(run_id)
-    if occurrence is not None:
-        occurrence.status = "failed"
-        task_store.put_occurrence(occurrence)
+        # Under the same lock, and only if still in flight (runs/occurrences.py).
+        occurrences.fail(run_store, task_store, run_id, "bridgeRestarted")
     logger.warning("run %s failed: bridge restarted (boot %s -> %s)", run_id, old_boot, boot_id)
     return True
 

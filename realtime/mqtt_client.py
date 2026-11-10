@@ -30,6 +30,19 @@ class CommandPublishError(RuntimeError):
     """
 
 
+class UnknownRobotError(CommandPublishError):
+    """The registry has no record of this robot, so there is no topic to send
+    to: the site in the topic comes from the robot's registration.
+
+    This used to publish to `roverhub/unknown/<robot>/commands`, which no bridge
+    subscribes to, and report the command as sent -- so an E-Stop issued just
+    after a backend restart, before the robot re-registered, went nowhere. A
+    CommandPublishError so every caller that already settles an unsent command
+    does so for this one too; the HTTP routes answer it with a 404. A robot that
+    registered and went offline is still known and is still published to.
+    """
+
+
 def real_mqtt_client_factory():
     import paho.mqtt.client as mqtt
 
@@ -90,8 +103,14 @@ class BackendMqttClient:
 
     def publish_command(self, robot_id: str, command) -> None:
         record = self._registry.get(robot_id)
-        site_id = record.site_id if record is not None else "unknown"
-        topic = f"roverhub/{site_id}/{robot_id}/commands"
+        if record is None:
+            logger.error(
+                "refusing command %s (%s) for robot %s: the registry does not know it, "
+                "so it has no site and no topic. The command was NOT sent.",
+                command.command_id, command.type, robot_id,
+            )
+            raise UnknownRobotError("robot not found")
+        topic = f"roverhub/{record.site_id}/{robot_id}/commands"
         info = self._client.publish(topic, command.model_dump_json(), qos=1)
         # publish() never raises -- it reports failure through the returned
         # MQTTMessageInfo. Discarding it (as this did) means a command that was

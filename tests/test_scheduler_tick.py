@@ -517,3 +517,109 @@ def test_unattended_enabled_dispatches_program_with_source_and_boot_id(tmp_path)
     assert (run.source, run.bridge_boot_id, run.started_by) == ("schedule", "boot-7", "schedule")
     stored = world.runs.get(occ.occurrence_id)
     assert (stored.source, stored.bridge_boot_id) == ("schedule", "boot-7")
+
+
+# -- the write after publish (audit 2026-11-10, "scheduler can wedge a robot") --
+#
+# _dispatch publishes START_MISSION and then marks the occurrence running. The
+# run can end in between -- the bridge refuses it and the ack is applied on
+# paho's thread, or it finishes before the tick gets there -- and the occurrence
+# is then already settled. Writing "running" from the copy read before publish
+# resurrected it, and because the tick seeds `busy` from running occurrences,
+# every later patrol of that robot was skipped as robot_busy.
+
+LATER = "2026-10-25T09:00:00Z"
+AT_LATER = datetime(2026, 10, 25, 9, 0, 30, tzinfo=timezone.utc)
+
+
+def _refused_by_the_bridge(world):
+    """publish() as production wires it, with a bridge that refuses at once: the
+    refusal ack is applied before publish returns."""
+    from control.commands import CommandStore
+    from runs.dispatch import RunDispatcher
+
+    dispatcher = RunDispatcher(world.registry, world.runs, world.store, CommandStore(),
+                               lambda robot_id, command: None)
+
+    def publish(occ, run):
+        dispatcher.start_failed(run.run_id, "REJECTED_CONTROL_HELD")
+    return publish
+
+
+def test_a_run_refused_before_the_post_publish_write_stays_failed_and_frees_the_robot(tmp_path):
+    world = _World(tmp_path, executor_kinds=frozenset({"program"}))
+    world.loop._publish = _refused_by_the_bridge(world)
+    world.task()
+    occ = world.due()
+
+    world.loop.run_once(AT_DUE)
+
+    stored = world.store.get_occurrence(occ.occurrence_id)
+    assert stored.status == "failed"
+    assert world.runs.get(stored.run_id).result == "failed"
+
+    # Not wedged: the next day's patrol of the same robot is dispatched.
+    world.loop._publish = lambda o, r: world.published.append((o, r))
+    nxt = world.due(due_at=LATER)
+    world.loop.run_once(AT_LATER)
+    assert world.store.get_occurrence(nxt.occurrence_id).status == "running"
+
+
+def test_a_run_that_finished_before_the_post_publish_write_settles_the_occurrence(tmp_path):
+    # The run closed (run_ended landed) but its occurrence hook has not run yet:
+    # the occurrence takes the run's outcome rather than "running".
+    world = _World(tmp_path, executor_kinds=frozenset({"program"}))
+
+    def publish(occ, run):
+        done = world.runs.get(run.run_id)
+        world.runs.put(done.model_copy(update={
+            "result": "completed", "ended_at": "2026-10-24T09:00:10Z", "end_reason": None}))
+    world.loop._publish = publish
+    world.task()
+    occ = world.due()
+
+    world.loop.run_once(AT_DUE)
+
+    assert world.store.get_occurrence(occ.occurrence_id).status == "succeeded"
+
+
+@pytest.mark.parametrize("terminal", ["succeeded", "failed", "cancelled", "skipped"])
+def test_a_terminal_occurrence_is_never_moved_back_to_running(tmp_path, terminal):
+    world = _World(tmp_path, executor_kinds=frozenset({"program"}))
+
+    def publish(occ, run):
+        current = world.store.get_occurrence(occ.occurrence_id)
+        world.store.put_occurrence(current.model_copy(update={"status": terminal, "message": "settled"}))
+    world.loop._publish = publish
+    world.task()
+    occ = world.due()
+
+    world.loop.run_once(AT_DUE)
+
+    stored = world.store.get_occurrence(occ.occurrence_id)
+    assert (stored.status, stored.message) == (terminal, "settled")
+
+
+def test_a_failed_publish_does_not_overwrite_a_run_that_already_ended(tmp_path):
+    # The refusal path settled the run first (start_failed, as publish_start does
+    # on a broker error); the scheduler's own failure write must re-read, not
+    # replace the record from the copy it held before publishing.
+    world = _World(tmp_path, executor_kinds=frozenset({"program"}))
+
+    def publish(occ, run):
+        current = world.runs.get(run.run_id)
+        world.runs.put(current.model_copy(update={
+            "result": "failed", "ended_at": "2026-10-24T09:00:05Z", "end_reason": "broker down",
+            "bucket_copied_at": "2026-10-24T09:00:06Z"}))
+        raise RuntimeError("broker down")
+    world.loop._publish = publish
+    world.task()
+    occ = world.due()
+
+    world.loop.run_once(AT_DUE)
+
+    run = world.runs.get(occ.occurrence_id)
+    assert (run.result, run.end_reason, run.bucket_copied_at) == (
+        "failed", "broker down", "2026-10-24T09:00:06Z")
+    stored = world.store.get_occurrence(occ.occurrence_id)
+    assert stored.status == "failed" and "broker down" in stored.message

@@ -187,3 +187,60 @@ def test_reset_position_with_a_pose_the_bridge_could_not_use_is_refused_before_p
         assert response.status_code == 422, params
         assert "RESET_POSITION params are not a usable pose" in response.json()["detail"], params
     assert mqtt_client.published_commands == []
+
+
+# -- a robot the registry does not know (audit 2026-11-10) ---------------------
+
+def _make_app_with_registry():
+    from robots.registry import RobotRegistry
+
+    registry = RobotRegistry()
+    store = CommandStore()
+    mqtt_client = _FakeMqttClient()
+    app = FastAPI()
+    app.include_router(build_router(store, mqtt_client, registry=registry))
+    return TestClient(app), registry, store, mqtt_client
+
+
+def test_a_command_for_an_unknown_robot_is_404_and_nothing_is_published_or_stored():
+    client, _, store, mqtt_client = _make_app_with_registry()
+
+    response = client.post(
+        "/robots/ghost/commands", json={"type": "ESTOP", "label": "E-Stop", "initiated_by": "x"})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "robot not found"}
+    assert mqtt_client.published_commands == []
+    assert store._commands == {}
+
+
+def test_a_known_robot_that_is_offline_is_still_sent_the_command():
+    client, registry, _, mqtt_client = _make_app_with_registry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    registry.mark_offline("robot-dev-01")
+
+    response = client.post(
+        "/robots/robot-dev-01/commands", json={"type": "ESTOP", "label": "E-Stop", "initiated_by": "x"})
+
+    assert response.status_code == 200
+    assert [robot_id for robot_id, _ in mqtt_client.published_commands] == ["robot-dev-01"]
+
+
+def test_a_robot_forgotten_between_the_check_and_the_publish_is_404_not_sent():
+    # The client is the last line: it refuses rather than build a topic for "unknown".
+    from realtime.mqtt_client import UnknownRobotError
+
+    class _Forgets(_FakeMqttClient):
+        def publish_command(self, robot_id, command):
+            raise UnknownRobotError("robot not found")
+
+    store = CommandStore()
+    app = FastAPI()
+    app.include_router(build_router(store, _Forgets()))
+    response = TestClient(app).post(
+        "/robots/ghost/commands", json={"type": "ESTOP", "label": "E-Stop", "initiated_by": "x"})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "robot not found"}
+    (command,) = store._commands.values()
+    assert command.current_stage == "execution_failed"

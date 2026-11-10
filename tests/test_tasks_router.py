@@ -625,3 +625,17 @@ def test_the_occurrence_exists_as_dispatched_when_the_command_goes_out(tmp_path)
     env.post()
 
     assert seen[0] is not None and seen[0].status == "dispatched"
+
+
+def test_run_now_for_a_task_whose_robot_is_unknown_is_404_and_nothing_is_sent(tmp_path):
+    env = _DispatchEnv(tmp_path)
+    env.client.put("/tasks/t-1", json={**_task(robot_id="ghost"), "version": 1})
+
+    response = env.post()
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "robot not found"}
+    assert env.published == []
+    assert env.runs.list() == []
+    assert TaskStore(env.tasks_dir).list_occurrences(
+        None, "2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z") == []
