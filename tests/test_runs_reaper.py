@@ -159,7 +159,6 @@ def test_a_robot_that_went_silent_is_not_judged_until_it_returns(tmp_path):
     """A bridge that stops talking ages offline in the registry. Its run is
     neither reaped while it is silent (nothing can vouch either way) nor the
     moment it returns: the grace period restarts on its return."""
-    from datetime import timedelta
 
     wall = [datetime(2026, 10, 29, 10, 0, 0, tzinfo=timezone.utc)]
     env = Env(tmp_path)

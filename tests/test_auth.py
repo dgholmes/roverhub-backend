@@ -377,6 +377,27 @@ def test_a_bridge_publishes_its_own_topics_and_reads_only_its_commands(auth_on):
     assert _acl(client, "rover-a", "roverhub/admin/bridge-a/register", ACC_WRITE) == 200
 
 
+def test_a_device_publishes_its_own_perception_topics_only(auth_on):
+    # The perception service signs in with the robot's device key, like the bridge.
+    client = TestClient(backend.app)
+    assert _acl(client, "rover-a", "roverhub/site-a/rover-a/incidents", ACC_WRITE) == 200
+    assert _acl(client, "rover-a", "roverhub/site-a/rover-a/perception/status", ACC_WRITE) == 200
+    assert _acl(client, "rover-a", "roverhub/site-b/rover-b/incidents", ACC_WRITE) == 403
+    assert _acl(client, "rover-a", "roverhub/site-a/rover-a/perception/other", ACC_WRITE) == 403
+    assert _acl(client, "rover-a", "roverhub/site-a/rover-a/perception", ACC_WRITE) == 403
+
+
+def test_a_browser_reads_perception_topics_at_its_sites(auth_on):
+    user = _user(auth_on, "ana", {"site-a": "operator"})
+    client = TestClient(backend.app)
+    uid = user.user_id
+    assert _acl(client, uid, "roverhub/+/+/incidents", ACC_SUBSCRIBE) == 200
+    assert _acl(client, uid, "roverhub/+/+/perception/status", ACC_SUBSCRIBE) == 200
+    assert _acl(client, uid, "roverhub/site-a/rover-a/incidents", ACC_READ) == 200
+    assert _acl(client, uid, "roverhub/site-b/rover-b/perception/status", ACC_READ) == 403
+    assert _acl(client, uid, "roverhub/site-a/rover-a/incidents", ACC_WRITE) == 403
+
+
 def test_a_browser_reads_only_its_sites_and_never_publishes(auth_on):
     user = _user(auth_on, "ana", {"site-a": "operator"})
     client = TestClient(backend.app)
