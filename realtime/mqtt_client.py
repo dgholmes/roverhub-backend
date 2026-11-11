@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import logging
-from typing import Callable, Optional, Tuple
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 from pydantic import ValidationError
 
@@ -43,6 +46,10 @@ class UnknownRobotError(CommandPublishError):
     """
 
 
+def _iso(epoch: Optional[float]) -> Optional[str]:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat() if epoch is not None else None
+
+
 def real_mqtt_client_factory():
     import paho.mqtt.client as mqtt
 
@@ -74,10 +81,31 @@ class BackendMqttClient:
         on_state: Optional[Callable[[str, Optional[str], Optional[str]], None]] = None,
         on_observed: Optional[Callable[[str, str, str, dict], None]] = None,
         on_published: Optional[Callable[..., None]] = None,
+        registration_check: Optional[Callable[[str, str, Optional[str]], bool]] = None,
+        clock: Callable[[], float] = time.time,
     ):
         self._broker_url = broker_url
         self._registry = registry
         self._on_ack = on_ack
+        # (bridge_id from the topic, robot_id from the body, the bridge the
+        # registry already has for that robot) -> may this registration speak
+        # for that robot? auth.Auth.registration_allowed in the app: the broker
+        # told it which device key writes each bridge id.
+        self._registration_check = registration_check
+        self._clock = clock
+        # The broker link, for /healthz. paho's thread writes, requests read.
+        self._link_lock = threading.Lock()
+        self._connected = False
+        self._connected_at: Optional[float] = None
+        self._connects = 0
+        self._disconnects = 0
+        self._last_disconnect_at: Optional[float] = None
+        self._last_disconnect_rc: Optional[int] = None
+        self._last_refused_rc: Optional[int] = None
+        self._last_message_at: Optional[float] = None
+        # Body/topic disagreements already logged, so a misconfigured bridge
+        # at 10 Hz is one warning rather than a flood.
+        self._warned: Set[tuple] = set()
         # (robot_id, previous_boot_id, boot_id), after the registry is updated.
         self._on_state = on_state
         # (kind, site_id, robot_id, payload) for the history (history/service.py
@@ -159,7 +187,41 @@ class BackendMqttClient:
         except Exception:
             logger.exception("the history observer failed on a %s message from %s", kind, robot_id)
 
+    # -- the broker link, for /healthz ------------------------------------------------
+
+    def link_status(self) -> Dict[str, Any]:
+        """Cheap (no I/O): whether the broker link is up, how long since any
+        message arrived, and how often it has dropped. A dead link otherwise
+        shows only as commands that never get an ack."""
+        now = self._clock()
+        with self._link_lock:
+            return {
+                "connected": self._connected,
+                "connected_since": _iso(self._connected_at) if self._connected else None,
+                "last_message_age_s": (round(now - self._last_message_at, 3)
+                                       if self._last_message_at is not None else None),
+                # Connections after the first: every one is a recovered drop.
+                "reconnect_count": max(0, self._connects - 1),
+                "disconnect_count": self._disconnects,
+                "last_disconnect_at": _iso(self._last_disconnect_at),
+                "last_disconnect_rc": self._last_disconnect_rc,
+                # The broker's CONNACK refusal (5 = not authorised), if the last
+                # attempt was refused; None once a connection succeeds.
+                "last_refused_rc": self._last_refused_rc,
+            }
+
     def _on_connect(self, client, userdata, flags, rc) -> None:
+        if rc != MQTT_ERR_SUCCESS:
+            with self._link_lock:
+                self._connected = False
+                self._last_refused_rc = rc
+            logger.error("the broker refused this backend's connection (rc=%s); paho will retry", rc)
+            return
+        with self._link_lock:
+            self._connected = True
+            self._connected_at = self._clock()
+            self._connects += 1
+            self._last_refused_rc = None
         client.subscribe("roverhub/admin/+/register", qos=1)
         client.subscribe("roverhub/+/+/telemetry", qos=0)
         client.subscribe("roverhub/+/+/state", qos=1)
@@ -170,6 +232,12 @@ class BackendMqttClient:
         client.subscribe("roverhub/+/+/perception/status", qos=1)
 
     def _on_disconnect(self, client, userdata, rc) -> None:
+        with self._link_lock:
+            if self._connected:
+                self._disconnects += 1
+            self._connected = False
+            self._last_disconnect_at = self._clock()
+            self._last_disconnect_rc = rc
         if rc == MQTT_ERR_SUCCESS:
             logger.info("MQTT client disconnected cleanly")
             return
@@ -200,6 +268,8 @@ class BackendMqttClient:
         MQTT subsystem. handle_message stays strict and directly testable; the
         containment lives here, at the boundary paho actually calls.
         """
+        with self._link_lock:
+            self._last_message_at = self._clock()
         try:
             self.handle_message(message.topic, message.payload)
         except Exception:
@@ -215,53 +285,113 @@ class BackendMqttClient:
             logger.warning("dropping unparseable MQTT payload on %s", topic)
             return
 
+        if not isinstance(data, dict):
+            logger.warning("dropping a non-object MQTT payload on %s", topic)
+            return
         parts = topic.split("/")
-        if topic.startswith("roverhub/admin/") and topic.endswith("/register"):
-            self._check_schema_version(data)
-            self._registry.upsert_from_registration(
-                robot_id=data["robot_id"], site_id=data["site_id"], robot_type=data["robot_type"],
-                bridge_id=data.get("bridge_id"),
-                schema_version=data.get("schema_version"),
-                host=self._validated(EdgeHostInfo, data.get("host"), data["robot_id"], "host"),
-                nav_map_id=data.get("nav_map_id") if isinstance(data.get("nav_map_id"), str) else None,
-            )
+        if len(parts) == 4 and parts[:2] == ["roverhub", "admin"] and parts[3] == "register":
+            self._handle_registration(parts[2], data)
             return
 
+        # Robot and site are the topic's, never the body's: with broker sign-in
+        # on, a device key may write only its own robot's topics
+        # (auth/mqtt_hooks.py), while a body says whatever its sender wrote.
         if len(parts) == 5 and parts[0] == "roverhub" and parts[3:] == ["perception", "status"]:
-            self._observe("perception_status", parts[1], parts[2], data)
+            site_id, robot_id, message_kind = parts[1], parts[2], "perception/status"
+        elif len(parts) == 4 and parts[0] == "roverhub":
+            site_id, robot_id, message_kind = parts[1], parts[2], parts[3]
+        else:
             return
-        if len(parts) != 4 or parts[0] != "roverhub":
-            return
-        message_kind = parts[3]
-        if message_kind == "incidents":
-            self._observe("incident", parts[1], parts[2], data)
+        if not self._identity_agrees(topic, site_id, robot_id, message_kind, data):
             return
 
-        if message_kind in ("telemetry", "heartbeat"):
-            self._registry.mark_seen(data["robot_id"])
+        if message_kind == "perception/status":
+            self._observe("perception_status", site_id, robot_id, data)
+        elif message_kind == "incidents":
+            # history/ingest.py keeps the payload as sent and files it under the
+            # topic's robot and site, warning if the payload names others.
+            self._observe("incident", site_id, robot_id, data)
+        elif message_kind in ("telemetry", "heartbeat"):
+            self._registry.mark_seen(robot_id)
             if message_kind == "heartbeat":
                 self._registry.update_host_metrics(
-                    data["robot_id"],
-                    self._validated(EdgeHostMetrics, data.get("host_metrics"), data["robot_id"], "host_metrics"),
+                    robot_id,
+                    self._validated(EdgeHostMetrics, data.get("host_metrics"), robot_id, "host_metrics"),
                     at=data.get("timestamp"),
                 )
             else:
-                self._observe("telemetry", parts[1], parts[2], data)
+                self._observe("telemetry", site_id, robot_id, data)
         elif message_kind == "state":
             boot_id = data.get("bridge_boot_id")
             previous = self._registry.update_state(
-                data["robot_id"], abstract_state=data["abstract_state"], sdk_state=data["sdk_state"],
+                robot_id, abstract_state=data["abstract_state"], sdk_state=data["sdk_state"],
                 control_owner=data.get("control_owner"), active_run=data.get("active_run"),
                 bridge_boot_id=boot_id,
-                nav_goal=self._validated(NavGoalStatus, data.get("nav_goal"), data["robot_id"], "nav_goal"),
+                nav_goal=self._validated(NavGoalStatus, data.get("nav_goal"), robot_id, "nav_goal"),
             )
             if self._on_state is not None:
-                self._on_state(data["robot_id"], previous, boot_id)
-            self._observe("state", parts[1], parts[2], data)
+                self._on_state(robot_id, previous, boot_id)
+            self._observe("state", site_id, robot_id, data)
         elif message_kind == "ack" and self._on_ack is not None:
             from shared.schemas.commands import Command
 
+            # _identity_agrees has already refused an ack whose body names
+            # another robot; the command store refuses one for a command that
+            # was sent to another robot (control/commands.py).
             self._on_ack(Command(**data))
+
+    def _warn_once(self, key: tuple, message: str, *args) -> None:
+        if key in self._warned:
+            return
+        if len(self._warned) < 1024:
+            self._warned.add(key)
+        logger.warning(message, *args)
+
+    def _identity_agrees(self, topic: str, site_id: str, robot_id: str, kind: str, data: dict) -> bool:
+        """Whether a per-robot message may be attributed to the topic's robot
+        and site. False (and dropped) when its body names another robot, or
+        when the registry has the robot at another site. Incidents keep their
+        own rule: filed under the topic, whatever the body says."""
+        body_robot = data.get("robot_id")
+        if kind not in ("incidents",) and body_robot is not None and body_robot != robot_id:
+            self._warn_once(("robot", topic, str(body_robot)),
+                            "dropping %s: its body names robot %r but it came on %s's topic. Nothing is "
+                            "attributed to either; check that bridge's ROBOT_ID.", topic, body_robot, robot_id)
+            return False
+        record = self._registry.get(robot_id)
+        if record is not None and record.site_id != site_id:
+            self._warn_once(("site", topic, record.site_id),
+                            "dropping %s: %s is registered at site %r, not %r. Check that device's SITE_ID.",
+                            topic, robot_id, record.site_id, site_id)
+            return False
+        return True
+
+    def _handle_registration(self, bridge_id: str, data: dict) -> None:
+        """roverhub/admin/<bridge_id>/register. The body names the robot; the
+        topic names the bridge. With broker sign-in on, the broker told us
+        which device key writes each bridge id (auth/mqtt_hooks.py), and a
+        registration is believed only for that key's robot."""
+        robot_id = data["robot_id"]
+        body_bridge = data.get("bridge_id")
+        if body_bridge is not None and body_bridge != bridge_id:
+            self._warn_once(("bridge", bridge_id, str(body_bridge)),
+                            "registration on bridge %s's topic names bridge %r; using the topic's",
+                            bridge_id, body_bridge)
+        if self._registration_check is not None:
+            existing = self._registry.get(robot_id)
+            if not self._registration_check(bridge_id, robot_id, existing.bridge_id if existing else None):
+                self._warn_once(("claim", bridge_id, robot_id),
+                                "ignoring a registration for %s on bridge %s's topic: that bridge is not "
+                                "written by %s's device key", robot_id, bridge_id, robot_id)
+                return
+        self._check_schema_version(data)
+        self._registry.upsert_from_registration(
+            robot_id=robot_id, site_id=data["site_id"], robot_type=data["robot_type"],
+            bridge_id=bridge_id,
+            schema_version=data.get("schema_version"),
+            host=self._validated(EdgeHostInfo, data.get("host"), robot_id, "host"),
+            nav_map_id=data.get("nav_map_id") if isinstance(data.get("nav_map_id"), str) else None,
+        )
 
     @staticmethod
     def _validated(model, value, robot_id: str, label: str) -> Optional[dict]:

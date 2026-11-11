@@ -66,6 +66,8 @@ class AuditRecord:
     outcome: Optional[str]
     detail: Dict[str, Any] = field(default_factory=dict)
     site_id: Optional[str] = None
+    # The robot the action concerns, when there is one (migration 0002).
+    robot_id: Optional[str] = None
     kind = "audit"
     vital = True
 

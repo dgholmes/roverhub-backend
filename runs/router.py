@@ -10,7 +10,7 @@ from typing import Callable, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
-from auth.deps import acting_user_id
+from auth.deps import acting_user_id, require_site_capability, visible
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -67,10 +67,12 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
         return {"run": run.model_dump(mode="json"), "command": command.model_dump(mode="json")}
 
     @router.put("/runs/{run_id}")
-    def put_run(run_id: str, run: MissionRun):
+    def put_run(run_id: str, run: MissionRun, http: Request):
         store.run_dir(run_id)
         if run.run_id != run_id:
             raise HTTPException(status_code=400, detail="body run_id does not match the path")
+        # The guard checked the stored run's site; this is the body's.
+        require_site_capability(http, run.site_id, ("dispatchPatrols",))
         with store.lock(run_id):
             previous = store.get(run_id)
             if previous is not None and previous.bucket_copied_at and not run.bucket_copied_at:
@@ -121,10 +123,12 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
         return {"added": added, "total": len(store.events(run_id))}
 
     @router.get("/runs")
-    def list_runs(site_id: Optional[str] = None, robot_id: Optional[str] = None,
+    def list_runs(http: Request, site_id: Optional[str] = None, robot_id: Optional[str] = None,
                   mission_id: Optional[str] = None, since: Optional[str] = None,
                   limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
-        runs = store.list(site_id, robot_id, mission_id, since)
+        # Only the sites the caller may see (auth/deps.py; everyone with sign-in off),
+        # before paging, so `total` counts what they can page through.
+        runs = visible(http, store.list(site_id, robot_id, mission_id, since), lambda r: r.site_id)
         page = runs[offset:offset + limit]
         return {"items": [_summary(store, r) for r in page], "total": len(runs),
                 "next_offset": offset + limit if offset + limit < len(runs) else None}

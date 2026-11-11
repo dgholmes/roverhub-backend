@@ -228,8 +228,8 @@ class HistoryStore:
                       self.db.dumps(r.detectors), self.db.dumps(r.payload)) for r in by_type[PerceptionRecord]])
             if AuditRecord in by_type:
                 cursor.executemany(self.db.sql(
-                    "INSERT INTO audit_log (at, actor, action, target, outcome, site_id, detail) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, {j})"),
+                    "INSERT INTO audit_log (at, actor, action, target, outcome, site_id, robot_id, detail) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, {j})"),
                     [self._audit_row(r) for r in by_type[AuditRecord]])
 
     def _incident_row(self, r: IncidentRecord) -> tuple:
@@ -254,7 +254,7 @@ class HistoryStore:
         )
 
     def _audit_row(self, r: AuditRecord) -> tuple:
-        return (r.at, r.actor, r.action, r.target, r.outcome, r.site_id, self.db.dumps(r.detail or {}))
+        return (r.at, r.actor, r.action, r.target, r.outcome, r.site_id, r.robot_id, self.db.dumps(r.detail or {}))
 
     # -- incidents ------------------------------------------------------------------------
 
@@ -280,12 +280,19 @@ class HistoryStore:
         return (rows[0]["site_id"], rows[0]["robot_id"]) if rows else None
 
     def list_incidents(self, site_id=None, robot_id=None, state=None, kind=None, since=None, until=None,
-                       limit: int = 50, cursor: Optional[str] = None):
+                       limit: int = 50, cursor: Optional[str] = None, sites=None):
+        """`sites`: only these sites' incidents (the caller's visible sites);
+        None for every site."""
         where, params = [], []
         for column, value in (("site_id", site_id), ("robot_id", robot_id), ("state", state), ("label", kind)):
             if value is not None:
                 where.append(f"{column} = ?")
                 params.append(value)
+        if sites is not None:
+            if not sites:
+                return [], None
+            where.append(f"site_id IN ({', '.join('?' for _ in sites)})")
+            params += sorted(sites)
         lo, hi = _bound(since, "from"), _bound(until, "to")
         if lo is not None:
             where.append("opened_at >= ?")
@@ -314,10 +321,10 @@ class HistoryStore:
         return rows[0]
 
     def _audit_in(self, conn, at: float, actor: str, action: str, target: str, outcome: str,
-                  site_id: Optional[str], detail: Dict[str, Any]) -> None:
-        self._exec(conn, "INSERT INTO audit_log (at, actor, action, target, outcome, site_id, detail) "
-                         f"VALUES (?, ?, ?, ?, ?, ?, {self.db.json_param()})",
-                   self._audit_row(AuditRecord(at, actor, action, target, outcome, detail, site_id)))
+                  site_id: Optional[str], detail: Dict[str, Any], robot_id: Optional[str] = None) -> None:
+        self._exec(conn, "INSERT INTO audit_log (at, actor, action, target, outcome, site_id, robot_id, detail) "
+                         f"VALUES (?, ?, ?, ?, ?, ?, ?, {self.db.json_param()})",
+                   self._audit_row(AuditRecord(at, actor, action, target, outcome, detail, site_id, robot_id)))
 
     def acknowledge(self, incident_id: str, actor: str, now: float) -> Dict[str, Any]:
         with self.transaction(write=True) as conn:
@@ -328,7 +335,7 @@ class HistoryStore:
                 self._exec(conn, "UPDATE incidents SET state = 'acknowledged', acknowledged_by = ?, "
                                  "acknowledged_at = ? WHERE incident_id = ?", (actor, now, incident_id))
                 self._audit_in(conn, now, actor, "incident.acknowledge", incident_id, "ok", row["site_id"],
-                               {"from": "open"})
+                               {"from": "open"}, row["robot_id"])
         return self.get_incident(incident_id)
 
     def resolve(self, incident_id: str, actor: str, outcome: str, note: Optional[str], now: float) -> Dict[str, Any]:
@@ -350,7 +357,7 @@ class HistoryStore:
                              "outcome = ?, note = ? WHERE incident_id = ?",
                        (actor, now, outcome, note, incident_id))
             self._audit_in(conn, now, actor, "incident.resolve", incident_id, outcome, row["site_id"],
-                           {"from": row["state"], "note": note})
+                           {"from": row["state"], "note": note}, row["robot_id"])
         return self.get_incident(incident_id)
 
     # -- telemetry history ----------------------------------------------------------------------
@@ -388,12 +395,28 @@ class HistoryStore:
     # -- audit ------------------------------------------------------------------------------------
 
     def list_audit(self, actor=None, action=None, target=None, since=None, until=None,
-                   limit: int = 50, cursor: Optional[str] = None):
+                   limit: int = 50, cursor: Optional[str] = None, site_id=None, robot_id=None,
+                   scope=None):
+        """Newest first. `action` ending in ".*" matches a family ("map.*").
+        `scope` (auth/deps.py AuditScope) limits the rows to those its holder
+        may read; None reads everything."""
         where, params = [], []
-        for column, value in (("actor", actor), ("action", action), ("target", target)):
+        for column, value in (("actor", actor), ("target", target), ("site_id", site_id),
+                              ("robot_id", robot_id)):
             if value is not None:
                 where.append(f"{column} = ?")
                 params.append(value)
+        if action is not None:
+            if action.endswith(".*"):
+                where.append("action LIKE ?")
+                params.append(action[:-1] + "%")
+            else:
+                where.append("action = ?")
+                params.append(action)
+        if scope is not None:
+            clause, scope_params = self._scope_clause(scope)
+            where.append(clause)
+            params += scope_params
         lo, hi = _bound(since, "from"), _bound(until, "to")
         if lo is not None:
             where.append("at >= ?")
@@ -406,11 +429,33 @@ class HistoryStore:
             where.append("(at < ? OR (at = ? AND id < ?))")
             params += [after[0], after[0], after[1]]
         clause = f"WHERE {' AND '.join(where)}" if where else ""
-        rows = self._read(f"SELECT id, at, actor, action, target, outcome, site_id, detail FROM audit_log {clause} "
+        rows = self._read(f"SELECT id, at, actor, action, target, outcome, site_id, robot_id, detail FROM audit_log {clause} "
                           "ORDER BY at DESC, id DESC LIMIT ?", params + [limit + 1])
         page = rows[:limit]
         next_cursor = _cursor_out(page[-1]["at"], page[-1]["id"]) if len(rows) > limit else None
         return [{**r, "at": iso(r["at"]), "detail": self.db.loads(r["detail"]) or {}} for r in page], next_cursor
+
+    @staticmethod
+    def _scope_clause(scope) -> Tuple[str, list]:
+        """SQL for what an AuditScope admits: its sites' rows, and rows with
+        no site only if it has `org_rows`."""
+        parts, params = [], []
+        if scope.all_sites:
+            if scope.excluded:
+                marks = ", ".join("?" for _ in scope.excluded)
+                parts.append(f"(site_id IS NOT NULL AND site_id NOT IN ({marks}))")
+                params += sorted(scope.excluded)
+            else:
+                parts.append("site_id IS NOT NULL")
+        elif scope.sites:
+            marks = ", ".join("?" for _ in scope.sites)
+            parts.append(f"site_id IN ({marks})")
+            params += sorted(scope.sites)
+        if scope.org_rows:
+            parts.append("site_id IS NULL")
+        if not parts:
+            return "1 = 0", []
+        return "(" + " OR ".join(parts) + ")", params
 
     # -- housekeeping -------------------------------------------------------------------------------
 

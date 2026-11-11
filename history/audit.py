@@ -25,6 +25,11 @@ logger = logging.getLogger("roverhub.history")
 
 _ACTOR: ContextVar[Optional[str]] = ContextVar("roverhub_audit_actor", default=None)
 
+# What routers are handed to report an action: AuditRecorder.record, called as
+# (action, target, outcome, detail, *, site_id=..., robot_id=...). The actor is
+# the request's (bind_actor), never an argument a router takes from a body.
+AuditFn = Callable[..., None]
+
 # Stages after which no further ack changes the outcome.
 FINAL_STAGES = frozenset({"execution_completed", "execution_failed", "timed_out", "cancelled"})
 # How many published commands are remembered until their final ack.
@@ -53,10 +58,12 @@ class AuditRecorder:
 
     def record(self, action: str, target: Optional[str], outcome: Optional[str],
                detail: Optional[Dict[str, Any]] = None, actor: Optional[str] = None,
-               site_id: Optional[str] = None, fallback: str = "system") -> None:
+               site_id: Optional[str] = None, fallback: str = "system",
+               robot_id: Optional[str] = None) -> None:
         try:
             self._submit(AuditRecord(at=self._clock(), actor=actor or current_actor() or fallback, action=action,
-                                     target=target, outcome=outcome, detail=detail or {}, site_id=site_id))
+                                     target=target, outcome=outcome, detail=detail or {}, site_id=site_id,
+                                     robot_id=robot_id))
         except Exception:
             logger.exception("could not queue the audit row for %s %s", action, target)
 
@@ -75,7 +82,7 @@ class AuditRecorder:
                 while len(self._pending) > MAX_PENDING:
                     self._pending.popitem(last=False)
         self.record("command.publish", robot_id, "not_sent" if error else "sent", detail,
-                    actor=actor, site_id=site_id)
+                    actor=actor, site_id=site_id, robot_id=robot_id)
 
     def command_acked(self, command) -> None:
         if command.current_stage not in FINAL_STAGES:
@@ -87,7 +94,7 @@ class AuditRecorder:
         actor, robot_id, site_id = pending
         self.record("command.outcome", robot_id, command.current_stage,
                     {"command_id": command.command_id, "type": command.type,
-                     "failure_reason": command.failure_reason}, actor=actor, site_id=site_id)
+                     "failure_reason": command.failure_reason}, actor=actor, site_id=site_id, robot_id=robot_id)
 
     # -- runs, maps, sign-in -------------------------------------------------------------
 
@@ -97,11 +104,11 @@ class AuditRecorder:
             self.record("run.start", run.run_id, run.result,
                         {"robot_id": run.robot_id, "mission_id": run.mission_id, "source": run.source,
                          "started_by": run.started_by},
-                        site_id=run.site_id, fallback=run.started_by or "system")
+                        site_id=run.site_id, fallback=run.started_by or "system", robot_id=run.robot_id)
         elif previous.result == "running" and run.result != "running":
             self.record("run.end", run.run_id, run.result,
                         {"robot_id": run.robot_id, "mission_id": run.mission_id, "end_reason": run.end_reason},
-                        site_id=run.site_id)
+                        site_id=run.site_id, robot_id=run.robot_id)
 
     def map_status(self, map_id: str, status: str, site_id: Optional[str] = None) -> None:
         self.record("map.status", map_id, status, {"status": status}, site_id=site_id)

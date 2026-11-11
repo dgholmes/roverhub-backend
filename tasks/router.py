@@ -31,7 +31,8 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from auth.deps import acting_user_id
+from auth.deps import acting_user_id, require_site_capability, site_visible
+from history.audit import AuditFn
 from pydantic import ValidationError
 
 from api.common import now_iso, read_bounded_body
@@ -117,6 +118,7 @@ def build_tasks_router(
     scheduler_enabled: Callable[[], bool] = lambda: True,
     dispatcher: Optional[RunDispatcher] = None,
     mission_store: Optional[MissionStore] = None,
+    audit: Optional[AuditFn] = None,
 ) -> APIRouter:
     """`clock` returns the UTC ISO string stamped into `updated_at` and used as
     the due time of a run-now; injectable so both are testable.
@@ -132,23 +134,31 @@ def build_tasks_router(
     router.dispatcher = dispatcher  # type: ignore[attr-defined]
     store = TaskStore(tasks_dir)
 
+    def _audit(action: str, task: MissionTask, detail: dict) -> None:
+        # `audit` is history/audit.py AuditRecorder.record: who comes from the
+        # request, never from the task's own created_by.
+        if audit is not None:
+            audit(action, task.task_id, "ok", detail, site_id=task.site_id, robot_id=task.robot_id)
+
     @router.get("/tasks")
-    def list_tasks(site_id: Optional[str] = None, mission_id: Optional[str] = None):
+    def list_tasks(request: Request, site_id: Optional[str] = None, mission_id: Optional[str] = None):
         tasks = store.list_tasks(site_id)
         if mission_id is not None:
             tasks = [t for t in tasks if t.mission_id == mission_id]
-        return {"items": [t.model_dump(mode="json") for t in tasks]}
+        # Only the sites the caller may see (auth/deps.py; everyone with sign-in off).
+        return {"items": [t.model_dump(mode="json") for t in tasks if site_visible(request, t.site_id)]}
 
     # Declared before /tasks/{task_id}, or "occurrences" would be read as an id.
     # `from` is a Python keyword, hence the alias.
     @router.get("/tasks/occurrences")
     def list_occurrences(
+        request: Request,
         from_: str = Query(alias="from"),
         to: str = Query(),
         site_id: Optional[str] = None,
     ):
         occurrences = store.list_occurrences(site_id, _bound("from", from_), _bound("to", to))
-        return {"items": [o.model_dump(mode="json") for o in occurrences]}
+        return {"items": [o.model_dump(mode="json") for o in occurrences if site_visible(request, o.site_id)]}
 
     @router.get("/tasks/{task_id}")
     def get_task(task_id: str):
@@ -173,6 +183,9 @@ def build_tasks_router(
             ) from None
         if task.task_id != task_id:
             raise HTTPException(status_code=400, detail="body task_id does not match the path")
+        # The guard checked the stored task's site; this is the body's, so a
+        # create or a move lands only where the caller may dispatch.
+        require_site_capability(request, task.site_id, ("dispatchPatrols",))
         if task.schedule is not None:
             problems = _schedule_problems(task.schedule)
             if problems:
@@ -191,9 +204,20 @@ def build_tasks_router(
         # against, so a stale client re-creating a deleted task starts over.)
         version = 1 if stored is None else task.version + 1
         stamp = clock()
-        task = task.model_copy(update={"updated_at": stamp, "version": version})
+        # Who made it is the server's to say: the signed-in user on a create,
+        # kept from the stored task after that (the body's with sign-in off).
+        created_by = acting_user_id(request, task.created_by) if stored is None else stored.created_by
+        task = task.model_copy(update={"updated_at": stamp, "version": version, "created_by": created_by})
         store.put_task(task)
         _replan(task, stamp)
+        detail = {"mission_id": task.mission_id, "name": task.name, "status": task.status, "version": version,
+                  "scheduled": task.schedule is not None}
+        if stored is not None:
+            detail["changed"] = sorted(
+                k for k in ("mission_id", "site_id", "robot_id", "name", "schedule", "dispatch_rule", "status",
+                            "max_duration_min")
+                if getattr(stored, k) != getattr(task, k))
+        _audit("task.create" if stored is None else "task.update", task, detail)
         return task.model_dump(mode="json")
 
     def _replan(task: MissionTask, stamp: str) -> None:
@@ -224,6 +248,7 @@ def build_tasks_router(
         # Runs even for a task that is already gone, so a retry (or a delete of
         # an id whose file was removed some other way) still clears the unstarted
         # occurrences it left behind. The 404 contract is unchanged.
+        existing = store.get_task(task_id)
         result = store.delete_task_cascade(task_id)
         if result.occurrences_deleted or result.occurrences_kept:
             # WARNING, not INFO: nothing configures logging, so INFO is dropped,
@@ -236,6 +261,9 @@ def build_tasks_router(
             )
         if not result.task_deleted:
             raise HTTPException(status_code=404, detail="task not found")
+        if existing is not None:
+            _audit("task.delete", existing, {"mission_id": existing.mission_id, "name": existing.name,
+                                             "occurrences_deleted": len(result.occurrences_deleted)})
         return Response(status_code=204)
 
     @router.post("/tasks/{task_id}/run-now", status_code=202)

@@ -121,6 +121,9 @@ def signed_in(tmp_path, monkeypatch, app):
     for name, role in (("vic", "viewer"), ("ana", "operator"), ("sue", "supervisor"), ("eng", "engineer")):
         auth.users.create(username=name, display_name=name, password=PASSWORD, org_role="member",
                           site_roles={"site-a": role})
+    # An auditor: watch-only at the site, with the audit-access flag.
+    auth.users.create(username="aud", display_name="aud", password=PASSWORD, org_role="member",
+                      site_roles={"site-a": "viewer"}, audit_access=True)
 
     def headers(name):
         token = app.post("/auth/login", json={"username": name, "password": PASSWORD}).json()["access_token"]
@@ -147,8 +150,15 @@ def test_viewers_read_incidents_operators_answer_them_managers_read_the_audit(ap
     assert app.get("/audit", headers=ana).status_code == 403
     assert app.get("/audit", headers=sue).status_code == 200
     assert app.get("/audit", headers=eng).status_code == 200
+    aud = signed_in("aud")
+    assert app.get("/audit", headers=aud).status_code == 200
     _flush()
-    logins = app.get("/audit", headers=sue, params={"action": "auth.login", "limit": 500}).json()["items"]
+    # Sign-ins belong to no site: the auditor reads them, a site supervisor does not.
+    logins = app.get("/audit", headers=aud, params={"action": "auth.login", "limit": 500}).json()["items"]
     assert {("vic", "ok"), ("ana", "ok"), ("sue", "ok"), ("eng", "ok")} <= {
         (r["detail"]["username"], r["outcome"]) for r in logins}
     assert all(r["actor"].startswith("user-") for r in logins if r["outcome"] == "ok")
+    assert app.get("/audit", headers=sue, params={"action": "auth.login"}).json()["items"] == []
+    # The site's own rows are the supervisor's: the acknowledgement, with its robot.
+    acks = app.get("/audit", headers=sue, params={"action": "incident.*", "robot_id": "rover-e2e"}).json()["items"]
+    assert [(r["target"], r["site_id"]) for r in acks if r["target"] == iid] == [(iid, "site-a")]

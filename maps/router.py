@@ -63,6 +63,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from api.common import read_bounded_body
+from auth.deps import require_site_capability, site_visible
+from history.audit import AuditFn
 from shared.schemas.maps import MapStatus, MapZone, SiteMap
 
 from .store import (
@@ -110,11 +112,39 @@ def _limit_for(name: str) -> int:
 
 def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                       max_upload_bytes: int = MAX_UPLOAD_BYTES,
-                      on_status: Optional[Callable[[SiteMap], None]] = None) -> APIRouter:
-    """`on_status(map)` after a status change is stored (the audit log)."""
+                      on_status: Optional[Callable[[SiteMap], None]] = None,
+                      audit: Optional[AuditFn] = None) -> APIRouter:
+    """`on_status(map)` after a status change is stored (the audit log).
+    `audit` (history/audit.py AuditRecorder.record) is told every upload,
+    zone edit, planning-grid change and delete."""
     router = APIRouter()
     store = MapStore(maps_dir)
     router.store = store  # type: ignore[attr-defined]  # tests and the app share it
+
+    def _audit(action: str, site_map: Optional[SiteMap], map_id: str, detail: dict) -> None:
+        if audit is None:
+            return
+        try:
+            audit(action, map_id, "ok", detail, site_id=site_map.site_id if site_map is not None else None)
+        except Exception:
+            logger.exception("could not audit %s of map %s", action, map_id)
+
+    def _manifest_site(part: UploadFile) -> tuple:
+        """(map_id, site_id) the bundle's manifest names, read before anything
+        is stored so the upload can be checked against the caller's sites. A
+        manifest that does not parse is left for the store to refuse."""
+        try:
+            raw = part.file.read(MAX_MANIFEST_BYTES + 1)
+            part.file.seek(0)
+            data = json.loads(raw)
+        except (OSError, ValueError):
+            return None, None
+        # The bundle's map fields sit in its `site_map` block (store._read_bundle).
+        block = data.get("site_map") if isinstance(data, dict) else None
+        if not isinstance(block, dict):
+            return None, None
+        map_id, site_id = block.get("map_id"), block.get("site_id")
+        return (map_id if isinstance(map_id, str) else None), (site_id if isinstance(site_id, str) else None)
 
     def _ingest(parts: Dict[str, UploadFile]) -> SiteMap:
         with tempfile.TemporaryDirectory(dir=store.root, prefix=UPLOAD_PREFIX) as scratch:
@@ -143,9 +173,10 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
             raise HTTPException(status_code=400, detail=str(exc)) from None
 
     @router.get("/maps")
-    def list_maps(site_id: Optional[str] = None):
+    def list_maps(request: Request, site_id: Optional[str] = None):
+        # Only the sites the caller may see (auth/deps.py; everyone with sign-in off).
         return {"items": [m.model_dump(mode="json") for m in store.list()
-                          if site_id is None or m.site_id == site_id]}
+                          if (site_id is None or m.site_id == site_id) and site_visible(request, m.site_id)]}
 
     @router.get("/maps/{map_id}")
     def get_map(map_id: str):
@@ -188,8 +219,22 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                 parts[name] = part
             if not parts:
                 raise HTTPException(status_code=400, detail="no bundle files were sent")
+            # The guard could not see a site (it is in the body): configure is
+            # needed at the bundle's site, and at the site of a map it replaces.
+            existing = None
+            if "site_map.json" in parts:
+                new_id, new_site = await run_in_threadpool(_manifest_site, parts["site_map.json"])
+                require_site_capability(request, new_site, ("configure",))
+                if new_id is not None:
+                    existing = store.get(new_id)
+                    if existing is not None and existing.site_id != new_site:
+                        require_site_capability(request, existing.site_id, ("configure",))
             try:
-                return await run_in_threadpool(_ingest, parts)
+                saved = await run_in_threadpool(_ingest, parts)
+                _audit("map.upload", saved, saved.map_id,
+                       {"name": saved.name, "floors": len(saved.floors), "status": saved.status,
+                        "replaced": existing is not None})
+                return saved
             except _TooLarge as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from None
             except BundleError as exc:
@@ -229,12 +274,17 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
     async def put_planning(map_id: str, index: int, request: Request,
                            clearance_m: float = DEFAULT_CLEARANCE_M):
         raw = await read_bounded_body(request, MAX_PLANNING_BYTES, "planning grid")
-        return await run_in_threadpool(
+        saved = await run_in_threadpool(
             _planning, lambda: store.set_planning(map_id, index, raw, clearance_m))
+        _audit("map.planning.set", saved, map_id,
+               {"floor": index, "clearance_m": clearance_m, "bytes": len(raw)})
+        return saved
 
     @router.delete("/maps/{map_id}/floors/{index}/planning")
     def delete_planning(map_id: str, index: int):
-        return _planning(lambda: store.delete_planning(map_id, index))
+        saved = _planning(lambda: store.delete_planning(map_id, index))
+        _audit("map.planning.delete", saved, map_id, {"floor": index})
+        return saved
 
     @router.get("/maps/{map_id}/floors/{index}/{kind}")
     def get_artifact(map_id: str, index: int, kind: str):
@@ -251,7 +301,10 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
             raise HTTPException(status_code=422, detail=json.loads(exc.json(include_url=False))) from None
         except (ValueError, KeyError, TypeError):
             raise HTTPException(status_code=422, detail='body must be {"zones": [...]}') from None
-        return _curate(lambda: store.save_zones(map_id, zones))
+        saved = _curate(lambda: store.save_zones(map_id, zones))
+        _audit("map.zones", saved, map_id,
+               {"zones": len(zones), "kinds": sorted({z.kind for z in zones})})
+        return saved
 
     @router.put("/maps/{map_id}/status")
     def put_status(map_id: str, body: _StatusBody):
@@ -265,8 +318,10 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
 
     @router.delete("/maps/{map_id}", status_code=204)
     def delete_map(map_id: str):
+        existing = store.get(map_id)
         if not store.delete(map_id):
             raise HTTPException(status_code=404, detail="map not found")
+        _audit("map.delete", existing, map_id, {"name": existing.name if existing is not None else None})
         return Response(status_code=204)
 
     return router

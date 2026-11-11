@@ -1,12 +1,14 @@
 """History routes: incidents and their workflow, a robot's history, the audit
 log, and the store's own status. Access rules are in auth/policy.py.
 
-    GET  /incidents?site_id&robot_id&state&kind&from&to&limit&cursor   newest first
+    GET  /incidents?site_id&robot_id&state&kind&from&to&limit&cursor   newest first, the caller's sites
     GET  /incidents/{incident_id}                                      with evidence URLs
     POST /incidents/{incident_id}/acknowledge
     POST /incidents/{incident_id}/resolve        {outcome, note}
     GET  /robots/{robot_id}/history?from&to&max_points               thinned on the server
-    GET  /audit?actor&action&target&from&to&limit&cursor
+    GET  /audit?site_id&robot_id&actor&action&target&from&to&limit&cursor
+         newest first; `action=map.*` matches a family; only the rows the
+         caller may read (auth/deps.py audit_scope)
     GET  /history/status
 
 Every route answers 503, with the reason, when history could not start.
@@ -18,7 +20,7 @@ from typing import Callable, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from auth.deps import DEV_USER_ID, principal_of
+from auth.deps import DEV_USER_ID, audit_scope, principal_of, visible_sites
 from history.db import epoch, iso
 from history.models import (
     AuditPage, HistoryStatus, IncidentOut, IncidentPage, IncidentWorkflowState, ResolveBody, RobotHistory,
@@ -69,6 +71,7 @@ def build_history_router(
 
     @router.get("/incidents", response_model=IncidentPage)
     def list_incidents(
+        request: Request,
         site_id: Optional[str] = None, robot_id: Optional[str] = None,
         state: Optional[IncidentWorkflowState] = None, kind: Optional[str] = None,
         from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None,
@@ -76,7 +79,7 @@ def build_history_router(
     ):
         items, next_cursor = _page_args(
             _store().list_incidents, site_id=site_id, robot_id=robot_id, state=state, kind=kind,
-            since=from_, until=to, limit=limit, cursor=cursor)
+            since=from_, until=to, limit=limit, cursor=cursor, sites=visible_sites(request))
         return {"items": [_with_evidence(i) for i in items], "next_cursor": next_cursor}
 
     @router.get("/incidents/{incident_id}", response_model=IncidentOut)
@@ -125,13 +128,18 @@ def build_history_router(
 
     @router.get("/audit", response_model=AuditPage)
     def list_audit(
+        request: Request,
+        site_id: Optional[str] = None, robot_id: Optional[str] = None,
         actor: Optional[str] = None, action: Optional[str] = None, target: Optional[str] = None,
         from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None,
         limit: int = Query(50, ge=1, le=500), cursor: Optional[str] = None,
     ):
+        # `actor` is the user id (or robot id, `operator-dev`, `system`,
+        # `schedule`) the server attributed the row to.
         items, next_cursor = _page_args(
             _store().list_audit, actor=actor, action=action, target=target, since=from_, until=to,
-            limit=limit, cursor=cursor)
+            limit=limit, cursor=cursor, site_id=site_id, robot_id=robot_id,
+            scope=audit_scope(principal_of(request)))
         return {"items": items, "next_cursor": next_cursor}
 
     @router.get("/history/status", response_model=HistoryStatus)

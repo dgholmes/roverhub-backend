@@ -164,6 +164,14 @@ def test_start_mission_ack_failure_fails_the_run_with_bridge_reason(env):
     assert run.end_reason == "REJECTED_CONTROL_HELD: operator-dev holds control"
 
 
+def test_only_the_runs_own_robot_can_settle_it_by_ack(env):
+    env.post()
+    command = env.published[0][1]
+    stranger = command.model_copy(update={"robot_id": "rover-jetson", "current_stage": "execution_failed"})
+    env.dispatcher.on_ack(stranger)
+    assert env.runs.get(RUN_ID).result == "running"
+
+
 def test_ack_failure_falls_back_to_stage_and_ignores_other_commands(env):
     env.post()
     command = env.published[0][1]

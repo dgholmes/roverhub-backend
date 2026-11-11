@@ -10,7 +10,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 import api.app as backend
-from auth.deps import DEV_USER_ID
+from auth.deps import DEV_USER_ID, BridgeBindings
 from auth.mqtt_hooks import ACC_READ, ACC_SUBSCRIBE, ACC_WRITE
 from auth.policy import CAPABILITIES, ROUTES
 from auth.router import LoginThrottle
@@ -28,6 +28,8 @@ def auth_on(tmp_path, monkeypatch):
     monkeypatch.setattr(auth, "issuer", TokenIssuer("test-secret"))
     monkeypatch.setattr(auth, "device_keys", {"rover-a": "device-key-a"})
     monkeypatch.setattr(auth, "broker_service_password", "service-pw")
+    # Which device key writes which registration topic, learned from ACL calls.
+    monkeypatch.setattr(auth, "bridges", BridgeBindings())
     backend.registry._robots.clear()
     backend.registry.upsert_from_registration("rover-a", "site-a", "quad")
     backend.registry.upsert_from_registration("rover-b", "site-b", "quad")

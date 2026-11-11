@@ -88,6 +88,7 @@ class AuditEntry(BaseModel):
     target: Optional[str] = None
     outcome: Optional[str] = None
     site_id: Optional[str] = None
+    robot_id: Optional[str] = None
     detail: Dict[str, Any] = Field(default_factory=dict)
 
 

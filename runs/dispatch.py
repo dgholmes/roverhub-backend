@@ -299,6 +299,14 @@ class RunDispatcher:
         run_id = (command.params or {}).get("run_id")
         if not run_id:
             return
+        run = self._runs.get(run_id)
+        if run is not None and run.robot_id != command.robot_id:
+            # Only the robot a run was sent to can settle it. The command store
+            # restores params from what was sent, but an ack for a command this
+            # process never sent (a restart since) carries the bridge's own.
+            logger.warning("ignoring %s's ack for run %s, which belongs to %s",
+                           command.robot_id, run_id, run.robot_id)
+            return
         if command.current_stage in ("execution_failed", "timed_out"):
             self._unanswered.pop(run_id, None)
             self.start_failed(run_id, command.failure_reason or command.current_stage)

@@ -85,12 +85,16 @@ class Rule:
     site (or, when the site cannot be told from the path, at any site).
     `device`: an edge device's key is accepted. `org_admin`: only an org owner
     or admin. `public`: nothing at all. `signed_in`: any signed-in user.
+    `auditors`: also anyone holding the "audit access" flag (roles.ts's folded
+    Auditor role) and org owners/admins -- the handler then narrows what they
+    see (auth/deps.py `audit_scope`).
     """
     capabilities: Tuple[str, ...] = ()
     device: bool = False
     org_admin: bool = False
     public: bool = False
     signed_in: bool = False
+    auditors: bool = False
 
 
 _READ = Rule(capabilities=("watchLive",))
@@ -188,13 +192,16 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     # resolve -- is for the people who act on robots there: the same floor as
     # sending a command (estop, drive, getUp), so a watch-only viewer cannot.
     # The audit log is for those who run the site: supervisors (`override`)
-    # and engineers (`configure`). The store's status is fleet health.
+    # and engineers (`configure`), plus anyone given audit access and the org's
+    # owners/admins. Each sees only the rows they may (auth/deps.py
+    # `audit_scope`): their sites' rows, and org-level rows (sign-ins, user
+    # changes) only for auditors and org admins. The store's status is fleet health.
     ("GET", "/incidents"): _READ,
     ("GET", "/incidents/{incident_id}"): _READ,
     ("POST", "/incidents/{incident_id}/acknowledge"): Rule(capabilities=("estop", "drive", "getUp")),
     ("POST", "/incidents/{incident_id}/resolve"): Rule(capabilities=("estop", "drive", "getUp")),
     ("GET", "/robots/{robot_id}/history"): _READ,
-    ("GET", "/audit"): Rule(capabilities=("override", "configure")),
+    ("GET", "/audit"): Rule(capabilities=("override", "configure"), auditors=True),
     ("GET", "/history/status"): Rule(capabilities=("seeHealth",)),
 }
 

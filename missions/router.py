@@ -39,6 +39,8 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from api.common import now_iso, read_bounded_body
+from auth.deps import acting_user_id, require_site_capability, site_visible
+from history.audit import AuditFn
 from shared.schemas.missions import MissionLibraryEntry
 from tasks.store import TaskStore
 
@@ -147,9 +149,11 @@ def build_missions_router(
     missions_dir: str,
     clock: Callable[[], str] = now_iso,
     tasks_dir: Optional[str] = None,
+    audit: Optional[AuditFn] = None,
 ) -> APIRouter:
     """`clock` returns the UTC ISO string stamped into `updated_at`; injectable
-    so ordering is testable.
+    so ordering is testable. `audit` (history/audit.py AuditRecorder.record)
+    is told every create, change and delete.
 
     `tasks_dir` is where deleting a mission also deletes its tasks. It is
     deliberately not defaulted to the real tasks directory: a router built over a
@@ -159,9 +163,15 @@ def build_missions_router(
     store = MissionStore(missions_dir)
     task_store = TaskStore(tasks_dir) if tasks_dir is not None else None
 
+    def _audit(action: str, mission_id: str, site_id: Optional[str], detail: dict) -> None:
+        if audit is not None:
+            audit(action, mission_id, "ok", detail, site_id=site_id)
+
     @router.get("/missions")
-    def list_missions(site_id: Optional[str] = None):
-        return {"items": [entry.model_dump(mode="json") for entry in store.list(site_id)]}
+    def list_missions(request: Request, site_id: Optional[str] = None):
+        # Only the sites the caller may see (auth/deps.py; everyone with sign-in off).
+        return {"items": [entry.model_dump(mode="json") for entry in store.list(site_id)
+                          if site_visible(request, entry.site_id)]}
 
     @router.get("/missions/{mission_id}")
     def get_mission(mission_id: str):
@@ -184,6 +194,9 @@ def build_missions_router(
             ) from None
         if entry.mission_id != mission_id:
             raise HTTPException(status_code=400, detail="body mission_id does not match the path")
+        # The guard checked the stored mission's site; this is the body's, so a
+        # create or a move lands only where the caller may plan.
+        require_site_capability(request, entry.site_id, ("planPatrols",))
 
         # Compare and write with no await between them: this handler runs on the
         # event loop, so no other request can interleave. The store itself has
@@ -198,8 +211,15 @@ def build_missions_router(
         # is nothing stored to compare a create against, so a stale client
         # re-creating a deleted mission starts over.)
         version = 1 if stored is None else entry.version + 1
-        entry = entry.model_copy(update={"updated_at": clock(), "version": version})
+        # Who made it is the server's to say: the signed-in user on a create,
+        # kept from the stored mission after that (the body's with sign-in off).
+        creator = acting_user_id(request, entry.creator) if stored is None else stored.creator
+        entry = entry.model_copy(update={"updated_at": clock(), "version": version, "creator": creator})
         store.put(entry)
+        _audit("mission.create" if stored is None else "mission.update", mission_id, entry.site_id,
+               {"name": entry.name, "kind": entry.kind, "version": version, "map_id": entry.map_id,
+                **({"previous_site_id": stored.site_id}
+                   if stored is not None and stored.site_id != entry.site_id else {})})
         return entry.model_dump(mode="json")
 
     @router.delete("/missions/{mission_id}", status_code=204)
@@ -228,8 +248,12 @@ def build_missions_router(
                 sum(len(r.occurrences_kept) for _, r in removed_tasks),
                 [o for _, r in removed_tasks for o in r.occurrences_kept],
             )
+        existing = store.get(mission_id)
         if not store.delete(mission_id):
             raise HTTPException(status_code=404, detail="mission not found")
+        _audit("mission.delete", mission_id, existing.site_id if existing else None,
+               {"name": existing.name if existing else None,
+                "tasks_deleted": [t for t, _ in removed_tasks]})
         return Response(status_code=204)
 
     return router

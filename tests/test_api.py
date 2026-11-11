@@ -9,13 +9,52 @@ def _clear_registry():
     yield
 
 
-def test_healthz_returns_ok():
+class _Subscriber:
+    def subscribe(self, topic, qos=0):
+        pass
+
+
+def test_healthz_returns_ok(monkeypatch):
     from fastapi.testclient import TestClient
 
+    import api.app as backend
+
+    monkeypatch.setattr(backend.mqtt_client, "_connected", True)
     client = TestClient(app)
     response = client.get("/healthz")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.json()["broker"]["connected"] is True
+
+
+def test_healthz_reports_a_dead_broker_link_without_failing(monkeypatch):
+    """A dead link is visible on the public health check -- and still a 200,
+    so the edge's clock sync (which reads server_time_ms) keeps working."""
+    from fastapi.testclient import TestClient
+
+    import api.app as backend
+
+    client = backend.mqtt_client
+    for name in ("_connected", "_connected_at", "_connects", "_disconnects", "_last_disconnect_at",
+                 "_last_disconnect_rc", "_last_refused_rc", "_last_message_at"):
+        monkeypatch.setattr(client, name, getattr(client, name))
+    times = iter([1000.0, 1001.0, 1010.0, 1030.0])
+    monkeypatch.setattr(client, "_clock", lambda: next(times))
+    client._on_connect(_Subscriber(), None, None, 0)      # 1000: up
+    client._on_message(None, None, type("M", (), {"topic": "x", "payload": b"{}"})())  # 1001: a message
+    client._on_disconnect(None, None, 7)                  # 1010: dropped
+    client._on_connect(_Subscriber(), None, None, 5)      # refused, not authorised
+    body = TestClient(app).get("/healthz")
+    assert body.status_code == 200
+    payload = body.json()
+    assert payload["status"] == "degraded"
+    broker = payload["broker"]
+    assert broker["connected"] is False
+    assert broker["last_message_age_s"] == 29.0           # read at 1030
+    assert broker["disconnect_count"] == 1 and broker["last_disconnect_rc"] == 7
+    assert broker["last_refused_rc"] == 5
+    assert broker["reconnect_count"] == 0
+    assert isinstance(payload["server_time_ms"], int)
 
 
 def test_healthz_carries_the_server_time_for_edge_clock_sync():

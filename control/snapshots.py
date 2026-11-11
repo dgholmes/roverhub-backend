@@ -53,7 +53,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Form, HTTPException, Query, Request, UploadFile
+
+from auth.deps import visible
 from pydantic import ValidationError
 from starlette.responses import FileResponse
 
@@ -245,6 +247,10 @@ class SnapshotIndex:
         with self._lock:
             self._entries[entry["snapshot_id"]] = entry
 
+    def get(self, snapshot_id: str) -> Optional[dict]:
+        with self._lock:
+            return self._entries.get(snapshot_id)
+
     def for_incident(self, incident_id: str) -> List[str]:
         """Snapshot ids whose upload named this incident, oldest first."""
         with self._lock:
@@ -354,8 +360,24 @@ def build_snapshot_router(
 
         return {"snapshot_id": snapshot_id, "size_bytes": len(contents)}
 
+    def _site_of(entry: dict) -> Optional[str]:
+        """A snapshot's site: its sidecar's, or (for one stored before the
+        library knew sites) its robot's current one."""
+        if entry.get("site_id") is not None:
+            return entry["site_id"]
+        if site_lookup is None:
+            return None
+        try:
+            return site_lookup(entry.get("robot_id"))
+        except Exception:
+            return None
+
+    router.site_of = lambda snapshot_id: (  # type: ignore[attr-defined]  # the app's site resolver
+        _site_of(index.get(snapshot_id)) if index.get(snapshot_id) is not None else None)
+
     @router.get("/snapshots")
     def list_snapshots(
+        request: Request,
         robot_id: Optional[str] = None,
         site_id: Optional[str] = None,
         since: Optional[datetime] = None,
@@ -370,6 +392,8 @@ def build_snapshot_router(
             since=_utc(since) if since else None,
             until=_utc(until) if until else None,
         )
+        # Only the sites the caller may see (auth/deps.py; everyone with sign-in off).
+        matches = visible(request, matches, _site_of)
         page = matches[offset:offset + limit]
         return {
             "items": [{**entry, "url": f"/snapshots/{entry['snapshot_id']}"} for entry in page],

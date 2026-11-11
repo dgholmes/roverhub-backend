@@ -83,12 +83,23 @@ def _dev_user() -> dict:
 
 
 def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
-                      on_login: Optional[Callable[[str, bool, Optional[str]], None]] = None) -> APIRouter:
+                      on_login: Optional[Callable[[str, bool, Optional[str]], None]] = None,
+                      audit: Optional[Callable[..., None]] = None) -> APIRouter:
     """`on_login(username, ok, user_id)` after each checked attempt (the audit
     log). Never told the password; a throttled attempt is not checked, so not
-    reported."""
+    reported. `audit` (history/audit.py AuditRecorder.record) is told every
+    change to a user: created, roles or flags changed, disabled, deleted,
+    password reset or changed, signed out everywhere. The actor is the request's."""
     router = APIRouter()
     throttle = throttle or LoginThrottle()
+
+    def _audit(action: str, user, detail: Optional[dict] = None) -> None:
+        if audit is None:
+            return
+        try:
+            audit(action, user.user_id, "ok", {"username": user.username, **(detail or {})})
+        except Exception:
+            logger.exception("could not audit %s of %s", action, user.user_id)
 
     def _set_cookie(response: Response, token: str, max_age: int) -> None:
         response.set_cookie(SESSION_COOKIE, token, max_age=max_age, httponly=True,
@@ -178,6 +189,7 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
             auth.users.set_password(principal.user.user_id, body.new_password)
         except PasswordTooShort as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _audit("user.password_change", principal.user)
         return Response(status_code=204)
 
     # --- user management (org owner / admin) -------------------------------
@@ -212,6 +224,8 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
                                      site_roles=body.site_roles, audit_access=body.audit_access)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _audit("user.create", user, {"org_role": user.org_role, "site_roles": dict(user.site_roles),
+                                     "audit_access": user.audit_access})
         return user.public()
 
     @router.patch("/users/{user_id}")
@@ -223,7 +237,12 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
             changes.get("org_role", "owner") != "owner" or changes.get("disabled"))
         if losing_owner and auth.users.active_owner_count() <= 1:
             raise HTTPException(status_code=409, detail="this is the last owner; make someone else owner first")
-        return auth.users.update(user_id, **changes).public()
+        updated = auth.users.update(user_id, **changes)
+        changed = {k: {"from": getattr(user, k), "to": getattr(updated, k)}
+                   for k in changes if getattr(user, k) != getattr(updated, k)}
+        if changed:
+            _audit("user.update", updated, {"changes": changed})
+        return updated.public()
 
     @router.delete("/users/{user_id}", status_code=204)
     def delete_user(user_id: str, request: Request):
@@ -232,6 +251,7 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
         if user.org_role == "owner" and not user.disabled and auth.users.active_owner_count() <= 1:
             raise HTTPException(status_code=409, detail="this is the last owner; make someone else owner first")
         auth.users.delete(user_id)
+        _audit("user.delete", user, {"org_role": user.org_role, "site_roles": dict(user.site_roles)})
         return Response(status_code=204)
 
     @router.post("/users/{user_id}/password", status_code=204)
@@ -242,6 +262,7 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
             auth.users.set_password(user_id, body.new_password)
         except PasswordTooShort as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _audit("user.password_reset", user)
         return Response(status_code=204)
 
     @router.post("/users/{user_id}/sign-out", status_code=204)
@@ -249,6 +270,7 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
         user = _require_user(user_id)
         _guard_owner_change(request, None, user.org_role)
         auth.users.revoke_tokens(user_id)
+        _audit("user.sign_out", user)
         return Response(status_code=204)
 
     return router

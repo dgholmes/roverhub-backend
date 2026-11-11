@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hmac
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import APIRouter, Response
 from pydantic import BaseModel
@@ -33,7 +33,9 @@ ACC_READ, ACC_WRITE, ACC_READWRITE, ACC_SUBSCRIBE = 1, 2, 3, 4
 # Per-robot topic suffixes (everything after roverhub/{site}/{robot}/), from
 # docs/02-system-architecture.md. incidents and perception/status come from the
 # perception service, which signs in with the same device key as the bridge.
-_ROBOT_TOPICS = {"telemetry", "state", "heartbeat", "lower_state", "commands", "ack", "run",
+# scan is the bridge's lidar-in-the-map feed (connection_manager.publish_scan);
+# without it here a signed-in broker refused it and the live scan went dark.
+_ROBOT_TOPICS = {"telemetry", "state", "heartbeat", "lower_state", "commands", "ack", "run", "scan",
                  "incidents", "perception/status"}
 # What a bridge receives rather than sends.
 _BRIDGE_READS = {"commands"}
@@ -76,18 +78,40 @@ def _robot_suffix(parts: list) -> str:
     return "/".join(parts[3:])
 
 
-def _bridge_allowed(robot_id: str, topic: str, acc: int) -> bool:
+def _bridge_allowed(auth: Auth, robot_id: str, topic: str, acc: int,
+                    site_of: Optional[Callable[[str], Optional[str]]] = None) -> bool:
     parts = topic.split("/")
     if parts[:2] == ["roverhub", "admin"] and len(parts) == 4 and parts[3] == "register":
         # The registration topic is keyed by bridge id, which is not the robot
-        # id; the payload names the robot. A known limit: a device key can
-        # write any registration. It cannot touch another robot's commands.
-        return acc in (ACC_WRITE, ACC_READ, ACC_READWRITE, ACC_SUBSCRIBE)
+        # id; the payload names the robot. A bridge only ever writes it. Writing
+        # binds the bridge id to this device's robot (auth/deps.py
+        # BridgeBindings): no other device may write it after that, and the
+        # backend believes a registration on it only for this robot.
+        bridge_id = parts[2]
+        if acc != ACC_WRITE or bridge_id in ("+", "#"):
+            return False
+        return auth.bridges.bind(bridge_id, robot_id)
     suffix = _robot_suffix(parts)
-    if parts[2:3] != [robot_id] or suffix not in _ROBOT_TOPICS:
+    # Exactly its own robot: no wildcard in the robot segment, and `suffix`
+    # must name one known topic, so no multi-level wildcard either.
+    if parts[2:3] != [robot_id] or suffix not in _ROBOT_TOPICS or parts[1] == "#":
         return False
     if suffix in _BRIDGE_READS:
         return acc in (ACC_READ, ACC_SUBSCRIBE)
+    if acc in (ACC_WRITE, ACC_READWRITE):
+        # Write only under the site the robot registered at, once that is
+        # known: browsers read the broker directly, so a message under another
+        # site's prefix would show this robot to that site's people. Unknown
+        # (no registration since the backend started) is allowed, as before.
+        # Subscriptions are not pinned: a bridge subscribes to its commands once
+        # per connect, and a refusal cached by the broker would cut it off.
+        try:
+            registered = site_of(robot_id) if site_of is not None else None
+        except Exception:
+            logger.exception("could not look up the site of %s for the broker", robot_id)
+            registered = None
+        if registered is not None and parts[1] != registered:
+            return False
     return acc in (ACC_WRITE, ACC_READ, ACC_SUBSCRIBE, ACC_READWRITE)
 
 
@@ -112,7 +136,9 @@ def _browser_allowed(auth: Auth, user_id: str, topic: str, acc: int) -> bool:
     return user.site_role(site) is not None
 
 
-def build_mqtt_hooks_router(auth: Auth) -> APIRouter:
+def build_mqtt_hooks_router(auth: Auth, site_of: Optional[Callable[[str], Optional[str]]] = None) -> APIRouter:
+    """`site_of(robot_id)`: the site the robot registered at, or None (the
+    registry, in the app). Pins a device's writes to that site."""
     router = APIRouter()
 
     def _is_service(username: str, password: Optional[str] = None) -> bool:
@@ -142,7 +168,7 @@ def build_mqtt_hooks_router(auth: Auth) -> APIRouter:
     @router.post("/mqtt/acl")
     def mqtt_acl(body: AclRequest):
         if body.username in auth.device_keys:
-            allowed = _bridge_allowed(body.username, body.topic, body.acc)
+            allowed = _bridge_allowed(auth, body.username, body.topic, body.acc, site_of)
         else:
             allowed = _browser_allowed(auth, body.username, body.topic, body.acc)
         if not allowed:

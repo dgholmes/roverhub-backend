@@ -78,7 +78,11 @@ _run_dispatcher = None  # bound below, once the run store exists
 
 
 def _on_ack(command):
-    command_store.apply_ack(command)
+    # The stored command's type, params and initiated_by win over the ack's
+    # (control/commands.py); None is an ack for a command sent to another robot.
+    command = command_store.apply_ack(command)
+    if command is None:
+        return
     history.audit.command_acked(command)  # the final outcome, once; never raises
     # A START_MISSION the bridge refused fails its run (runs/dispatch.py). Kept
     # apart from apply_ack so a dispatcher error cannot lose the ack itself.
@@ -95,6 +99,9 @@ mqtt_client = BackendMqttClient(
     # Every message history stores, queued on paho's thread; and every command
     # this backend sends, for the audit log (realtime/mqtt_client.py).
     on_observed=history.observe, on_published=history.audit.command_published,
+    # A registration is believed only for the robot whose device key writes its
+    # bridge's topic (auth/deps.py BridgeBindings). `auth` is bound below.
+    registration_check=lambda bridge_id, robot_id, known: auth.registration_allowed(bridge_id, robot_id, known),
 )
 
 
@@ -114,6 +121,11 @@ def _resolve_site(params):
         if "mission_id" in params:
             mission = _scheduler_missions.get(params["mission_id"])
             return (getattr(mission, "site_id", None) if mission else None), None
+        if "map_id" in params:
+            site_map = maps_router.store.get(params["map_id"])
+            return (site_map.site_id if site_map else None), None
+        if "snapshot_id" in params:
+            return snapshots_router.site_of(params["snapshot_id"]), None
         if "incident_id" in params and history.available:
             found = history.store.site_of_incident(params["incident_id"])
             return found if found else (None, None)
@@ -138,10 +150,14 @@ async def _bind_audit_actor(request: Request) -> None:
 
 app = FastAPI(title="RoverHub Backend (dev)",
               dependencies=[Depends(auth.guard), Depends(_bind_audit_actor)])
-app.include_router(build_auth_router(auth, on_login=history.audit.login))
-app.include_router(build_mqtt_hooks_router(auth))
+# Every change to a user, robot, mission, task or map is told to the audit log
+# (history/audit.py), attributed to the request's signed-in principal.
+app.include_router(build_auth_router(auth, on_login=history.audit.login, audit=history.audit.record))
+# The broker's checks. A device's writes are pinned to the site its robot
+# registered at (auth/mqtt_hooks.py).
+app.include_router(build_mqtt_hooks_router(auth, site_of=lambda robot_id: _site_for(robot_id)))
 app.include_router(build_router(command_store, mqtt_client, registry=registry))
-app.include_router(build_robots_router(registry))
+app.include_router(build_robots_router(registry, audit=history.audit.record))
 app.include_router(build_media_router(clips_dir=os.environ.get("AUDIO_CLIPS_DIR", DEFAULT_AUDIO_CLIPS_DIR)))
 # Camera snapshots travel the other way from audio clips -- edge to cloud. Unlike
 # clips they are kept as a small media library (JPEG + JSON sidecar, listed by
@@ -164,6 +180,7 @@ app.include_router(snapshots_router)
 maps_router = build_maps_router(
     maps_dir=os.environ.get("MAPS_DIR", DEFAULT_MAPS_DIR),
     on_status=lambda m: history.audit.map_status(m.map_id, m.status, m.site_id) if m is not None else None,
+    audit=history.audit.record,
 )
 app.include_router(maps_router)
 _tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)
@@ -173,6 +190,7 @@ _tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)
 app.include_router(build_missions_router(
     missions_dir=os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR),
     tasks_dir=_tasks_dir,
+    audit=history.audit.record,
 ))
 # Mission run records: one folder per run (run-records spec §6). See runs/.
 # The copier shares the router's own RunStore so its per-run locks coordinate
@@ -210,6 +228,7 @@ def _scheduler_enabled() -> bool:
 tasks_router = build_tasks_router(
     tasks_dir=_tasks_dir, scheduler_enabled=_scheduler_enabled,
     mission_store=MissionStore(os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR)),
+    audit=history.audit.record,
 )
 app.include_router(tasks_router)
 
@@ -407,6 +426,14 @@ async def _on_shutdown() -> None:
 
 @app.get("/healthz")
 def healthz():
+    """Public and cheap (no I/O): the process is up, and whether its broker
+    link is. A dead link otherwise shows only as commands that never get an
+    ack -- the REST API keeps answering and the console (which reads the broker
+    directly) keeps showing telemetry. Always 200, so the edge's clock sync
+    and plain liveness probes are unaffected; `status` is "degraded" while
+    the broker link is down, and `broker` says since when and how often."""
+    broker = mqtt_client.link_status()
     # server_time_ms: edge bridges stamp their messages from this clock rather
     # than their own, which can boot minutes wrong (robot_bridge/clock.py).
-    return {"status": "ok", "server_time_ms": int(time.time() * 1000)}
+    return {"status": "ok" if broker["connected"] else "degraded", "server_time_ms": int(time.time() * 1000),
+            "broker": broker, "history": {"available": history.available}}
