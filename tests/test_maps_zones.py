@@ -51,7 +51,11 @@ def test_save_zones_leaves_the_rest_of_the_map_alone(store, tmp_path):
     before = store.get("map-venue")
     store.save_zones("map-venue", [zone()])
     after = store.get("map-venue")
-    assert after.model_copy(update={"zones": []}) == before
+    # The zones are in the content hash (test_maps_content_hash.py); nothing
+    # else moves.
+    unhashed = [f.model_copy(update={"content_hash": None}) for f in after.floors]
+    was = [f.model_copy(update={"content_hash": None}) for f in before.floors]
+    assert after.model_copy(update={"zones": [], "floors": unhashed}) == before.model_copy(update={"floors": was})
     assert store.artifact_path("map-venue", 0, "grid") is not None
     assert sorted(os.listdir(tmp_path / "maps")) == ["map-venue"]
     assert sorted(os.listdir(tmp_path / "maps" / "map-venue")) == ["floor0", "map.json"]

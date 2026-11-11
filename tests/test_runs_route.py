@@ -278,3 +278,30 @@ def test_a_scheduled_route_the_backend_refuses_fails_with_the_sentence(tmp_path)
     assert occ.status == "failed"
     assert "the map Office 3F is a draft; activate it in Missions › Maps" in occ.message
     assert env.published == []
+
+
+# -- the map's content hash (0.0.20) ------------------------------------------------
+
+def _hashed_env(tmp_path, robot_hash):
+    from tests.test_route_steps import _floor
+    floor = _floor().model_copy(update={"content_hash": "c" * 64})
+    env = Env(tmp_path, schema="0.0.20", nav_map_id="map-office", smap=site_map(floors=[floor]))
+    env.registry.upsert_from_registration(ROBOT, "site-a", "quad", "b-1", "0.0.20",
+                                          nav_map_id="map-office", nav_map_hash=robot_hash)
+    return env
+
+
+def test_a_robot_running_another_version_of_the_map_is_refused(tmp_path):
+    env = _hashed_env(tmp_path, "d" * 64)
+    assert _refused(env, env.start()) == (
+        f"{ROBOT} runs a different version of Office 3F (its map files hash to dddddddddddd, the console's "
+        "floor 0 to cccccccccccc): copy the map's planning grid and zones.json to the robot again "
+        "(guide 15 §3.1) and restart its nav stack and bridge")
+
+
+def test_a_robot_on_the_same_version_or_not_saying_is_fine(tmp_path):
+    for robot_hash in ("c" * 64, None):
+        env = _hashed_env(tmp_path / str(robot_hash), robot_hash)
+        assert env.start().status_code == 201
+        legs = [s for s in env.published[0].params["steps"] if s["kind"] == "navigate"]
+        assert {leg["goal"]["map_hash"] for leg in legs} == {"c" * 64}

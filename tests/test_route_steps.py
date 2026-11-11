@@ -292,3 +292,12 @@ def test_a_waypoint_with_no_label_is_named_by_its_id():
 def test_a_map_with_no_zones_accepts_any_point_on_its_grid():
     mission = route([wp("wp-1", 9.5, 9.5)])
     assert compiled(mission, site_map(zones=[])).steps[0].goal.x_m == 9.5
+
+
+def test_a_leg_carries_the_floors_content_hash():
+    # 0.0.20: the bridge refuses the leg when its own map files hash differently.
+    floor = _floor().model_copy(update={"content_hash": "c" * 64})
+    steps = compile_route(route(), site_map(floors=[floor]), "quad").steps
+    assert {s.goal.map_hash for s in steps if isinstance(s, NavStep)} == {"c" * 64}
+    # A map stored before 0.0.20 sends none, which the bridge accepts with a warning.
+    assert {s.goal.map_hash for s in compiled().steps if isinstance(s, NavStep)} == {None}

@@ -316,7 +316,10 @@ def compile_route(mission: MissionLibraryEntry, site_map: SiteMap, robot_type: O
             kind="navigate", blockId=f"wp:{waypoint.waypoint_id}:go", label=waypoint.label,
             waypointId=waypoint.waypoint_id,
             goal=NavGotoParams(x_m=waypoint.x_m, y_m=waypoint.y_m, yaw_rad=heading_to_yaw(waypoint.heading_deg),
-                               map_id=mission.map_id, floor_id=str(floor.index)),
+                               map_id=mission.map_id, floor_id=str(floor.index),
+                               # The floor's version as stored now (0.0.20): the
+                               # bridge refuses the leg if its files differ.
+                               map_hash=floor.content_hash),
             toleranceM=min(MAX_TOLERANCE_M, max(waypoint.tolerance_m, NAV_MIN_TOLERANCE_M)),
             maxSeconds=leg_s, maxSpeedMps=speed,
         ))

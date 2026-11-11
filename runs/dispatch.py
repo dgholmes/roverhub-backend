@@ -43,6 +43,9 @@ R_MAP_DRAFT = "the map {map_name} is a draft; activate it in Missions › Maps"
 R_MAP_ARCHIVED = "the map {map_name} is archived; make it active again in Missions › Maps"
 R_NAV_MAP = ("{robot_id} is localised on the map {robot_map}, not on {map_name}, which this route is drawn on; "
              "load that map on the robot or pick a robot that has it")
+R_NAV_MAP_HASH = ("{robot_id} runs a different version of {map_name} (its map files hash to {robot_hash}, "
+                  "the console's floor {floor} to {map_hash}): copy the map's planning grid and zones.json to the "
+                  "robot again (guide 15 §3.1) and restart its nav stack and bridge")
 R_PROGRAM_NAVIGATES = ("this program contains a walk-to-point step, which only a route can carry; "
                        "remove it, or draw the walk as a route")
 
@@ -172,6 +175,16 @@ class RunDispatcher:
             compiled = compile_route(mission, site_map, robot.robot_type)
         except RouteNotRunnable as refused:
             raise StartRefused(refused.message) from refused
+        # Only when both sides say (0.0.20): the bridge checks every leg's hash
+        # again itself, and a missing one on either side is accepted there.
+        robot_hash = getattr(robot, "nav_map_hash", None)
+        if robot_hash is not None:
+            for step in compiled.steps:
+                goal = getattr(step, "goal", None)
+                if goal is not None and goal.map_hash is not None and goal.map_hash != robot_hash:
+                    raise StartRefused(R_NAV_MAP_HASH.format(
+                        robot_id=robot.robot_id, map_name=site_map.name, floor=goal.floor_id,
+                        robot_hash=robot_hash[:12], map_hash=goal.map_hash[:12]))
         return compiled.steps, max_duration_s if max_duration_s is not None else compiled.cap_s
 
     def _is_running(self, robot, robot_id: str, exclude_run_id: Optional[str]) -> bool:

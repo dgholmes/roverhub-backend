@@ -19,6 +19,15 @@ A floor's planning grid can also be set or removed on a stored map
 (`set_planning`, `delete_planning`): it is usually made after the survey, from
 the survey, on the machine that runs Nav2.
 
+Every floor carries a content hash (`MapFloor.content_hash`, tracker 1-5-01):
+sha256 over its grid's and planning grid's pixels and placement and the map's
+zones, as shared/schemas/map_hash.py defines it. It is recomputed from the
+stored files on every write that can change it -- a bundle, a planning grid,
+the zones -- and never taken from an upload. A map stored before the hash
+existed gets one computed on read (not written back) until its next write. The
+bridge hashes its own copies the same way, so the two numbers say whether the
+robot runs the map the console shows.
+
 No database, like runs/store.py: the directory is re-read on every call.
 
 Two things here take caller-supplied text and must not be talked into reading or
@@ -42,6 +51,7 @@ from typing import Callable, Dict, List, Optional, Tuple, get_args
 
 from pydantic import ValidationError
 
+from shared.schemas.map_hash import MapHashError, content_hash, grid_entry, zone_entries
 from shared.schemas.maps import MapFloor, MapStatus, MapZone, PlanningGrid, SiteMap
 
 logger = logging.getLogger("roverhub.maps")
@@ -207,6 +217,33 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
+def floor_content_hash(directory: Path, site_map: SiteMap, floor: MapFloor,
+                       log: Callable[..., None] = logger.warning) -> Optional[str]:
+    """The content hash of `floor` as stored under `directory`, or None (logged)
+    when its files cannot be hashed. The planning grid is the one map.json
+    describes: `floor.planning` None means none, whatever is on disk."""
+    floor_dir = directory / ("floor%d" % floor.index)
+    try:
+        grid = grid_entry((floor_dir / ARTIFACT_FILES["grid"]).read_bytes(), floor.resolution_m,
+                          floor.origin_xy_m, where="floor %d's grid" % floor.index)
+        planning = None
+        if floor.planning is not None:
+            planning = grid_entry((floor_dir / PLANNING_FILE).read_bytes(), floor.resolution_m,
+                                  floor.origin_xy_m, where="floor %d's planning grid" % floor.index)
+        return content_hash(site_map.map_id, grid, planning, zone_entries(site_map.zones))
+    except (OSError, MapHashError) as exc:
+        log("map %s floor %d has no content hash: %s", site_map.map_id, floor.index, exc)
+        return None
+
+
+def with_content_hashes(directory: Path, site_map: SiteMap,
+                        log: Callable[..., None] = logger.warning) -> SiteMap:
+    """`site_map` with every floor's content_hash computed from `directory`."""
+    return site_map.model_copy(update={"floors": [
+        f.model_copy(update={"content_hash": floor_content_hash(directory, site_map, f, log)})
+        for f in site_map.floors]})
+
+
 class MapNotFound(LookupError):
     """No map by that id (or an id that cannot name one)."""
 
@@ -298,6 +335,10 @@ class MapStore:
         if site_map.map_id != map_id:
             logger.warning("skipping map directory %s: its map_id is %r", map_id, site_map.map_id)
             return None
+        if any(f.content_hash is None for f in site_map.floors):
+            # Stored before 0.0.20 (or unhashable): computed, not written back,
+            # so a read never writes. The next write stores it.
+            site_map = with_content_hashes(directory, site_map, log=logger.debug)
         return site_map
 
     def list(self) -> List[SiteMap]:
@@ -398,6 +439,9 @@ class MapStore:
                         "created_at": existing.created_at,
                         "zones": existing.zones,
                     })
+                # From the files just copied and the zones just kept; whatever
+                # the bundle said is replaced.
+                site_map = with_content_hashes(scratch, site_map)
                 (scratch / MAP_FILE).write_text(site_map.model_dump_json(indent=2), encoding="utf-8")
 
                 aside = None
@@ -470,7 +514,9 @@ class MapStore:
             current = self.get(map_id)
             if current is None:
                 raise MapNotFound(map_id)
-            updated = current.model_copy(update=change(current))
+            # Zones are in the hash; a status change leaves it as it was, and
+            # recomputing then is what stores a pre-0.0.20 map's hash.
+            updated = with_content_hashes(directory, current.model_copy(update=change(current)))
             self._write_map_file(directory, updated)
         return updated
 
@@ -554,6 +600,9 @@ class MapStore:
                 if data is not None:
                     _atomic_write(target, data)
                     placed = True
+                # The planning grid is in the hash: computed from the file now
+                # in place (or its absence), before map.json says so.
+                updated = with_content_hashes(directory, updated)
                 self._write_map_file(directory, updated)
             except BaseException:
                 try:

@@ -639,3 +639,78 @@ def test_forgetting_an_unsent_command_is_harmless_on_a_client_without_a_queue():
     command = Command(command_id="c", robot_id="robot-dev-01", type="ESTOP", label="E", initiated_by="o")
     with pytest.raises(CommandPublishError):
         client.publish_command("robot-dev-01", command)
+
+
+def test_registration_records_the_hash_of_the_map_files_the_bridge_runs_on():
+    # Schema 0.0.20: compared with the floor's content_hash before a route starts.
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    base = {"robot_id": "rover-j", "site_id": "site-a", "robot_type": "quad", "schema_version": "0.0.20",
+            "nav_map_id": "map-office"}
+
+    client.handle_message("roverhub/admin/rover-j/register", json.dumps({**base, "nav_map_hash": "a" * 64}).encode())
+    assert registry.get("rover-j").nav_map_hash == "a" * 64
+
+    # Not a hash, or not said: not reported.
+    for payload in ({**base, "nav_map_hash": "not-a-hash"}, base):
+        client.handle_message("roverhub/admin/rover-j/register", json.dumps(payload).encode())
+        assert registry.get("rover-j").nav_map_hash is None
+
+
+# --- the bridge's last will (edge connection_manager.py, 2026-11-11) ----------
+
+
+def _heartbeat(status=None, **extra):
+    body = {
+        "bridge_id": "bridge-dev-01", "robot_id": "robot-dev-01", "site_id": "site-dev",
+        "timestamp": "2026-11-11T00:00:00+00:00", "sdk_connected": False, "dds_connected": False,
+        "cloud_connected": False, "battery_pct": None, "mission_active": False,
+        "available_motions": [], "host_metrics": None, **extra,
+    }
+    if status is not None:
+        body["status"] = status
+    return json.dumps(body).encode()
+
+
+def test_the_last_will_marks_the_robot_offline_at_once_and_clears_its_metrics():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    _register(client)
+    client.handle_message("roverhub/site-dev/robot-dev-01/heartbeat", _heartbeat(
+        "online", sdk_connected=True, cloud_connected=True, host_metrics={"cpu_percent": 12.5}))
+    record = registry.get("robot-dev-01")
+    assert record.online is True and record.host_metrics["cpu_percent"] == 12.5
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/heartbeat", _heartbeat("offline"))
+
+    record = registry.get("robot-dev-01")
+    assert record.online is False  # not ROBOT_OFFLINE_AFTER_S later
+    assert record.host_metrics is None and record.host_metrics_at is None
+
+
+def test_the_next_message_after_a_last_will_brings_the_robot_back():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    _register(client)
+    client.handle_message("roverhub/site-dev/robot-dev-01/heartbeat", _heartbeat("offline"))
+    client.handle_message("roverhub/site-dev/robot-dev-01/heartbeat", _heartbeat("online"))
+    assert registry.get("robot-dev-01").online is True
+
+
+def test_a_heartbeat_without_a_status_still_counts_as_one():
+    """An older bridge sends no status: every heartbeat it sends is alive."""
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    _register(client)
+    registry.mark_offline("robot-dev-01")
+    client.handle_message("roverhub/site-dev/robot-dev-01/heartbeat", _heartbeat())
+    assert registry.get("robot-dev-01").online is True
+
+
+def test_a_last_will_for_an_unregistered_robot_is_a_no_op():
+    """Retained, so a backend starting later gets it before (or without) the
+    registration; it must not create a record or raise."""
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    client.handle_message("roverhub/site-dev/robot-dev-01/heartbeat", _heartbeat("offline"))
+    assert registry.list_all() == []

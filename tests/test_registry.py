@@ -276,3 +276,14 @@ def test_nav_map_id_is_kept_from_registration_and_listed():
     assert robot_json(registry.get("rover-j"))["nav_map_id"] == "map-office"
     registry.upsert_from_registration("rover-j", "site-a", "quad")
     assert registry.get("rover-j").nav_map_id is None
+
+
+def test_nav_map_hash_is_kept_from_registration_and_listed():
+    from robots.router import robot_json
+
+    registry = RobotRegistry()
+    registry.upsert_from_registration("rover-j", "site-a", "quad", nav_map_id="map-office", nav_map_hash="b" * 64)
+    assert registry.get("rover-j").nav_map_hash == "b" * 64
+    assert robot_json(registry.get("rover-j"))["nav_map_hash"] == "b" * 64
+    registry.upsert_from_registration("rover-j", "site-a", "quad", nav_map_id="map-office")
+    assert registry.get("rover-j").nav_map_hash is None

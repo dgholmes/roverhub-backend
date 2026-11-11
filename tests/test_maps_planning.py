@@ -157,8 +157,10 @@ def test_setting_and_removing_it_leave_the_status_and_zones_alone(store):
 def test_setting_it_leaves_the_rest_of_the_map_alone(store):
     before = store.get("map-venue")
     after = store.set_planning("map-venue", 0, PLANNING)
-    floors = [f.model_copy(update={"planning": None}) for f in after.floors]
-    assert after.model_copy(update={"floors": floors}) == before
+    # The planning grid is in the content hash (test_maps_content_hash.py).
+    floors = [f.model_copy(update={"planning": None, "content_hash": None}) for f in after.floors]
+    was = [f.model_copy(update={"content_hash": None}) for f in before.floors]
+    assert after.model_copy(update={"floors": floors}) == before.model_copy(update={"floors": was})
 
 
 def test_delete_planning_removes_the_file_and_the_record(store, tmp_path):

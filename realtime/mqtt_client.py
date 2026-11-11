@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Optional, Set, Tuple
 from pydantic import ValidationError
 
 from shared.schemas.bridge_status import EdgeHostInfo, EdgeHostMetrics, NavGoalStatus
+from shared.schemas.map_hash import is_map_hash
 from shared.schemas.version import SCHEMA_VERSION
 
 logger = logging.getLogger("backend.realtime.mqtt_client")
@@ -380,6 +381,18 @@ class BackendMqttClient:
             # history/ingest.py keeps the payload as sent and files it under the
             # topic's robot and site, warning if the payload names others.
             self._observe("incident", site_id, robot_id, data)
+        elif message_kind == "heartbeat" and data.get("status") == "offline":
+            # The bridge's last will (roverhub-edge connection_manager.py): the
+            # BROKER saying the bridge's connection ended without a goodbye --
+            # its process, power or network is gone. It arrives on the
+            # heartbeat topic, so it must not count as one: offline at once,
+            # rather than ROBOT_OFFLINE_AFTER_S of silence later, and its
+            # host metrics cleared, not shown as current. Retained, so a
+            # backend that starts later learns it too (a no-op for a robot not
+            # registered yet). Anything else the bridge sends brings it back.
+            self._registry.mark_offline(robot_id)
+            self._registry.update_host_metrics(robot_id, None, at=None)
+            logger.warning("robot %s: the broker reports its bridge's connection lost (last will)", robot_id)
         elif message_kind in ("telemetry", "heartbeat"):
             self._registry.mark_seen(robot_id)
             if message_kind == "heartbeat":
@@ -460,6 +473,8 @@ class BackendMqttClient:
             schema_version=data.get("schema_version"),
             host=self._validated(EdgeHostInfo, data.get("host"), robot_id, "host"),
             nav_map_id=data.get("nav_map_id") if isinstance(data.get("nav_map_id"), str) else None,
+            # 0.0.20. Anything but a well-formed hash reads as "not reported".
+            nav_map_hash=data.get("nav_map_hash") if is_map_hash(data.get("nav_map_hash")) else None,
         )
 
     @staticmethod

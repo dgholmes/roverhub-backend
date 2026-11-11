@@ -49,8 +49,11 @@ def _now() -> datetime:
 # bridge message refreshes last_seen -- registration and heartbeat every
 # HEARTBEAT_INTERVAL_S (5 s by default on the edge), telemetry at 10 Hz -- so
 # 15 s is three heartbeat intervals: two lost heartbeats are tolerated, a third
-# is not. The bridge sets no MQTT last will, so silence is the only signal a
-# dead bridge, a dead link or a dead broker connection gives.
+# is not. Since 2026-11-11 the bridge also sets an MQTT last will (an offline
+# heartbeat, realtime/mqtt_client.py marks the robot offline on it at once),
+# but silence stays the signal for what a will cannot say: a broker that has
+# not yet noticed the bridge is gone (~1.5x its keepalive), or this backend's
+# own link to the broker.
 DEFAULT_OFFLINE_AFTER_S = 15.0
 
 
@@ -97,6 +100,11 @@ class RobotRecord:
     # localised on (its NAV_MAP_ID), None with nav off or from an older bridge.
     # Lets a route on another map be refused before START_MISSION.
     nav_map_id: Optional[str] = None
+    # From the registration (schema 0.0.20): the content hash of the map files
+    # the bridge's nav stack runs on (shared/schemas/map_hash.py). None with nav
+    # off, from an older bridge, or when the device could not hash its files.
+    # Compared with the floor's MapFloor.content_hash before a route starts.
+    nav_map_hash: Optional[str] = None
 
 
 class RobotRegistry:
@@ -147,6 +155,7 @@ class RobotRegistry:
         schema_version: Optional[str] = None,
         host: Optional[dict] = None,
         nav_map_id: Optional[str] = None,
+        nav_map_hash: Optional[str] = None,
     ) -> None:
         now = self._clock()
         with self._lock:
@@ -157,7 +166,7 @@ class RobotRegistry:
                     robot_id=robot_id, site_id=site_id, robot_type=robot_type,
                     name=robot_id, last_seen=now, online=True,
                     bridge_id=bridge_id, schema_version=schema_version,
-                    first_seen=now, host=host, nav_map_id=nav_map_id,
+                    first_seen=now, host=host, nav_map_id=nav_map_id, nav_map_hash=nav_map_hash,
                     acceptance=acceptance, acceptance_source=source,
                     acceptance_changed_at=now,
                 )
@@ -175,6 +184,7 @@ class RobotRegistry:
             # Replaced, not kept: a registration without it is a bridge whose
             # nav is off (or older than 0.0.16), which is on no map.
             existing.nav_map_id = nav_map_id
+            existing.nav_map_hash = nav_map_hash
 
     def mark_seen(self, robot_id: str) -> None:
         with self._lock:
