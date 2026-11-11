@@ -50,6 +50,12 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     "ESTOP": _STOPPING,
     "STOP_MISSION": _STOPPING,
     "STOP_SPEAK": _STOPPING,
+    # Cancelling a walk-to-point is stopping, so it is never harder than starting
+    # one. NAV_GOTO itself is driving the robot and takes the `drive` default.
+    "NAV_CANCEL": _STOPPING,
+    # Placing the robot on the map is not a stop: it changes where the robot
+    # believes it is, which redirects every goal that follows. Same as driving.
+    "RESET_POSITION": ("drive",),
     # Releasing an E-Stop leaves the robot lying down (`ready`); standing it
     # up again is the "get a robot back up" capability technicians hold.
     "RESET_ESTOP": ("getUp",),
@@ -142,6 +148,20 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("PUT", "/tasks/{task_id}"): Rule(capabilities=("dispatchPatrols",)),
     ("DELETE", "/tasks/{task_id}"): Rule(capabilities=("dispatchPatrols",)),
     ("POST", "/tasks/{task_id}/run-now"): Rule(capabilities=("dispatchPatrols",)),
+
+    # Site maps: everyone who can see a site may see its floor plans; uploading
+    # a survey or deleting a map is site configuration. Drawing zones and freezing
+    # a map are one judgement -- a person has looked at it, and "active" is what
+    # missions plan against -- so both need `editZones`, which supervisors hold
+    # and engineers do not: the engineer who uploads a survey (`configure`) does
+    # not also sign it off, and a re-upload drops an active map back to draft.
+    ("GET", "/maps"): _READ,
+    ("GET", "/maps/{map_id}"): _READ,
+    ("GET", "/maps/{map_id}/floors/{index}/{kind}"): _READ,
+    ("POST", "/maps"): Rule(capabilities=("configure",)),
+    ("PUT", "/maps/{map_id}/zones"): Rule(capabilities=("editZones",)),
+    ("PUT", "/maps/{map_id}/status"): Rule(capabilities=("editZones",)),
+    ("DELETE", "/maps/{map_id}"): Rule(capabilities=("configure",)),
 
     # Runs
     ("POST", "/robots/{robot_id}/runs"): Rule(capabilities=("dispatchPatrols",)),

@@ -465,3 +465,42 @@ def test_state_message_stores_control_owner_and_active_run():
     record = registry.get("robot-dev-01")
     assert record.control_owner == "mission:r-1"
     assert record.active_run == run
+
+
+_NAV_GOAL = {"goal_id": "c-1", "x_m": 1.0, "y_m": 2.0, "yaw_rad": None, "map_id": "map-venue",
+             "state": "aborted", "reason": "localization_lost", "updated_at": "2026-11-10T00:00:00Z"}
+
+
+def test_state_message_stores_nav_goal():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/state", _state_payload(nav_goal=_NAV_GOAL))
+
+    assert registry.get("robot-dev-01").nav_goal == _NAV_GOAL
+
+
+def test_state_message_without_nav_goal_gives_none():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    client.handle_message("roverhub/site-dev/robot-dev-01/state", _state_payload(nav_goal=_NAV_GOAL))
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/state", _state_payload())  # an old bridge
+
+    assert registry.get("robot-dev-01").nav_goal is None
+
+
+def test_state_message_with_a_malformed_nav_goal_still_updates_state():
+    """Display data must never cost the state message that carried it."""
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/state",
+                          _state_payload(nav_goal={**_NAV_GOAL, "state": "teleporting"}))
+
+    record = registry.get("robot-dev-01")
+    assert record.abstract_state == "STAND"
+    assert record.nav_goal is None

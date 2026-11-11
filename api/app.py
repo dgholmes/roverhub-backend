@@ -17,6 +17,7 @@ from control.commands import CommandStore
 from control.media import DEFAULT_AUDIO_CLIPS_DIR, MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router
 from control.snapshots import DEFAULT_SNAPSHOTS_DIR, build_snapshot_router
 from control.router import build_router
+from maps.router import DEFAULT_MAPS_DIR, build_maps_router
 from missions.router import DEFAULT_MISSIONS_DIR, MissionStore, build_missions_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry, offline_after_s_from_env
@@ -121,6 +122,9 @@ app.include_router(build_snapshot_router(
     snapshots_dir=os.environ.get("SNAPSHOTS_DIR", DEFAULT_SNAPSHOTS_DIR),
     site_lookup=_site_for,
 ))
+# Site maps: a surveyed floor plan packed by tools/map_prep/pack_map.py, kept as
+# one directory per map. See maps/.
+app.include_router(build_maps_router(maps_dir=os.environ.get("MAPS_DIR", DEFAULT_MAPS_DIR)))
 _tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)
 # Missions authored in the console, stored as one JSON file each so they
 # survive a refresh and are shared between browsers. See missions/router.py.
