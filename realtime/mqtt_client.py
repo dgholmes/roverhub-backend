@@ -103,6 +103,10 @@ class BackendMqttClient:
         self._last_disconnect_rc: Optional[int] = None
         self._last_refused_rc: Optional[int] = None
         self._last_message_at: Optional[float] = None
+        # Attempts that never reached the broker at all (refused TCP, no DNS,
+        # timeout) since the last connection; paho's thread keeps retrying.
+        self._connect_failures = 0
+        self._last_connect_failure_at: Optional[float] = None
         # Body/topic disagreements already logged, so a misconfigured bridge
         # at 10 Hz is one warning rather than a flood.
         self._warned: Set[tuple] = set()
@@ -121,8 +125,20 @@ class BackendMqttClient:
         self._client.on_message = self._on_message
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
+        self._client.on_connect_fail = self._on_connect_fail
 
     def connect(self) -> None:
+        """Start the broker link, without waiting for it.
+
+        The first connection is made by paho's network thread, which retries
+        it with the same backoff as any reconnect -- so a broker that is down
+        when the backend starts (docker not up yet, a reboot that started us
+        first) no longer kills startup. The API serves meanwhile, /healthz
+        answers "degraded" with the broker block saying why, and commands are
+        refused (404, as no robot has registered yet) rather than sent. Before
+        2026-11-11 this called connect(), which raised ConnectionRefusedError
+        out of the startup hook and took the whole backend down with the
+        broker."""
         host, port = self._parse_broker_url(self._broker_url)
         # Bound paho's own reconnect backoff. Its network thread reconnects on
         # its own as long as it is alive -- keeping it alive is what _on_message
@@ -133,7 +149,11 @@ class BackendMqttClient:
         service_password = os.environ.get("BROKER_SERVICE_PASSWORD", "")
         if service_password:
             self._client.username_pw_set("roverhub-backend", service_password)
-        self._client.connect(host, port)
+        # connect_async only records where to go; loop_start's thread runs
+        # loop_forever(retry_first_connection=True), which dials, and on failure
+        # waits out reconnect_delay_set's backoff (1 s doubling to 30 s) and
+        # dials again, forever.
+        self._client.connect_async(host, port)
         self._client.loop_start()
 
     def disconnect(self) -> None:
@@ -167,9 +187,36 @@ class BackendMqttClient:
                 command.command_id, command.type, robot_id, topic, rc,
             )
             error = f"could not publish command to the broker (rc={rc}); the robot was not sent this command"
+            self._forget_unsent(getattr(info, "mid", None), command)
             self._published(robot_id, command, record.site_id, error)
             raise CommandPublishError(error)
         self._published(robot_id, command, record.site_id, None)
+
+    def _forget_unsent(self, mid, command) -> None:
+        """Take a command just reported as NOT sent out of paho's queue.
+
+        paho 1.6 does not drop a QoS 1 publish it could not send: on
+        MQTT_ERR_NO_CONN it keeps the message and sends it when the link comes
+        back. So a command the operator was told failed (503) would reach the
+        robot later anyway -- a walk, minutes late. The bridge's expiry check
+        (ttl_s) is the other guard, but it covers only a non-exempt command on
+        a synced bridge; "not sent" must mean not sent. paho has no public call
+        for this, so it reaches into paho's queue under paho's own lock, and
+        does nothing on a client without one (a test fake, a future paho)."""
+        queue = getattr(self._client, "_out_messages", None)
+        lock = getattr(self._client, "_out_message_mutex", None)
+        if mid is None or queue is None or lock is None:
+            return
+        try:
+            with lock:
+                dropped = queue.pop(mid, None)
+        except Exception:
+            logger.exception("could not drop unsent command %s from the MQTT queue; it may still be "
+                             "delivered when the broker link returns", command.command_id)
+            return
+        if dropped is not None:
+            logger.info("dropped unsent command %s (%s) from the MQTT queue, so it is not delivered "
+                        "late when the broker link returns", command.command_id, command.type)
 
     def _published(self, robot_id, command, site_id, error) -> None:
         if self._on_published is None:
@@ -208,7 +255,25 @@ class BackendMqttClient:
                 # The broker's CONNACK refusal (5 = not authorised), if the last
                 # attempt was refused; None once a connection succeeds.
                 "last_refused_rc": self._last_refused_rc,
+                # Attempts that never reached a broker (it is down, or the URL
+                # is wrong) since the last connection; paho keeps retrying.
+                "connect_failures": self._connect_failures,
+                "last_connect_failure_at": _iso(self._last_connect_failure_at),
             }
+
+    def _on_connect_fail(self, client, userdata) -> None:
+        """paho could not reach the broker at all; it retries after its backoff.
+        Logged on the first failure and then every 10th, so a broker that stays
+        down for an hour is a handful of lines, not thousands."""
+        with self._link_lock:
+            self._connect_failures += 1
+            self._last_connect_failure_at = self._clock()
+            failures = self._connect_failures
+        if failures == 1 or failures % 10 == 0:
+            logger.error(
+                "cannot reach the MQTT broker at %s (%d attempt(s) so far); the API keeps serving, "
+                "/healthz reports degraded, and no command can reach a robot until it connects. "
+                "Retrying with backoff.", self._broker_url, failures)
 
     def _on_connect(self, client, userdata, flags, rc) -> None:
         if rc != MQTT_ERR_SUCCESS:
@@ -222,6 +287,10 @@ class BackendMqttClient:
             self._connected_at = self._clock()
             self._connects += 1
             self._last_refused_rc = None
+            recovered_after = self._connect_failures
+            self._connect_failures = 0
+        if recovered_after:
+            logger.info("connected to the MQTT broker after %d failed attempt(s)", recovered_after)
         client.subscribe("roverhub/admin/+/register", qos=1)
         client.subscribe("roverhub/+/+/telemetry", qos=0)
         client.subscribe("roverhub/+/+/state", qos=1)

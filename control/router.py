@@ -82,9 +82,11 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None) -> API
             current_stage="requested",
             stages=[CommandStageEvent(stage="requested", at=datetime.now(timezone.utc).isoformat())],
             initiated_by=acting_user_id(http, request.initiated_by),
-            # None for a stop: a late stop is still a stop. The bridge only logs
-            # an expired command for now, so nothing may depend on it dropping one.
-            ttl_s=command_ttl_s(request.type),
+            # How stale the bridge may find it before refusing it
+            # REJECTED_EXPIRED (by type, and a Release & resume by its params).
+            # None for a stop: a late stop is still a stop. The bridge enforces
+            # it only once its clock is synced with ours (robot_bridge/clock.py).
+            ttl_s=command_ttl_s(request.type, request.params),
         )
         command_store.add(command)
         try:

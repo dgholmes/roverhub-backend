@@ -4,6 +4,7 @@ import os
 import re
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -59,6 +60,18 @@ AUDIO_CLIP_PATH_RE = re.compile(r"^/robots/[^/]+/audio-clips$")
 # Anchored and character-restricted so no separator or ".." can reach
 # os.path.join when a clip is fetched back.
 CLIP_ID_RE = re.compile(r"^[A-Za-z0-9_-]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[A-Za-z0-9]{1,5}$")
+# The "-{uuid4}{ext}" tail of a clip id; what is left is the robot's id.
+_CLIP_TAIL_RE = re.compile(r"-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[A-Za-z0-9]{1,5}$")
+
+
+def robot_of_clip(clip_id: str) -> Optional[str]:
+    """The robot a clip was uploaded for, read from its id, or None for an id
+    upload_audio_clip could not have made. The access guard resolves a clip's
+    site from it (api/app.py), so GET /audio-clips/{clip_id} is checked at that
+    robot's site like every other per-robot read."""
+    if not CLIP_ID_RE.match(clip_id):
+        return None
+    return _CLIP_TAIL_RE.sub("", clip_id) or None
 
 
 class ContentLengthLimitMiddleware:

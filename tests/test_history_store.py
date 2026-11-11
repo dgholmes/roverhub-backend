@@ -206,6 +206,31 @@ def test_history_is_per_robot_and_reports_whether_any_exists(history_store):
     assert history_store.has_samples("rover-b") and not history_store.has_samples("rover-z")
 
 
+def test_history_can_be_limited_to_the_callers_sites(history_store):
+    # A robot that moved from site-a to site-b: a site-b reader sees only site-b's samples.
+    history_store.write([sample(T0 + i, site_id="site-a") for i in range(5)]
+                        + [sample(T0 + 10 + i, site_id="site-b") for i in range(5)]
+                        + [sample(T0 + 20, site_id=None)])
+    rows = lambda sites, n=500: history_store.history("rover-a", T0 - 1, T0 + 100, n, sites=sites)  # noqa: E731
+    assert len(rows(None)) == 11
+    assert len(rows(frozenset({"site-b"}))) == 6          # plus the sample with no site
+    assert len(rows(frozenset({"site-a", "site-b"}))) == 11
+    assert rows(frozenset()) == []
+    assert 1 <= len(rows(frozenset({"site-b"}), n=2)) <= 2  # the thinned query filters too
+    assert history_store.has_samples("rover-a", frozenset({"site-b"}))
+    history_store.write([sample(T0, robot="rover-c", site_id="site-a")])
+    assert not history_store.has_samples("rover-c", frozenset({"site-z"}))
+    assert not history_store.has_samples("rover-a", frozenset())
+
+
+def test_a_robots_site_is_its_newest_sample_that_names_one(history_store):
+    assert history_store.site_of_robot("rover-a") is None
+    history_store.write([sample(T0, site_id="site-a"), sample(T0 + 10, site_id="site-b"),
+                         sample(T0 + 20, site_id=None)])
+    assert history_store.site_of_robot("rover-a") == "site-b"
+    assert history_store.site_of_robot("rover-z") is None
+
+
 # -- audit ------------------------------------------------------------------------------------
 
 def test_the_audit_log_is_filtered_and_paged_newest_first(history_store):

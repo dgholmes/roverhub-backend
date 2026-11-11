@@ -365,27 +365,53 @@ class HistoryStore:
     _SAMPLE_COLUMNS = ("at, battery_pct, x_m, y_m, heading_deg, position_quality, speed_mps, abstract_state, "
                        "sdk_state, posture, control_owner, active_run_id, link, reason")
 
-    def history(self, robot_id: str, since: float, until: float, max_points: int) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _sample_sites(sites) -> Tuple[str, List[Any]]:
+        """A WHERE fragment keeping only samples at `sites` (the caller's
+        visible sites; None for all). A sample with no site is kept, as a list
+        shows a record with no site to anyone who holds a role somewhere."""
+        if sites is None:
+            return "", []
+        return (f" AND (site_id IS NULL OR site_id IN ({', '.join('?' for _ in sites)}))", sorted(sites))
+
+    def history(self, robot_id: str, since: float, until: float, max_points: int,
+                sites=None) -> List[Dict[str, Any]]:
         """Samples with since <= at < until, oldest first, at most max_points:
         past that the window is cut into max_points equal buckets and the first
-        sample of each is returned, so the thinning happens in the database."""
-        args = (robot_id, since, until)
-        count = self._read("SELECT COUNT(*) AS n FROM telemetry_samples WHERE robot_id = ? AND at >= ? AND at < ?",
-                           args)[0]["n"]
+        sample of each is returned, so the thinning happens in the database.
+        `sites`: only samples taken at these sites (None for every site), so a
+        robot that moved sites does not show its old site's history."""
+        if sites is not None and not sites:
+            return []
+        site_sql, site_args = self._sample_sites(sites)
+        args = (robot_id, since, until, *site_args)
+        count = self._read("SELECT COUNT(*) AS n FROM telemetry_samples WHERE robot_id = ? AND at >= ? AND at < ?"
+                           + site_sql, args)[0]["n"]
         if count <= max_points:
             rows = self._read(f"SELECT {self._SAMPLE_COLUMNS} FROM telemetry_samples "
-                              "WHERE robot_id = ? AND at >= ? AND at < ? ORDER BY at, id", args)
+                              "WHERE robot_id = ? AND at >= ? AND at < ?" + site_sql + " ORDER BY at, id", args)
         else:
             width = (until - since) / max_points
             bucket = self.db.floor_expr("(at - ?) / ?")
             rows = self._read(
                 f"SELECT {self._SAMPLE_COLUMNS} FROM telemetry_samples WHERE id IN ("
-                f"SELECT MIN(id) FROM telemetry_samples WHERE robot_id = ? AND at >= ? AND at < ? "
-                f"GROUP BY {bucket}) ORDER BY at, id", (robot_id, since, until, since, width))
+                f"SELECT MIN(id) FROM telemetry_samples WHERE robot_id = ? AND at >= ? AND at < ?{site_sql} "
+                f"GROUP BY {bucket}) ORDER BY at, id", (*args, since, width))
         return [{**r, "at": iso(r["at"])} for r in rows]
 
-    def has_samples(self, robot_id: str) -> bool:
-        return bool(self._read("SELECT 1 AS one FROM telemetry_samples WHERE robot_id = ? LIMIT 1", (robot_id,)))
+    def has_samples(self, robot_id: str, sites=None) -> bool:
+        if sites is not None and not sites:
+            return False
+        site_sql, site_args = self._sample_sites(sites)
+        return bool(self._read("SELECT 1 AS one FROM telemetry_samples WHERE robot_id = ?" + site_sql + " LIMIT 1",
+                               (robot_id, *site_args)))
+
+    def site_of_robot(self, robot_id: str) -> Optional[str]:
+        """The site of this robot's newest telemetry sample that names one, or
+        None. For access checks on a robot the registry does not know."""
+        rows = self._read("SELECT site_id FROM telemetry_samples WHERE robot_id = ? AND site_id IS NOT NULL "
+                          "ORDER BY at DESC, id DESC LIMIT 1", (robot_id,))
+        return rows[0]["site_id"] if rows else None
 
     def latest_perception(self) -> List[Dict[str, Any]]:
         rows = self._read("SELECT robot_id, site_id, at, source_state, fps, camera, detectors FROM perception_status "

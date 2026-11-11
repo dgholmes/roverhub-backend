@@ -271,6 +271,30 @@ def test_a_stop_is_published_with_no_time_limit():
     assert [command.ttl_s for _, command in mqtt_client.published_commands] == [None] * 4
 
 
+def test_a_release_and_resume_carries_a_time_limit_and_a_plain_release_none():
+    # Release & resume sets a paused mission walking again (schema 0.0.19).
+    from shared.schemas.commands import COMMAND_TTL_RESUMING_RELEASE_S
+
+    client, registry, _, mqtt_client = _make_app_with_registry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    for params in ({"resume_run": True}, {}):
+        client.post("/robots/robot-dev-01/commands",
+                    json={"type": "RELEASE_CONTROL", "label": "Release", "initiated_by": "x", "params": params})
+    assert [command.ttl_s for _, command in mqtt_client.published_commands] == [
+        COMMAND_TTL_RESUMING_RELEASE_S, None]
+
+
+def test_a_walk_is_published_with_a_few_seconds_to_arrive():
+    client, registry, _, mqtt_client = _make_app_with_registry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    client.post("/robots/robot-dev-01/commands",
+                json={"type": "LINE_WALK", "label": "Walk", "initiated_by": "x", "params": {"distance_m": 1.0}})
+    (_, command), = mqtt_client.published_commands
+    assert command.ttl_s == 5.0
+    # The issue time the bridge measures the age from is the backend's stamp.
+    assert command.stages[0].stage == "requested"
+
+
 def test_resume_needs_the_run_id_of_the_paused_run():
     client, registry, _, mqtt_client = _make_app_with_registry()
     registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")

@@ -289,6 +289,70 @@ def test_robots_are_listed_for_the_callers_sites(app, auth_on):
     assert ids("own") == ["rover-a", "rover-b"]
 
 
+def _history_sample(robot_id, site_id, at=T0):
+    from history.records import SampleRecord
+
+    return SampleRecord(robot_id=robot_id, site_id=site_id, at=at, battery_pct=80.0, x_m=0.0, y_m=0.0,
+                        heading_deg=0.0, position_quality="localized", speed_mps=0.0, abstract_state="STAND",
+                        sdk_state="balance_stand", posture="upright", control_owner=None, active_run_id=None,
+                        link="live", reason="interval")
+
+
+def test_the_history_of_a_robot_the_registry_forgot_is_checked_at_its_last_site(app, auth_on):
+    if not backend.history.available:
+        pytest.skip("history is not available in this run")
+    ghost = f"ghost-{uuid.uuid4().hex[:6]}"
+    backend.history.store.write([_history_sample(ghost, "site-b")])
+    window = {"from": "2025-11-10T00:00:00Z", "to": "2025-11-12T00:00:00Z"}
+    assert backend.registry.get(ghost) is None
+    # ana holds site-a only: before, a robot unknown to the registry had no
+    # site, so anyone who could watch anywhere could read its history.
+    assert app.get(f"/robots/{ghost}/history", params=window, headers=auth_on("ana")).status_code == 403
+    response = app.get(f"/robots/{ghost}/history", params=window, headers=auth_on("bob"))
+    assert response.status_code == 200 and len(response.json()["samples"]) == 1
+    # Nothing anywhere: no site to check, and the handler says it is unknown.
+    assert app.get("/robots/nobody-at-all/history", params=window, headers=auth_on("ana")).status_code == 404
+
+
+def test_a_robots_history_leaves_out_the_sites_the_reader_cannot_see(app, auth_on):
+    if not backend.history.available:
+        pytest.skip("history is not available in this run")
+    # rover-b is at site-b now, but some of its samples are from site-a.
+    backend.history.store.write([_history_sample("rover-b", "site-a", T0), _history_sample("rover-b", "site-b", T0 + 5)])
+    window = {"from": "2025-11-10T00:00:00Z", "to": "2025-11-12T00:00:00Z"}
+    bob = app.get("/robots/rover-b/history", params=window, headers=auth_on("bob")).json()["samples"]
+    own = app.get("/robots/rover-b/history", params=window, headers=auth_on("own")).json()["samples"]
+    assert len(own) == len(bob) + 1
+
+
+def test_a_speak_clip_is_read_at_its_robots_site(app, auth_on):
+    import os
+
+    clips_dir = os.environ["AUDIO_CLIPS_DIR"]
+    os.makedirs(clips_dir, exist_ok=True)
+    clip_id = f"rover-b-{uuid.uuid4()}.pcm"
+    with open(os.path.join(clips_dir, clip_id), "wb") as f:
+        f.write(bytes(2))
+    assert app.get(f"/audio-clips/{clip_id}", headers=auth_on("ana")).status_code == 403   # site-a only
+    assert app.get(f"/audio-clips/{clip_id}", headers=auth_on("bob")).status_code == 200
+    assert app.get(f"/audio-clips/{clip_id}", headers=auth_on("own")).status_code == 200
+    # A device key may still fetch it -- a mission's Speak step keeps its clip
+    # when the mission runs on another robot -- but only with a key.
+    assert app.get(f"/audio-clips/{clip_id}", headers={"Authorization": "Bearer key-a"}).status_code == 200
+    app.cookies.clear()  # the last sign-in's session cookie would authorise a GET
+    assert app.get(f"/audio-clips/{clip_id}").status_code == 401
+
+
+def test_a_clips_robot_is_read_from_its_id():
+    from control.media import robot_of_clip
+
+    uid = uuid.uuid4()
+    assert robot_of_clip(f"rover-b-{uid}.pcm") == "rover-b"
+    assert robot_of_clip(f"my_robot-2-{uid}.wav") == "my_robot-2"
+    assert robot_of_clip("rover-b.pcm") is None
+    assert robot_of_clip(f"../rover-b-{uid}.pcm") is None
+
+
 def _mission(mission_id, site_id, version=1, creator="someone-else"):
     return {"mission_id": mission_id, "name": "Patrol", "type": "patrol", "kind": "route", "version": version,
             "creator": creator, "updated_at": "2026-11-11T00:00:00Z", "map_id": "map", "site_id": site_id}

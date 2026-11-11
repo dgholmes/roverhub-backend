@@ -28,6 +28,10 @@ class _FakeMqttClient:
     def connect(self, host, port):
         self.connected_to = (host, port)
 
+    def connect_async(self, host, port):
+        # paho's: records the target; loop_start's thread dials it.
+        self.connected_to = (host, port)
+
     def loop_start(self):
         pass
 
@@ -547,3 +551,91 @@ def test_registration_records_the_map_the_bridge_navigates_on():
     # A bridge with nav off (or older than 0.0.16) says nothing: none, not the last value.
     client.handle_message("roverhub/admin/rover-j/register", json.dumps(base).encode())
     assert registry.get("rover-j").nav_map_id is None
+
+
+# --- A broker that is down at startup (2026-11-11) ----------------------------
+#
+# connect() used to dial synchronously and raise ConnectionRefusedError out of
+# the startup hook, so a broker that was down when the backend started took the
+# whole API down with it. Now paho's thread makes the first connection too,
+# retrying with backoff, and /healthz says "degraded" meanwhile.
+
+
+def test_connect_does_not_dial_on_the_callers_thread():
+    class Refusing(_FakeMqttClient):
+        def connect(self, host, port):
+            raise ConnectionRefusedError("nobody home")
+
+    client = BackendMqttClient("mqtt://localhost:1884", RobotRegistry(), Refusing)
+    client.connect()  # must not raise
+    assert client._client.connected_to == ("localhost", 1884)
+    assert client._client.on_connect_fail is not None
+
+
+def test_failed_attempts_show_on_the_link_status_until_a_connection():
+    t = {"now": 1000.0}
+    client = BackendMqttClient("mqtt://localhost:1884", RobotRegistry(), _FakeMqttClient,
+                               clock=lambda: t["now"])
+    client.connect()
+    for _ in range(3):
+        client._on_connect_fail(None, None)
+    status = client.link_status()
+    assert status["connected"] is False
+    assert status["connect_failures"] == 3
+    assert status["last_connect_failure_at"] is not None
+
+    client._on_connect(client._client, None, {}, 0)
+    status = client.link_status()
+    assert status["connected"] is True and status["connect_failures"] == 0
+
+
+def test_a_real_paho_client_survives_a_broker_that_is_down():
+    import socket
+    import time
+
+    from realtime.mqtt_client import real_mqtt_client_factory
+
+    # A port nothing listens on: bind one, then close it.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    client = BackendMqttClient(f"mqtt://127.0.0.1:{port}", RobotRegistry(), real_mqtt_client_factory)
+    try:
+        client.connect()  # raised ConnectionRefusedError before
+        deadline = time.monotonic() + 5.0
+        while client.link_status()["connect_failures"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        status = client.link_status()
+        assert status["connected"] is False
+        assert status["connect_failures"] >= 1
+    finally:
+        client.disconnect()
+
+
+def test_a_command_reported_unsent_is_not_sent_later_by_paho():
+    # paho keeps a QoS 1 publish it could not send and sends it on reconnect,
+    # which would deliver a command the operator was told had failed.
+    from realtime.mqtt_client import real_mqtt_client_factory
+
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    client = BackendMqttClient("mqtt://127.0.0.1:1", registry, real_mqtt_client_factory)
+    command = Command(command_id="cmd-late", robot_id="robot-dev-01", type="LINE_WALK", label="Walk",
+                      initiated_by="operator-dev")
+
+    with pytest.raises(CommandPublishError):
+        client.publish_command("robot-dev-01", command)  # never connected: MQTT_ERR_NO_CONN
+
+    assert client._client._out_messages == {}
+
+
+def test_forgetting_an_unsent_command_is_harmless_on_a_client_without_a_queue():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    client._client.publish_rc = 4
+    command = Command(command_id="c", robot_id="robot-dev-01", type="ESTOP", label="E", initiated_by="o")
+    with pytest.raises(CommandPublishError):
+        client.publish_command("robot-dev-01", command)

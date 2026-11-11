@@ -14,7 +14,9 @@ from auth.deps import Auth, principal_of
 from auth.mqtt_hooks import build_mqtt_hooks_router
 from auth.router import build_auth_router
 from control.commands import CommandStore
-from control.media import DEFAULT_AUDIO_CLIPS_DIR, MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router
+from control.media import (
+    DEFAULT_AUDIO_CLIPS_DIR, MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router, robot_of_clip,
+)
 from control.snapshots import DEFAULT_SNAPSHOTS_DIR, build_snapshot_router
 from control.router import build_router
 from history.audit import bind_actor
@@ -105,13 +107,36 @@ mqtt_client = BackendMqttClient(
 )
 
 
+def _robot_site(robot_id: str):
+    """A robot's site for a role check: the registry's, or -- for a robot it
+    does not know (not registered since this process started, or deleted) --
+    the site of the robot's newest stored telemetry, so its history is not
+    readable from any site just because the registry forgot it. None when
+    neither knows."""
+    record = registry.get(robot_id)
+    if record is not None:
+        return record.site_id
+    if history.available:
+        try:
+            return history.store.site_of_robot(robot_id)
+        except Exception:
+            logger.exception("could not look up the site of robot %s in history", robot_id)
+    return None
+
+
 def _resolve_site(params):
     """The (site_id, robot_id) a request's path refers to, for role checks.
     Bound late: the stores it reads are built further down this module."""
     try:
         if "robot_id" in params:
-            record = registry.get(params["robot_id"])
-            return (record.site_id if record else None), params["robot_id"]
+            return _robot_site(params["robot_id"]), params["robot_id"]
+        if "clip_id" in params:
+            # A Speak clip belongs to the site of the robot it was uploaded
+            # for (its id starts with that robot's id). The robot is NOT
+            # returned: a mission's Speak step keeps its clip when the mission
+            # runs on another robot, so a device key must still fetch it.
+            robot_id = robot_of_clip(params["clip_id"])
+            return (_robot_site(robot_id) if robot_id else None), None
         if "run_id" in params:
             run = runs_router.store.get(params["run_id"])
             return (run.site_id, run.robot_id) if run else (None, None)

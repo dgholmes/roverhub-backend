@@ -137,6 +137,10 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("POST", "/robots/{robot_id}/audio-clips"): Rule(capabilities=("drive",)),
     ("GET", "/tts/capability"): _READ,
     ("POST", "/tts"): Rule(capabilities=("drive",)),
+    # Checked at the site of the robot the clip was uploaded for (its id
+    # names it: api/app.py _resolve_site), like any per-robot read; any
+    # device key may fetch it, as a mission's Speak step keeps its clip when
+    # the mission runs on another robot.
     ("GET", "/audio-clips/{clip_id}"): Rule(capabilities=("watchLive",), device=True),
 
     # Snapshots: taken by the bridge, browsed by people.
@@ -200,6 +204,9 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("GET", "/incidents/{incident_id}"): _READ,
     ("POST", "/incidents/{incident_id}/acknowledge"): Rule(capabilities=("estop", "drive", "getUp")),
     ("POST", "/incidents/{incident_id}/resolve"): Rule(capabilities=("estop", "drive", "getUp")),
+    # A robot the registry does not know is checked at the site of its newest
+    # stored sample (api/app.py _robot_site), and samples from sites the
+    # reader cannot see are left out (history/router.py).
     ("GET", "/robots/{robot_id}/history"): _READ,
     ("GET", "/audit"): Rule(capabilities=("override", "configure"), auditors=True),
     ("GET", "/history/status"): Rule(capabilities=("seeHealth",)),

@@ -111,9 +111,14 @@ def build_history_router(
 
     @router.get("/robots/{robot_id}/history", response_model=RobotHistory, response_model_by_alias=True)
     def robot_history(
-        robot_id: str, from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None,
+        robot_id: str, request: Request, from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None,
         max_points: int = Query(500, ge=1, le=MAX_POINTS_CAP),
     ):
+        # The guard has checked watchLive at the robot's site (the registry's,
+        # or its newest sample's when the registry does not know it: api/app.py
+        # _robot_site). Samples from sites the caller cannot see are left out
+        # as well, for a robot that has moved sites.
+        sites = visible_sites(request)
         store = _store()
         until = epoch(to) if to is not None else clock()
         since = epoch(from_) if from_ is not None else (until - DEFAULT_WINDOW_S if until is not None else None)
@@ -121,10 +126,10 @@ def build_history_router(
             raise HTTPException(status_code=400, detail="from and to must be ISO 8601 timestamps")
         if since >= until:
             raise HTTPException(status_code=400, detail="from must be before to")
-        if not robot_known(robot_id) and not store.has_samples(robot_id):
+        if not robot_known(robot_id) and not store.has_samples(robot_id, sites):
             raise HTTPException(status_code=404, detail="robot not found")
         return {"robot_id": robot_id, "from": iso(since), "to": iso(until),
-                "samples": store.history(robot_id, since, until, max_points)}
+                "samples": store.history(robot_id, since, until, max_points, sites=sites)}
 
     @router.get("/audit", response_model=AuditPage)
     def list_audit(
