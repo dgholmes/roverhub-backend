@@ -249,7 +249,7 @@ def test_files_the_layout_does_not_name_are_not_kept(tmp_path):
     store.save_bundle(bundle)
     kept = sorted(str(p.relative_to(tmp_path / "maps" / "map-venue")).replace("\\", "/")
                   for p in (tmp_path / "maps" / "map-venue").rglob("*") if p.is_file())
-    assert kept == ["floor0/grid.pgm", "floor0/grid.png", "map.json"]
+    assert kept == ["floor0/grid.pgm", "floor0/grid.png", "map.json", "version.json"]
 
 
 def test_the_cloud_limit_is_the_packers_expression():

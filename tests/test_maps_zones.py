@@ -58,7 +58,7 @@ def test_save_zones_leaves_the_rest_of_the_map_alone(store, tmp_path):
     assert after.model_copy(update={"zones": [], "floors": unhashed}) == before.model_copy(update={"floors": was})
     assert store.artifact_path("map-venue", 0, "grid") is not None
     assert sorted(os.listdir(tmp_path / "maps")) == ["map-venue"]
-    assert sorted(os.listdir(tmp_path / "maps" / "map-venue")) == ["floor0", "map.json"]
+    assert sorted(os.listdir(tmp_path / "maps" / "map-venue")) == ["floor0", "map.json", "version.json"]
 
 
 def test_save_zones_on_an_unknown_map_raises_map_not_found(store):
@@ -106,7 +106,7 @@ def test_a_failed_zone_write_leaves_the_old_map_and_no_scratch_file(store, tmp_p
         store.save_zones("map-venue", [zone("new")])
     monkeypatch.setattr(os, "replace", real)
     assert [z.zone_id for z in store.get("map-venue").zones] == ["old"]
-    assert sorted(os.listdir(tmp_path / "maps" / "map-venue")) == ["floor0", "map.json"]
+    assert sorted(os.listdir(tmp_path / "maps" / "map-venue")) == ["floor0", "map.json", "version.json"]
 
 
 def test_concurrent_zone_and_status_writes_do_not_lose_each_other(store):
@@ -257,7 +257,12 @@ def test_put_zones_refuses_a_non_finite_vertex(client, router):
 
 
 def test_put_status_freezes_a_map(client, router):
-    response = client.put("/maps/map-venue/status", json={"status": "active"})
+    # The fixture's 4 x 2 grid has no cloud or track, so its quality report
+    # fails (tests/test_maps_pipeline.py has the gate itself): freezing it
+    # takes a report and an override.
+    job = client.post("/maps/map-venue/quality").json()
+    assert router.jobs.wait(job["job_id"])["status"] == "succeeded"
+    response = client.put("/maps/map-venue/status", json={"status": "active", "override_quality": True})
     assert response.status_code == 200
     assert response.json()["status"] == "active"
     assert router.store.get("map-venue").status == "active"

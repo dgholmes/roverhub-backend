@@ -48,3 +48,9 @@ PyJWT>=2.8
 tzdata>=2024.1
 
 # Optional: boto3, only when RUNS_BUCKET is set (runs/bucket.py imports it lazily).
+
+# The map pipeline (maps/survey_math.py, maps/survey.py, maps/quality.py):
+# levelling a survey cloud, building its grid and the quality report. The same
+# one dependency as tools/map_prep (no Pillow, no scipy). Imported lazily, so
+# the service starts without it and only those jobs fail.
+numpy>=1.21

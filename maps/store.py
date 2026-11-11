@@ -13,7 +13,22 @@ A survey is packed into a *bundle* directory by tools/map_prep/pack_map.py:
 `save_bundle` takes such a directory and keeps it under `<root>/<map_id>/` as
 
     map.json            the validated SiteMap (floors joined in)
+    version.json        which version of this map's bundle this is (VERSIONS below)
+    quality.json        the quality report, once one has run (maps/quality.py)
     floor<N>/...        the artifacts, byte for byte
+    floor<N>/track.csv  the path the survey walked (t,x,y,z, level), optional
+    floor<N>/survey.json  how the server levelled and gridded it (maps/survey.py)
+    versions/v<K>/      earlier bundles, each laid out as above
+
+VERSIONS (tracker 1-5-06). Replacing a map's bundle -- a re-upload, a survey
+processed by maps/survey.py, or a restore -- keeps the bundle it replaces
+under versions/v<K>/ (hard links where the filesystem allows, so nothing is
+copied: every file here is replaced, never rewritten in place). The newest
+MAX_VERSIONS are kept. `restore_version` makes an old one current again under
+a new version number, so a restore can itself be undone. The zones carry over
+in both directions (they are the map's, not a survey's) and the map drops to
+draft, exactly as on a re-upload; the restored floors keep the planning grids
+they had, since those were made in that survey's frame.
 
 A floor's planning grid can also be set or removed on a stored map
 (`set_planning`, `delete_planning`): it is usually made after the survey, from
@@ -46,6 +61,8 @@ import re
 import shutil
 import tempfile
 import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, get_args
 
@@ -76,7 +93,7 @@ MAP_FILE = "map.json"
 # kind (as it appears in a URL) -> file name inside floor<N>/. The whole of what
 # a caller may ask for.
 ARTIFACT_FILES = {"grid": "grid.pgm", "preview": "grid.png", "cloud": "cloud.bin",
-                  "planning": "planning.pgm"}
+                  "planning": "planning.pgm", "track": "track.csv", "survey": "survey.json"}
 _REQUIRED = ("grid", "preview")
 PLANNING_FILE = ARTIFACT_FILES["planning"]
 
@@ -121,6 +138,17 @@ _SCRATCH_PREFIX = ".incoming-"
 UPLOAD_PREFIX = ".upload-"
 _DELETED_PREFIX = ".deleted-"
 _OLD_PREFIX = ".replaced-"
+
+VERSIONS_DIR = "versions"
+VERSION_FILE = "version.json"
+QUALITY_FILE = "quality.json"
+# Earlier bundles kept per map. A bundle is a few MB to a few tens of MB (the
+# grids and a cloud of at most 8 MiB per floor), so ten is room for a site's
+# re-surveys over months without a map directory growing past a gigabyte.
+MAX_VERSIONS = 10
+_VERSION_DIR_RE = re.compile(r"v([1-9][0-9]{0,8})")
+# A track is a few dozen bytes per pose at ~10 Hz: 8 MiB is hours of walking.
+MAX_TRACK_BYTES = 8 * 1024 * 1024
 
 
 class BundleError(ValueError):
@@ -256,6 +284,65 @@ class PlanningNotFound(MapNotFound):
     """The floor exists but has no planning grid. The message says so."""
 
 
+class VersionNotFound(MapNotFound):
+    """The map exists but keeps no version by that number. The message says so."""
+
+
+def _move_dir(source: Path, target: Path) -> None:
+    """os.replace for a map directory, retried briefly on PermissionError.
+
+    On Windows a directory cannot be renamed while any file in it is open, and
+    a background quality check (maps/quality.py) reads a map's files without
+    the store's lock. Its reads are short, so waiting out one is enough; a
+    handle held longer than ~2 s fails as before. Other errors are not retried."""
+    delay = 0.02
+    for attempt in range(12):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == 11:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.25)
+
+
+def _link_or_copy(source: Path, target: Path) -> None:
+    """Hard-link `source` at `target`, or copy it where links are refused (a
+    filesystem without them, another volume). Safe because the store never
+    rewrites a file in place: every write goes through a new file and
+    os.replace, so a link's other name keeps the old bytes."""
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copyfile(source, target)
+
+
+def _link_tree(source: Path, target: Path, skip=()) -> None:
+    """`source`'s files at `target`, recursively, by _link_or_copy. Names
+    starting with "." (a write in progress) and names in `skip` are left out."""
+    target.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        if child.name.startswith(".") or child.name in skip:
+            continue
+        if child.is_dir():
+            _link_tree(child, target / child.name)
+        elif child.is_file():
+            _link_or_copy(child, target / child.name)
+
+
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def valid_map_id(map_id: object) -> bool:
     return (isinstance(map_id, str) and bool(MAP_ID_RE.fullmatch(map_id))
             and not _WINDOWS_DEVICES.fullmatch(map_id))
@@ -351,7 +438,7 @@ class MapStore:
         return maps
 
     def artifact_path(self, map_id: str, floor: int, kind: str) -> Optional[Path]:
-        """The stored file for one floor's grid, preview or cloud, or None.
+        """The stored file for one floor's artifact (ARTIFACT_FILES), or None.
 
         Never raises for caller input: anything but a real map id, a
         non-negative integer floor and one of the three kinds is simply "no such
@@ -373,9 +460,13 @@ class MapStore:
 
     # --- writing -----------------------------------------------------------
 
-    def save_bundle(self, bundle_dir: Path) -> SiteMap:
+    def save_bundle(self, bundle_dir: Path, source: str = "upload",
+                    detail: Optional[dict] = None) -> SiteMap:
         """Validate a bundle directory and store it, replacing any map with the
         same id. Raises BundleError (and stores nothing) if it is unusable.
+
+        The bundle it replaces is kept as a version (VERSIONS above). `source`
+        ("upload", "survey") and `detail` are recorded in the new version.json.
 
         The new map is assembled in a scratch directory beside the store and
         moved into place with os.replace, so a reader sees the old map or the
@@ -396,8 +487,8 @@ class MapStore:
                 floor_dir = scratch / ("floor%d" % floor.index)
                 floor_dir.mkdir()
                 for kind, file_name in ARTIFACT_FILES.items():
-                    source = bundle_dir / ("floor%d" % floor.index) / file_name
-                    if not source.is_file():
+                    artifact = bundle_dir / ("floor%d" % floor.index) / file_name
+                    if not artifact.is_file():
                         if kind in _REQUIRED:
                             raise BundleError("floor %d has no %s" % (floor.index, file_name))
                         if kind == "planning" and floor.planning is not None:
@@ -407,14 +498,17 @@ class MapStore:
                     # The router refuses this on upload and on serving too; a
                     # direct caller (a seeding script) must not be able to store
                     # a map whose cloud can never be served.
-                    if kind == "cloud" and source.stat().st_size > MAX_CLOUD_BYTES:
+                    if kind == "cloud" and artifact.stat().st_size > MAX_CLOUD_BYTES:
                         raise BundleError("floor %d's cloud exceeds %d bytes" % (floor.index, MAX_CLOUD_BYTES))
+                    if kind in ("track", "survey") and artifact.stat().st_size > MAX_TRACK_BYTES:
+                        raise BundleError("floor %d's %s exceeds %d bytes"
+                                          % (floor.index, file_name, MAX_TRACK_BYTES))
                     if kind == "planning":
                         # Counted from the file, never taken from the manifest:
                         # only the clearance is the bundle's to say.
                         clearance = floor.planning.clearance_m if floor.planning else DEFAULT_CLEARANCE_M
-                        planning[floor.index] = planning_grid_for(floor, source.read_bytes(), clearance)
-                    shutil.copyfile(source, floor_dir / file_name)
+                        planning[floor.index] = planning_grid_for(floor, artifact.read_bytes(), clearance)
+                    shutil.copyfile(artifact, floor_dir / file_name)
             # A floor's planning grid is the bundle's or nothing. One stored on
             # the map being replaced is not carried over (unlike its zones): it
             # was made in the old survey's frame and says where the robot may
@@ -443,28 +537,252 @@ class MapStore:
                 # the bundle said is replaced.
                 site_map = with_content_hashes(scratch, site_map)
                 (scratch / MAP_FILE).write_text(site_map.model_dump_json(indent=2), encoding="utf-8")
-
-                aside = None
-                try:
-                    if directory.exists():
-                        aside = Path(tempfile.mkdtemp(dir=self.root, prefix=_OLD_PREFIX))
-                        os.replace(directory, aside / directory.name)
-                    os.replace(scratch, directory)
-                except BaseException:
-                    if aside is not None:
-                        if (aside / directory.name).exists():
-                            # Put the old map back. If even that fails it stays
-                            # in `aside`, which is not deleted, and the next
-                            # start of the store restores it.
-                            os.replace(aside / directory.name, directory)
-                        shutil.rmtree(aside, ignore_errors=True)
-                    raise
-                if aside is not None:
-                    shutil.rmtree(aside, ignore_errors=True)
+                version = self._carry_versions(directory, scratch)
+                self._write_version_file(scratch, {"version": version, "source": source,
+                                                   "created_at": _now(), **(detail or {})})
+                self._swap_in(directory, scratch)
         except BaseException:
             shutil.rmtree(scratch, ignore_errors=True)
             raise
         return site_map
+
+    def _swap_in(self, directory: Path, scratch: Path) -> None:
+        """Move `scratch` into place as `directory`. Call under the lock.
+
+        A directory cannot be renamed over a non-empty one, so an existing map
+        is first moved aside: for that instant the id reads as absent -- never
+        as half-replaced."""
+        aside = None
+        try:
+            if directory.exists():
+                aside = Path(tempfile.mkdtemp(dir=self.root, prefix=_OLD_PREFIX))
+                _move_dir(directory, aside / directory.name)
+            _move_dir(scratch, directory)
+        except BaseException:
+            if aside is not None:
+                if (aside / directory.name).exists():
+                    # Put the old map back. If even that fails it stays in
+                    # `aside`, which is not deleted, and the next start of
+                    # the store restores it.
+                    _move_dir(aside / directory.name, directory)
+                shutil.rmtree(aside, ignore_errors=True)
+            raise
+        if aside is not None:
+            shutil.rmtree(aside, ignore_errors=True)
+
+    # --- versions ------------------------------------------------------------
+
+    @staticmethod
+    def _write_version_file(directory: Path, doc: dict) -> None:
+        # A plain write: `directory` is a scratch directory nobody reads yet.
+        (directory / VERSION_FILE).write_text(json.dumps(doc, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _archived(directory: Path) -> Dict[int, Path]:
+        """version number -> its directory under versions/."""
+        found: Dict[int, Path] = {}
+        versions = directory / VERSIONS_DIR
+        if not versions.is_dir():
+            return found
+        for child in versions.iterdir():
+            match = _VERSION_DIR_RE.fullmatch(child.name)
+            if match and (child / MAP_FILE).is_file():
+                found[int(match.group(1))] = child
+        return found
+
+    def _current_version(self, directory: Path) -> int:
+        """The live bundle's version number. A map stored before versions
+        existed has no version.json and is version 1 (or one past the newest
+        archive, should there be one)."""
+        doc = _read_json(directory / VERSION_FILE) or {}
+        number = doc.get("version")
+        if isinstance(number, int) and not isinstance(number, bool) and number > 0:
+            return number
+        archived = self._archived(directory)
+        return max(archived) + 1 if archived else 1
+
+    def _carry_versions(self, directory: Path, scratch: Path) -> int:
+        """Under the lock, before `scratch` replaces `directory`: link the
+        archives `directory` keeps, and its live bundle as one more, into
+        `scratch/versions/`, keeping the newest MAX_VERSIONS. Returns the
+        number the new bundle gets: 1 for a map that is new."""
+        if not (directory / MAP_FILE).is_file():
+            return 1
+        archived = self._archived(directory)
+        current = self._current_version(directory)
+        target = scratch / VERSIONS_DIR
+        keep = sorted(set(archived) | {current})[-MAX_VERSIONS:]
+        for number in keep:
+            into = target / ("v%d" % number)
+            if number in archived:
+                _link_tree(archived[number], into)
+            else:
+                _link_tree(directory, into, skip=(VERSIONS_DIR,))
+                if not (into / VERSION_FILE).is_file():
+                    self._write_version_file(into, {"version": number, "source": "upload"})
+        return max(keep) + 1
+
+    def current_version(self, map_id: str) -> int:
+        """The live bundle's version number. Raises MapNotFound."""
+        directory = self._dir(map_id)
+        if directory is None or not (directory / MAP_FILE).is_file():
+            raise MapNotFound(map_id)
+        return self._current_version(directory)
+
+    def version_dir(self, map_id: str, version: int) -> Optional[Path]:
+        """The directory of an archived version, or None. Never raises for
+        caller input: the number is an int, so the name is built, not taken."""
+        directory = self._dir(map_id)
+        if directory is None or not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            return None
+        path = directory / VERSIONS_DIR / ("v%d" % version)
+        return path if (path / MAP_FILE).is_file() else None
+
+    def list_versions(self, map_id: str) -> List[dict]:
+        """The live bundle and every kept version, newest first. Raises MapNotFound."""
+        directory = self._dir(map_id)
+        current = self.get(map_id)
+        if directory is None or current is None:
+            raise MapNotFound(map_id)
+        entries = [self._version_entry(directory, current, self._current_version(directory), True)]
+        for number, path in sorted(self._archived(directory).items(), reverse=True):
+            try:
+                site_map = SiteMap.model_validate_json((path / MAP_FILE).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                logger.warning("skipping unreadable version %d of map %s: %s", number, map_id, exc)
+                continue
+            entries.append(self._version_entry(path, site_map, number, False))
+        return entries
+
+    @staticmethod
+    def _version_entry(path: Path, site_map: SiteMap, number: int, current: bool) -> dict:
+        doc = _read_json(path / VERSION_FILE) or {}
+        quality = _read_json(path / QUALITY_FILE)
+        return {
+            "version": number,
+            "current": current,
+            "source": doc.get("source", "upload"),
+            "created_at": doc.get("created_at") or site_map.updated_at,
+            "restored_from": doc.get("restored_from"),
+            "detail": {k: v for k, v in doc.items()
+                       if k not in ("version", "source", "created_at", "restored_from")},
+            "name": site_map.name,
+            "updated_at": site_map.updated_at,
+            "zones": len(site_map.zones),
+            "floors": [{"index": f.index, "size_cells": list(f.size_cells),
+                        "resolution_m": f.resolution_m, "origin_xy_m": list(f.origin_xy_m),
+                        "free_cells": f.free_cells, "occupied_cells": f.occupied_cells,
+                        "unknown_cells": f.unknown_cells, "has_planning": f.planning is not None,
+                        "has_track": (path / ("floor%d" % f.index) / ARTIFACT_FILES["track"]).is_file()}
+                       for f in site_map.floors],
+            "quality": None if quality is None else {
+                "passed": quality.get("passed"), "computed_at": quality.get("computed_at"),
+                "failed": quality.get("failed", [])},
+        }
+
+    def version_artifact_path(self, map_id: str, version: int, floor: int, kind: str) -> Optional[Path]:
+        """artifact_path for an archived version, with the same refusals."""
+        path = self.version_dir(map_id, version)
+        if path is None or not isinstance(floor, int) or isinstance(floor, bool) or floor < 0:
+            return None
+        file_name = ARTIFACT_FILES.get(kind) if isinstance(kind, str) else None
+        if file_name is None:
+            return None
+        found = path / ("floor%d" % floor) / file_name
+        return found if found.is_file() else None
+
+    def restore_version(self, map_id: str, version: int) -> SiteMap:
+        """Make archived `version` the live bundle again, under a new number.
+
+        Raises MapNotFound, or VersionNotFound when no such version is kept.
+        The live bundle is archived first, as a re-upload archives it. The map
+        keeps its current zones and creation date and drops to draft; the
+        restored floors keep their own planning grids (same frame). It has no
+        quality report until one runs on it: a report names the version it
+        was made for, so the archived one would only read as stale."""
+        directory = self._dir(map_id)
+        if directory is None:
+            raise MapNotFound(map_id)
+        with self._lock:
+            current = self.get(map_id)
+            if current is None:
+                raise MapNotFound(map_id)
+            source = self.version_dir(map_id, version)
+            if source is None:
+                raise VersionNotFound("map %s keeps no version %r" % (map_id, version))
+            try:
+                archived = SiteMap.model_validate_json((source / MAP_FILE).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise BundleError("version %d of map %s is unreadable: %s" % (version, map_id, exc)) from None
+            scratch = Path(tempfile.mkdtemp(dir=self.root, prefix=_SCRATCH_PREFIX))
+            try:
+                for floor in archived.floors:
+                    floor_source = source / ("floor%d" % floor.index)
+                    if not floor_source.is_dir():
+                        raise BundleError("version %d of map %s has no files for floor %d"
+                                          % (version, map_id, floor.index))
+                    floor_target = scratch / ("floor%d" % floor.index)
+                    floor_target.mkdir()
+                    for file_name in ARTIFACT_FILES.values():
+                        if (floor_source / file_name).is_file():
+                            _link_or_copy(floor_source / file_name, floor_target / file_name)
+                restored = archived.model_copy(update={
+                    "zones": current.zones, "status": "draft",
+                    "created_at": current.created_at, "updated_at": _now()})
+                restored = with_content_hashes(scratch, restored)
+                (scratch / MAP_FILE).write_text(restored.model_dump_json(indent=2), encoding="utf-8")
+                number = self._carry_versions(directory, scratch)
+                self._write_version_file(scratch, {"version": number, "source": "restore",
+                                                   "restored_from": version, "created_at": _now()})
+                self._swap_in(directory, scratch)
+            except BaseException:
+                shutil.rmtree(scratch, ignore_errors=True)
+                raise
+        return restored
+
+    # --- the quality report (maps/quality.py computes it) ------------------
+
+    def snapshot(self, map_id: str, kinds=("grid", "planning", "cloud", "track")
+                 ) -> Tuple[SiteMap, int, Dict[int, Dict[str, Optional[bytes]]]]:
+        """(map, version, {floor index: {kind: bytes or None}}), read under the
+        lock so that no write lands halfway through -- and so the reader never
+        holds a file open while a write renames it (Windows refuses that).
+        Raises MapNotFound. A few tens of MB at most per floor."""
+        directory = self._dir(map_id)
+        if directory is None:
+            raise MapNotFound(map_id)
+        with self._lock:
+            site_map = self.get(map_id)
+            if site_map is None:
+                raise MapNotFound(map_id)
+            files: Dict[int, Dict[str, Optional[bytes]]] = {}
+            for floor in site_map.floors:
+                floor_dir = directory / ("floor%d" % floor.index)
+                files[floor.index] = {}
+                for kind in kinds:
+                    path = floor_dir / ARTIFACT_FILES[kind]
+                    files[floor.index][kind] = path.read_bytes() if path.is_file() else None
+            return site_map, self._current_version(directory), files
+
+    def read_quality(self, map_id: str) -> Optional[dict]:
+        directory = self._dir(map_id)
+        return None if directory is None else _read_json(directory / QUALITY_FILE)
+
+    def write_quality(self, map_id: str, report: dict, expect_version: Optional[int] = None) -> bool:
+        """Store `report` as the map's quality report. False (nothing written)
+        when the map is gone or, given `expect_version`, has had its bundle
+        replaced since the report started: a report on the old bundle must not
+        land on the new one."""
+        directory = self._dir(map_id)
+        if directory is None:
+            raise MapNotFound(map_id)
+        with self._lock:
+            if not (directory / MAP_FILE).is_file():
+                return False
+            if expect_version is not None and self._current_version(directory) != expect_version:
+                return False
+            _atomic_write(directory / QUALITY_FILE, json.dumps(report, indent=2).encode("utf-8"))
+        return True
 
     # --- curating ------------------------------------------------------------
 
@@ -631,7 +949,7 @@ class MapStore:
             # Move out of the namespace first, so a half-deleted map is never
             # visible, then remove.
             aside = Path(tempfile.mkdtemp(dir=self.root, prefix=_DELETED_PREFIX))
-            os.replace(directory, aside / directory.name)
+            _move_dir(directory, aside / directory.name)
         shutil.rmtree(aside, ignore_errors=True)
         return True
 

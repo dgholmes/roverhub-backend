@@ -276,7 +276,7 @@ def test_a_part_that_is_not_a_file_is_a_400(client, tmp_path):
 
 def test_every_maps_route_has_an_auth_policy_rule(router):
     routes = [(m, r.path) for r in router.routes if isinstance(r, APIRoute) for m in r.methods]
-    assert len(routes) == 10
+    assert len(routes) == 18
     for key in routes:
         assert key in ROUTES, key
 

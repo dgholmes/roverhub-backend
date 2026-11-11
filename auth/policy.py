@@ -179,6 +179,23 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("DELETE", "/maps/{map_id}/floors/{index}/planning"): Rule(capabilities=("editZones",)),
     ("PUT", "/maps/{map_id}/status"): Rule(capabilities=("editZones",)),
     ("DELETE", "/maps/{map_id}"): Rule(capabilities=("configure",)),
+    # The survey pipeline (maps/survey.py, maps/jobs.py). A survey upload and a
+    # version restore replace the map's bundle, as an upload does, so they are
+    # site configuration. The quality report is read like the map; running it
+    # changes nothing a robot uses, so the engineer who uploads and the
+    # supervisor who reviews may both start one. Freezing a map whose report
+    # failed is PUT status above plus `override` at the map's site, checked in
+    # the handler (maps/router.py _quality_gate) because only the body says so.
+    # A job's site is in its record, not its path: the handlers hide jobs at
+    # sites the caller cannot see.
+    ("POST", "/map-surveys"): Rule(capabilities=("configure",)),
+    ("GET", "/map-jobs"): _READ,
+    ("GET", "/map-jobs/{job_id}"): _READ,
+    ("GET", "/maps/{map_id}/quality"): _READ,
+    ("POST", "/maps/{map_id}/quality"): Rule(capabilities=("editZones", "configure")),
+    ("GET", "/maps/{map_id}/versions"): _READ,
+    ("GET", "/maps/{map_id}/versions/{version}/floors/{index}/{kind}"): _READ,
+    ("POST", "/maps/{map_id}/versions/{version}/restore"): Rule(capabilities=("configure",)),
 
     # Runs
     ("POST", "/robots/{robot_id}/runs"): Rule(capabilities=("dispatchPatrols",)),
