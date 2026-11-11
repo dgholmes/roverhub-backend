@@ -88,6 +88,8 @@ R_OFF_GRID = ("waypoint {waypoint} is outside the surveyed area of the map {map_
               "move it onto the map in the mission editor")
 R_NO_GO = ("waypoint {waypoint} is in or within {margin:g} m of the no-go zone {zone}; "
            "move it further out in the mission editor")
+R_IN_STAIRS = ("waypoint {waypoint} is on or within {margin:g} m of the stairs {zone}, which only a Stairs "
+               "step may cross; move it onto a landing in the mission editor")
 R_OUTSIDE = ("waypoint {waypoint} is outside the site boundary {zone}, or within {margin:g} m of its edge; "
              "move it inside in the mission editor")
 R_ACTION = ("the {action} action at waypoint {waypoint} cannot run on the robot yet; "
@@ -193,6 +195,12 @@ def _zone_refusal(waypoint: Waypoint, zones: List[MapZone]) -> Optional[str]:
         if zone.kind == "no_go" and (
                 _edge_distance(x, y, zone.polygon) <= ZONE_MARGIN_M or _inside(x, y, zone.polygon)):
             return R_NO_GO.format(waypoint=_name(waypoint), margin=ZONE_MARGIN_M, zone=_zone_name(zone))
+    for zone in zones:
+        # A flight of stairs (0.0.21): the bridge refuses a goal on one
+        # (REJECTED_NAV_GOAL_IN_STAIRS_ZONE) with the same margin.
+        if zone.kind == "stairs" and (
+                _edge_distance(x, y, zone.polygon) <= ZONE_MARGIN_M or _inside(x, y, zone.polygon)):
+            return R_IN_STAIRS.format(waypoint=_name(waypoint), margin=ZONE_MARGIN_M, zone=_zone_name(zone))
     fences = [z for z in zones if z.kind == "geofence"]
     if fences and not any(
             0.0 < _edge_distance(x, y, z.polygon) and _edge_distance(x, y, z.polygon) >= ZONE_MARGIN_M

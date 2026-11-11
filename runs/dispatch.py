@@ -14,7 +14,9 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 from control.commands import CommandStore
+from missions import stairs_checks
 from missions.route_steps import RouteNotRunnable, compile_route
+from missions.stairs_checks import STAIRS_SCHEMA_VERSION, StairsNotRunnable
 from realtime.mqtt_client import CommandPublishError, UnknownRobotError, _parse_version
 from robots.registry import RobotRegistry
 from runs import occurrences
@@ -153,6 +155,7 @@ class RunDispatcher:
                 # Only the route compiler makes these: a browser-built walk is
                 # untrusted input with no map check behind it.
                 raise StartRefused(R_PROGRAM_NAVIGATES)
+            self._check_stairs(robot, mission, steps)
             return steps, max_duration_s
         if steps:
             raise StartRefused(R_ROUTE_WITH_STEPS, 422)
@@ -186,6 +189,34 @@ class RunDispatcher:
                         robot_id=robot.robot_id, map_name=site_map.name, floor=goal.floor_id,
                         robot_hash=robot_hash[:12], map_hash=goal.map_hash[:12]))
         return compiled.steps, max_duration_s if max_duration_s is not None else compiled.cap_s
+
+    def _check_stairs(self, robot, mission: MissionLibraryEntry, steps: List[ProgramStep]) -> None:
+        """A program's Stairs steps (0.0.21), as missions/stairs_checks.py says.
+        The steps checked are the ones being sent (the caller's, or the stored
+        compile's), never only the stored ones. Raises StartRefused."""
+        flights = list(stairs_checks.stairs_steps(steps))
+        if not flights:
+            return
+        try:
+            stairs_checks.check_allowed(mission, flights)
+            if robot.robot_type != "quad":
+                # Leg configuration is read on point-foot quads only; a wheel
+                # robot's legs are always "unknown", which the step refuses.
+                raise StairsNotRunnable(stairs_checks.R_STAIRS_NOT_QUAD.format(
+                    robot_type=robot.robot_type or "unknown"))
+            version = _parse_version(robot.schema_version)
+            if version is None or version < _parse_version(STAIRS_SCHEMA_VERSION):
+                raise StairsNotRunnable(stairs_checks.R_STAIRS_SCHEMA.format(
+                    version=robot.schema_version or "unknown"))
+            site_map = stairs_checks.check_map(
+                self._map_lookup(mission.map_id) if self._map_lookup is not None else None, mission.map_id)
+            stairs_checks.check_zones(flights, site_map)
+            stairs_checks.check_landings(flights, site_map)
+            if robot.nav_map_id is not None and robot.nav_map_id != site_map.map_id:
+                raise StairsNotRunnable(stairs_checks.R_STAIRS_NAV_MAP.format(
+                    robot_id=robot.robot_id, robot_map=robot.nav_map_id, map_name=site_map.name))
+        except StairsNotRunnable as refused:
+            raise StartRefused(refused.message) from refused
 
     def _is_running(self, robot, robot_id: str, exclude_run_id: Optional[str]) -> bool:
         # registry.active_run is the live truth for bridge runs. A stored run

@@ -216,6 +216,8 @@ app.include_router(build_missions_router(
     missions_dir=os.environ.get("MISSIONS_DIR", DEFAULT_MISSIONS_DIR),
     tasks_dir=_tasks_dir,
     audit=history.audit.record,
+    # A Stairs step is checked against its stairs zone on the mission's map.
+    map_lookup=maps_router.store.get,
 ))
 # Mission run records: one folder per run (run-records spec §6). See runs/.
 # The copier shares the router's own RunStore so its per-run locks coordinate

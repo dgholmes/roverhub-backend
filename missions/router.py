@@ -19,7 +19,9 @@ Endpoints:
 - GET    /missions[?site_id=]  -> {"items": [entry, ...]}, newest updated_at first
 - GET    /missions/{id}        -> entry, 404 if unknown
 - PUT    /missions/{id}        -> create or replace; server stamps updated_at and
-                                  version; 409 (with the stored entry) on a stale version
+                                  version; 409 (with the stored entry) on a stale version;
+                                  422 for a program whose Stairs steps cannot run (0.0.21,
+                                  missions/stairs_checks.py)
 - DELETE /missions/{id}        -> 204, 404 if unknown; also deletes the mission's tasks and
                                   their unstarted occurrences (history is kept) and logs it
 """
@@ -41,6 +43,8 @@ from pydantic import ValidationError
 from api.common import now_iso, read_bounded_body
 from auth.deps import acting_user_id, require_site_capability, site_visible
 from history.audit import AuditFn
+from missions import stairs_checks
+from shared.schemas.maps import SiteMap
 from shared.schemas.missions import MissionLibraryEntry
 from tasks.store import TaskStore
 
@@ -150,6 +154,7 @@ def build_missions_router(
     clock: Callable[[], str] = now_iso,
     tasks_dir: Optional[str] = None,
     audit: Optional[AuditFn] = None,
+    map_lookup: Optional[Callable[[str], Optional[SiteMap]]] = None,
 ) -> APIRouter:
     """`clock` returns the UTC ISO string stamped into `updated_at`; injectable
     so ordering is testable. `audit` (history/audit.py AuditRecorder.record)
@@ -158,7 +163,12 @@ def build_missions_router(
     `tasks_dir` is where deleting a mission also deletes its tasks. It is
     deliberately not defaulted to the real tasks directory: a router built over a
     temp missions directory (every test) must never reach into `data/tasks`.
-    api/app.py passes it; with None, a delete touches the mission only."""
+    api/app.py passes it; with None, a delete touches the mission only.
+
+    `map_lookup` (map_id -> SiteMap or None, the maps router's store.get) lets a
+    save check that a program's Stairs steps name stairs zones on its map. With
+    None -- and for a map the store does not have -- only Stairs allowed is
+    checked on save; the run's start checks the rest (runs/dispatch.py)."""
     router = APIRouter()
     store = MissionStore(missions_dir)
     task_store = TaskStore(tasks_dir) if tasks_dir is not None else None
@@ -166,6 +176,20 @@ def build_missions_router(
     def _audit(action: str, mission_id: str, site_id: Optional[str], detail: dict) -> None:
         if audit is not None:
             audit(action, mission_id, "ok", detail, site_id=site_id)
+
+    def _check_stairs(entry: MissionLibraryEntry) -> None:
+        """A program that climbs (0.0.21) must allow stairs, and name stairs
+        zones on its map when the map is known. 422 with the sentence."""
+        flights = stairs_checks.program_stairs(entry)
+        if not flights:
+            return
+        try:
+            stairs_checks.check_allowed(entry, flights)
+            site_map = map_lookup(entry.map_id) if map_lookup is not None else None
+            if site_map is not None:
+                stairs_checks.check_zones(flights, site_map)
+        except stairs_checks.StairsNotRunnable as refused:
+            raise HTTPException(status_code=422, detail=refused.message) from None
 
     @router.get("/missions")
     def list_missions(request: Request, site_id: Optional[str] = None):
@@ -194,6 +218,7 @@ def build_missions_router(
             ) from None
         if entry.mission_id != mission_id:
             raise HTTPException(status_code=400, detail="body mission_id does not match the path")
+        _check_stairs(entry)
         # The guard checked the stored mission's site; this is the body's, so a
         # create or a move lands only where the caller may plan.
         require_site_capability(request, entry.site_id, ("planPatrols",))
