@@ -15,7 +15,21 @@ def test_healthz_returns_ok():
     client = TestClient(app)
     response = client.get("/healthz")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json()["status"] == "ok"
+
+
+def test_healthz_carries_the_server_time_for_edge_clock_sync():
+    """Edge bridges anchor their timestamps to this (robot_bridge/clock.py):
+    the Jetson has no RTC battery and boots with a stale clock."""
+    import time
+
+    from fastapi.testclient import TestClient
+
+    before = time.time() * 1000
+    body = TestClient(app).get("/healthz").json()
+    after = time.time() * 1000
+    assert isinstance(body["server_time_ms"], int)
+    assert before - 1 <= body["server_time_ms"] <= after + 1
 
 
 def test_robots_endpoint_lists_registered_robots():

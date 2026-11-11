@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -328,4 +329,6 @@ async def _on_shutdown() -> None:
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    # server_time_ms: edge bridges stamp their messages from this clock rather
+    # than their own, which can boot minutes wrong (robot_bridge/clock.py).
+    return {"status": "ok", "server_time_ms": int(time.time() * 1000)}
