@@ -41,7 +41,8 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional
+import logging
+from typing import Callable, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ValidationError
@@ -55,6 +56,8 @@ from shared.schemas.maps import MapStatus, MapZone, SiteMap
 from .store import (
     DEFAULT_MAPS_DIR, MAX_CLOUD_BYTES, UPLOAD_PREFIX, BundleError, MapNotFound, MapStore,
 )
+
+logger = logging.getLogger("roverhub.maps")
 
 # Per-part limits. A cloud's is the packer's own figure (see store.MAX_CLOUD_BYTES).
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -92,7 +95,9 @@ def _limit_for(name: str) -> int:
 
 
 def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
-                      max_upload_bytes: int = MAX_UPLOAD_BYTES) -> APIRouter:
+                      max_upload_bytes: int = MAX_UPLOAD_BYTES,
+                      on_status: Optional[Callable[[SiteMap], None]] = None) -> APIRouter:
+    """`on_status(map)` after a status change is stored (the audit log)."""
     router = APIRouter()
     store = MapStore(maps_dir)
     router.store = store  # type: ignore[attr-defined]  # tests and the app share it
@@ -204,7 +209,13 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
 
     @router.put("/maps/{map_id}/status")
     def put_status(map_id: str, body: _StatusBody):
-        return _curate(lambda: store.set_status(map_id, body.status))
+        result = _curate(lambda: store.set_status(map_id, body.status))
+        if on_status is not None:
+            try:
+                on_status(store.get(map_id))
+            except Exception:
+                logger.exception("the map status observer failed for %s", map_id)
+        return result
 
     @router.delete("/maps/{map_id}", status_code=204)
     def delete_map(map_id: str):

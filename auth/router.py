@@ -1,15 +1,18 @@
 """Sign-in, the user's own account, and user management."""
 from __future__ import annotations
 
+import logging
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from .deps import DEV_USER_ID, SESSION_COOKIE, Auth, principal_of
 from .users import ALL_SITES, OrgRole, PasswordTooShort, SiteRole
+
+logger = logging.getLogger("roverhub.auth")
 
 
 class LoginRequest(BaseModel):
@@ -79,7 +82,11 @@ def _dev_user() -> dict:
             "disabled": False}
 
 
-def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None) -> APIRouter:
+def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
+                      on_login: Optional[Callable[[str, bool, Optional[str]], None]] = None) -> APIRouter:
+    """`on_login(username, ok, user_id)` after each checked attempt (the audit
+    log). Never told the password; a throttled attempt is not checked, so not
+    reported."""
     router = APIRouter()
     throttle = throttle or LoginThrottle()
 
@@ -92,6 +99,14 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None) -> A
         _set_cookie(response, token, max(0, expires_at - int(time.time())))
         return {"access_token": token, "token_type": "bearer", "expires_at": expires_at,
                 "user": user.public()}
+
+    def _report(name: str, ok: bool, user_id: Optional[str]) -> None:
+        if on_login is None:
+            return
+        try:
+            on_login(name, ok, user_id)
+        except Exception:
+            logger.exception("the sign-in observer failed")
 
     @router.get("/auth/config")
     def config():
@@ -110,8 +125,10 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None) -> A
         user = auth.users.check_credentials(name, body.password)
         if user is None:
             throttle.failed(name)
+            _report(name, False, None)
             raise HTTPException(status_code=401, detail="wrong username or password")
         throttle.succeeded(name)
+        _report(name, True, user.user_id)
         auth.users.record_login(user.user_id)
         return _session(response, auth.users.get(user.user_id))
 

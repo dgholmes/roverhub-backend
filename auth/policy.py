@@ -176,6 +176,20 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("PUT", "/runs/{run_id}/files/{rel:path}"): Rule(capabilities=("dispatchPatrols",), device=True),
     ("GET", "/runs/{run_id}/files/{rel:path}"): _READ,
     ("GET", "/runs/{run_id}/zip"): _READ,
+
+    # History (history/router.py). Everyone who can see a site may read its
+    # incidents and a robot's history. Answering an incident -- acknowledge,
+    # resolve -- is for the people who act on robots there: the same floor as
+    # sending a command (estop, drive, getUp), so a watch-only viewer cannot.
+    # The audit log is for those who run the site: supervisors (`override`)
+    # and engineers (`configure`). The store's status is fleet health.
+    ("GET", "/incidents"): _READ,
+    ("GET", "/incidents/{incident_id}"): _READ,
+    ("POST", "/incidents/{incident_id}/acknowledge"): Rule(capabilities=("estop", "drive", "getUp")),
+    ("POST", "/incidents/{incident_id}/resolve"): Rule(capabilities=("estop", "drive", "getUp")),
+    ("GET", "/robots/{robot_id}/history"): _READ,
+    ("GET", "/audit"): Rule(capabilities=("override", "configure")),
+    ("GET", "/history/status"): Rule(capabilities=("seeHealth",)),
 }
 
 # HEAD follows GET wherever GET is allowed (browsers probe media with it).

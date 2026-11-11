@@ -355,3 +355,57 @@ def test_unknown_form_fields_are_ignored(tmp_path):
     client = _library(tmp_path)
     _upload(client, camera="front", some_future_field="x")
     assert client.get("/snapshots").json()["items"][0]["camera"] == "front"
+
+
+# -- evidence for an incident (history, 2026-11-11) ----------------------------
+
+def _evidence_client(tmp_path):
+    app = FastAPI()
+    router = build_snapshot_router(snapshots_dir=str(tmp_path))
+    app.include_router(router)
+    return TestClient(app), router
+
+
+def test_an_upload_that_names_its_incident_is_linked_to_it(tmp_path):
+    client, router = _evidence_client(tmp_path)
+    response = client.post("/robots/rover-a/snapshots", data={"incident_id": "rover-a-0123abcd"},
+                           files={"file": ("evidence.jpg", JPEG, "image/jpeg")})
+    snapshot_id = response.json()["snapshot_id"]
+
+    assert router.index.for_incident("rover-a-0123abcd") == [snapshot_id]
+    listed = client.get("/snapshots").json()["items"][0]
+    assert listed["incident_id"] == "rover-a-0123abcd"
+
+
+def test_the_link_survives_a_restart_and_old_records_have_none(tmp_path):
+    client, _ = _evidence_client(tmp_path)
+    client.post("/robots/rover-a/snapshots", data={"incident_id": "rover-a-inc-1"},
+                files={"file": ("e.jpg", JPEG, "image/jpeg")})
+    client.post("/robots/rover-a/snapshots", files={"file": ("f.jpg", JPEG, "image/jpeg")})
+    _, rebuilt = _evidence_client(tmp_path)
+    assert len(rebuilt.index.for_incident("rover-a-inc-1")) == 1
+    items = TestClient(_app_for(tmp_path)).get("/snapshots").json()["items"]
+    assert sorted(str(i.get("incident_id")) for i in items) == ["None", "rover-a-inc-1"]
+
+
+def _app_for(tmp_path):
+    app = FastAPI()
+    app.include_router(build_snapshot_router(snapshots_dir=str(tmp_path)))
+    return app
+
+
+def test_an_incident_id_that_could_not_be_one_is_refused(tmp_path):
+    client, _ = _evidence_client(tmp_path)
+    response = client.post("/robots/rover-a/snapshots", data={"incident_id": "../../etc"},
+                           files={"file": ("e.jpg", JPEG, "image/jpeg")})
+    assert response.status_code == 400
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_robot_cannot_attach_evidence_to_another_robots_incident(tmp_path):
+    client, _ = _evidence_client(tmp_path)
+    response = client.post("/robots/rover-a/snapshots", data={"incident_id": "rover-b-0123abcd"},
+                           files={"file": ("e.jpg", JPEG, "image/jpeg")})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "incident_id must be one of rover-a's incidents (rover-a-...)"
+    assert list(tmp_path.iterdir()) == []

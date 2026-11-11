@@ -6,16 +6,19 @@ import os
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from auth.deps import Auth
+from auth.deps import Auth, principal_of
 from auth.mqtt_hooks import build_mqtt_hooks_router
 from auth.router import build_auth_router
 from control.commands import CommandStore
 from control.media import DEFAULT_AUDIO_CLIPS_DIR, MAX_AUDIO_CLIP_BYTES, ContentLengthLimitMiddleware, build_media_router
 from control.snapshots import DEFAULT_SNAPSHOTS_DIR, build_snapshot_router
 from control.router import build_router
+from history.audit import bind_actor
+from history.router import build_history_router
+from history.service import History
 from maps.router import DEFAULT_MAPS_DIR, build_maps_router
 from missions.router import DEFAULT_MISSIONS_DIR, MissionStore, build_missions_router
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
@@ -51,6 +54,11 @@ registry = RobotRegistry(
     offline_after_s=offline_after_s_from_env(),
 )
 command_store = CommandStore()
+# The backend's memory (history/): incidents, decimated telemetry, perception
+# status and the audit log. SQLite at HISTORY_DB by default, Postgres when
+# DATABASE_URL says so. Never stops the backend from starting: if it cannot
+# open, its routes answer 503 with the reason and nothing is recorded.
+history = History.from_env()
 _reconcile_hook = None  # bound below, once the run and task stores exist
 orphan_settler = None  # bound below, once the run and task stores exist
 
@@ -70,6 +78,7 @@ _run_dispatcher = None  # bound below, once the run store exists
 
 def _on_ack(command):
     command_store.apply_ack(command)
+    history.audit.command_acked(command)  # the final outcome, once; never raises
     # A START_MISSION the bridge refused fails its run (runs/dispatch.py). Kept
     # apart from apply_ack so a dispatcher error cannot lose the ack itself.
     if _run_dispatcher is not None:
@@ -82,6 +91,9 @@ def _on_ack(command):
 mqtt_client = BackendMqttClient(
     os.environ.get("CLOUD_MQTT_URL", "mqtt://localhost:1883"), registry, real_mqtt_client_factory,
     on_ack=_on_ack, on_state=_on_state,
+    # Every message history stores, queued on paho's thread; and every command
+    # this backend sends, for the audit log (realtime/mqtt_client.py).
+    on_observed=history.observe, on_published=history.audit.command_published,
 )
 
 
@@ -101,6 +113,9 @@ def _resolve_site(params):
         if "mission_id" in params:
             mission = _scheduler_missions.get(params["mission_id"])
             return (getattr(mission, "site_id", None) if mission else None), None
+        if "incident_id" in params and history.available:
+            found = history.store.site_of_incident(params["incident_id"])
+            return found if found else (None, None)
     except NameError:
         pass  # a request during startup, before the stores exist
     return None, None
@@ -110,8 +125,19 @@ def _resolve_site(params):
 # dependency, so every route -- including ones added later -- is checked
 # against auth/policy.py, and a route with no rule there is refused.
 auth = Auth.from_env(resolve_site=_resolve_site)
-app = FastAPI(title="RoverHub Backend (dev)", dependencies=[Depends(auth.guard)])
-app.include_router(build_auth_router(auth))
+
+
+async def _bind_audit_actor(request: Request) -> None:
+    """Who the audit log names for anything this request causes: the principal
+    the guard just identified (`operator-dev` with sign-in off), never a name
+    from the body. Bound for this request only (history/audit.py)."""
+    principal = principal_of(request)
+    bind_actor(principal.id if principal is not None else None)
+
+
+app = FastAPI(title="RoverHub Backend (dev)",
+              dependencies=[Depends(auth.guard), Depends(_bind_audit_actor)])
+app.include_router(build_auth_router(auth, on_login=history.audit.login))
 app.include_router(build_mqtt_hooks_router(auth))
 app.include_router(build_router(command_store, mqtt_client, registry=registry))
 app.include_router(build_robots_router(registry))
@@ -124,16 +150,20 @@ def _site_for(robot_id: str):
     return record.site_id if record else None
 
 
-app.include_router(build_snapshot_router(
+snapshots_router = build_snapshot_router(
     snapshots_dir=os.environ.get("SNAPSHOTS_DIR", DEFAULT_SNAPSHOTS_DIR),
     site_lookup=_site_for,
-))
+)
+app.include_router(snapshots_router)
 # Site maps: a surveyed floor plan packed by tools/map_prep/pack_map.py, kept as
 # one directory per map. See maps/.
 # The dispatcher reads maps through this router's own store (a route is compiled
 # against its map when a run starts), so there is one MapStore per process: it
 # assumes it owns its directory.
-maps_router = build_maps_router(maps_dir=os.environ.get("MAPS_DIR", DEFAULT_MAPS_DIR))
+maps_router = build_maps_router(
+    maps_dir=os.environ.get("MAPS_DIR", DEFAULT_MAPS_DIR),
+    on_status=lambda m: history.audit.map_status(m.map_id, m.status, m.site_id) if m is not None else None,
+)
 app.include_router(maps_router)
 _tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)
 # Missions authored in the console, stored as one JSON file each so they
@@ -154,7 +184,15 @@ runs_router = build_runs_router(
     on_run_ended=lambda run: _run_ended(run) if _run_ended else None,
 )
 _copier = bucket_from_env(runs_router.store)
+# Every start and end of a run is a write of its record: the audit log's hook.
+runs_router.store.observer = history.audit.run_changed
 app.include_router(runs_router)
+# Incidents, a robot's history, the audit log (history/router.py). Evidence is
+# linked by the snapshot library's own records of which incident an upload named.
+app.include_router(build_history_router(
+    history, evidence_for=snapshots_router.index.for_incident,
+    robot_known=lambda robot_id: registry.get(robot_id) is not None,
+))
 # Mission tasks (a mission assigned to a robot on a schedule) and the occurrence
 # queue the scheduler materialises from them. See tasks/router.py.
 
@@ -324,6 +362,7 @@ async def _on_startup() -> None:
     except Exception:
         # A bad record must not keep the backend (and E-Stop) from starting.
         logger.exception("could not settle what the previous process left in flight")
+    history.start()
     mqtt_client.connect()
     app.state.run_watch_task = asyncio.create_task(_run_watchdog())
     if _scheduler_enabled():
@@ -361,6 +400,8 @@ async def _on_shutdown() -> None:
             app.state.scheduler_task = None  # a later startup (or a test) must not see a stale one
     finally:
         mqtt_client.disconnect()
+        # After MQTT, so nothing more arrives; flushes what is queued, bounded.
+        await asyncio.to_thread(history.stop, 2.0)
 
 
 @app.get("/healthz")

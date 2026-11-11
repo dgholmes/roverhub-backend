@@ -12,7 +12,7 @@ import re
 import tempfile
 import threading
 from pathlib import Path
-from typing import AsyncIterator, Iterable, List, Optional
+from typing import AsyncIterator, Callable, Iterable, List, Optional
 
 from fastapi import HTTPException
 
@@ -57,6 +57,10 @@ class RunStore:
         os.makedirs(runs_dir, exist_ok=True)
         self._locks: dict = {}
         self._locks_guard = threading.Lock()
+        # (previous, run) after every put: previous is None for a new run. Every
+        # path that starts or ends a run writes it here, so the audit log hangs
+        # off this (api/app.py). Must not raise; it is contained if it does.
+        self.observer: Optional[Callable[[Optional[MissionRun], MissionRun], None]] = None
 
     def lock(self, run_id: str) -> threading.RLock:
         """Per-run lock. Endpoints are sync, so FastAPI runs them on a threadpool;
@@ -88,8 +92,14 @@ class RunStore:
     def put(self, run: MissionRun) -> None:
         directory = self.run_dir(run.run_id)
         with self.lock(run.run_id):
+            previous = self.get(run.run_id) if self.observer is not None else None
             os.makedirs(directory, exist_ok=True)
             _atomic_write(os.path.join(directory, RUN_FILE), run.model_dump_json(indent=2))
+        if self.observer is not None:
+            try:
+                self.observer(previous, run)
+            except Exception:
+                logger.exception("the run observer failed for %s", run.run_id)
 
     def list(self, site_id=None, robot_id=None, mission_id=None, since=None) -> List[MissionRun]:
         runs = []

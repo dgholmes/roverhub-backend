@@ -102,6 +102,12 @@ _ID_SUFFIX_LEN = 1 + 36 + len(".jpg")
 # so it is allowlisted rather than trusted.
 CAMERA_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
+# The incident an evidence image belongs to (perception's upload, 2026-11-11):
+# the same character set perception uses for its evidence folders, and it must
+# start with "<robot_id>-" -- perception makes every id that way -- so one robot
+# cannot attach images to another robot's incidents.
+INCIDENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+
 # A RobotPosition serialises to ~250 bytes; anything far beyond that is not one.
 MAX_POSITION_CHARS = 4096
 
@@ -149,8 +155,8 @@ def _parse_position(raw: Optional[str], robot_id: str) -> Optional[dict]:
 
 
 def _metadata(*, snapshot_id, robot_id, site_id, camera, captured_at, received_at, size_bytes,
-              position=None) -> dict:
-    return {
+              position=None, incident_id=None) -> dict:
+    entry = {
         "snapshot_id": snapshot_id,
         "robot_id": robot_id,
         "site_id": site_id,
@@ -162,6 +168,12 @@ def _metadata(*, snapshot_id, robot_id, site_id, camera, captured_at, received_a
         # when the bridge predates position reporting or sent nothing usable.
         "position": position,
     }
+    # The incident this image is evidence for, only when the upload named one,
+    # so every other record (and every sidecar written before 2026-11-11) reads
+    # exactly as it did.
+    if incident_id is not None:
+        entry["incident_id"] = incident_id
+    return entry
 
 
 class SnapshotIndex:
@@ -233,6 +245,13 @@ class SnapshotIndex:
         with self._lock:
             self._entries[entry["snapshot_id"]] = entry
 
+    def for_incident(self, incident_id: str) -> List[str]:
+        """Snapshot ids whose upload named this incident, oldest first."""
+        with self._lock:
+            entries = [e for e in self._entries.values() if e.get("incident_id") == incident_id]
+        entries.sort(key=lambda e: (_parse_iso(e["received_at"]), e["snapshot_id"]))
+        return [e["snapshot_id"] for e in entries]
+
     def query(self, robot_id=None, site_id=None, since=None, until=None) -> List[dict]:
         with self._lock:
             entries = list(self._entries.values())
@@ -264,6 +283,7 @@ def build_snapshot_router(
     router = APIRouter()
     os.makedirs(snapshots_dir, exist_ok=True)
     index = SnapshotIndex(snapshots_dir)
+    router.index = index  # type: ignore[attr-defined]  # incidents read their evidence links from it
 
     @router.post("/robots/{robot_id}/snapshots")
     async def upload_snapshot(
@@ -272,9 +292,18 @@ def build_snapshot_router(
         camera: Optional[str] = Form(None),
         captured_at: Optional[str] = Form(None),
         position: Optional[str] = Form(None),
+        incident_id: Optional[str] = Form(None),
     ):
         if not ROBOT_ID_RE.match(robot_id):
             raise HTTPException(status_code=400, detail="robot_id contains invalid characters")
+        if incident_id is not None and incident_id != "":
+            if not INCIDENT_ID_RE.match(incident_id):
+                raise HTTPException(status_code=400, detail="incident_id contains invalid characters")
+            if not incident_id.startswith(f"{robot_id}-"):
+                raise HTTPException(status_code=400, detail=(
+                    f"incident_id must be one of {robot_id}'s incidents ({robot_id}-...)"))
+        else:
+            incident_id = None
         if camera is not None and not CAMERA_RE.match(camera):
             raise HTTPException(status_code=400, detail="camera contains invalid characters")
         captured = None
@@ -320,6 +349,7 @@ def build_snapshot_router(
             camera=camera, captured_at=captured,
             received_at=clock(), size_bytes=len(contents),
             position=_parse_position(position, robot_id),
+            incident_id=incident_id,
         ))
 
         return {"snapshot_id": snapshot_id, "size_bytes": len(contents)}

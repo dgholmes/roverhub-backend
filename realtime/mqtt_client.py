@@ -72,12 +72,23 @@ class BackendMqttClient:
         mqtt_client_factory: MqttClientFactory,
         on_ack: Optional[Callable] = None,
         on_state: Optional[Callable[[str, Optional[str], Optional[str]], None]] = None,
+        on_observed: Optional[Callable[[str, str, str, dict], None]] = None,
+        on_published: Optional[Callable[..., None]] = None,
     ):
         self._broker_url = broker_url
         self._registry = registry
         self._on_ack = on_ack
         # (robot_id, previous_boot_id, boot_id), after the registry is updated.
         self._on_state = on_state
+        # (kind, site_id, robot_id, payload) for the history (history/service.py
+        # History.observe): telemetry, state, incident, perception_status. Site
+        # and robot from the topic. Called after the registry is updated; it
+        # only queues, and anything it raises is contained here.
+        self._on_observed = on_observed
+        # (robot_id, command, site_id, error) after every publish attempt -- the
+        # one choke point every command the backend sends passes, so the audit
+        # log hangs off it. error is None when paho took the message.
+        self._on_published = on_published
         self._client = mqtt_client_factory()
         self._client.on_message = self._on_message
         self._client.on_connect = self._on_connect
@@ -111,7 +122,11 @@ class BackendMqttClient:
             )
             raise UnknownRobotError("robot not found")
         topic = f"roverhub/{record.site_id}/{robot_id}/commands"
-        info = self._client.publish(topic, command.model_dump_json(), qos=1)
+        try:
+            info = self._client.publish(topic, command.model_dump_json(), qos=1)
+        except Exception as exc:
+            self._published(robot_id, command, record.site_id, f"{type(exc).__name__}: {exc}")
+            raise
         # publish() never raises -- it reports failure through the returned
         # MQTTMessageInfo. Discarding it (as this did) means a command that was
         # never sent is indistinguishable from one that was, which is how a dead
@@ -123,9 +138,26 @@ class BackendMqttClient:
                 "The command was NOT sent to the edge bridge.",
                 command.command_id, command.type, robot_id, topic, rc,
             )
-            raise CommandPublishError(
-                f"could not publish command to the broker (rc={rc}); the robot was not sent this command"
-            )
+            error = f"could not publish command to the broker (rc={rc}); the robot was not sent this command"
+            self._published(robot_id, command, record.site_id, error)
+            raise CommandPublishError(error)
+        self._published(robot_id, command, record.site_id, None)
+
+    def _published(self, robot_id, command, site_id, error) -> None:
+        if self._on_published is None:
+            return
+        try:
+            self._on_published(robot_id, command, site_id=site_id, error=error)
+        except Exception:
+            logger.exception("the publish observer failed for command %s", command.command_id)
+
+    def _observe(self, kind: str, site_id: str, robot_id: str, data) -> None:
+        if self._on_observed is None:
+            return
+        try:
+            self._on_observed(kind, site_id, robot_id, data)
+        except Exception:
+            logger.exception("the history observer failed on a %s message from %s", kind, robot_id)
 
     def _on_connect(self, client, userdata, flags, rc) -> None:
         client.subscribe("roverhub/admin/+/register", qos=1)
@@ -133,6 +165,9 @@ class BackendMqttClient:
         client.subscribe("roverhub/+/+/state", qos=1)
         client.subscribe("roverhub/+/+/heartbeat", qos=0)
         client.subscribe("roverhub/+/+/ack", qos=1)
+        # Perception's (docs/02-system-architecture.md): stored by history/.
+        client.subscribe("roverhub/+/+/incidents", qos=1)
+        client.subscribe("roverhub/+/+/perception/status", qos=1)
 
     def _on_disconnect(self, client, userdata, rc) -> None:
         if rc == MQTT_ERR_SUCCESS:
@@ -192,9 +227,15 @@ class BackendMqttClient:
             )
             return
 
+        if len(parts) == 5 and parts[0] == "roverhub" and parts[3:] == ["perception", "status"]:
+            self._observe("perception_status", parts[1], parts[2], data)
+            return
         if len(parts) != 4 or parts[0] != "roverhub":
             return
         message_kind = parts[3]
+        if message_kind == "incidents":
+            self._observe("incident", parts[1], parts[2], data)
+            return
 
         if message_kind in ("telemetry", "heartbeat"):
             self._registry.mark_seen(data["robot_id"])
@@ -204,6 +245,8 @@ class BackendMqttClient:
                     self._validated(EdgeHostMetrics, data.get("host_metrics"), data["robot_id"], "host_metrics"),
                     at=data.get("timestamp"),
                 )
+            else:
+                self._observe("telemetry", parts[1], parts[2], data)
         elif message_kind == "state":
             boot_id = data.get("bridge_boot_id")
             previous = self._registry.update_state(
@@ -214,6 +257,7 @@ class BackendMqttClient:
             )
             if self._on_state is not None:
                 self._on_state(data["robot_id"], previous, boot_id)
+            self._observe("state", parts[1], parts[2], data)
         elif message_kind == "ack" and self._on_ack is not None:
             from shared.schemas.commands import Command
 

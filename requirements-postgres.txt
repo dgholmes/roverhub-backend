@@ -1,0 +1,5 @@
+# Only for the history store on Postgres (history/db.py), which is used when
+# DATABASE_URL starts with postgres://. SQLite, the default, needs nothing.
+#   pip install -r requirements.txt -r requirements-postgres.txt
+# psycopg 3; [binary] bundles libpq, so no Postgres client install is needed.
+psycopg[binary]>=3.1
