@@ -163,6 +163,12 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("GET", "/maps/{map_id}/floors/{index}/{kind}"): _READ,
     ("POST", "/maps"): Rule(capabilities=("configure",)),
     ("PUT", "/maps/{map_id}/zones"): Rule(capabilities=("editZones",)),
+    # A floor's planning grid (the map Nav2 plans on) is read like its survey
+    # grid, and set or removed like zones are drawn: both say where the robot
+    # may walk, and neither changes the map's status.
+    ("GET", "/maps/{map_id}/floors/{index}/planning"): _READ,
+    ("PUT", "/maps/{map_id}/floors/{index}/planning"): Rule(capabilities=("editZones",)),
+    ("DELETE", "/maps/{map_id}/floors/{index}/planning"): Rule(capabilities=("editZones",)),
     ("PUT", "/maps/{map_id}/status"): Rule(capabilities=("editZones",)),
     ("DELETE", "/maps/{map_id}"): Rule(capabilities=("configure",)),
 

@@ -7,6 +7,14 @@
                                                    (PNG) or `cloud` (float32 xyz); 404 if
                                                    there is no such file, 413 if a cloud is
                                                    over 8 MiB
+- GET    /maps/{map_id}/floors/{index}/planning -> the floor's planning grid (PGM), the map
+                                                   Nav2 plans on; 404 if it has none
+- PUT    /maps/{map_id}/floors/{index}/planning -> SiteMap; the raw PGM as the body
+         [?clearance_m=0.2]                        sets it (floor.planning gets its counts);
+                                                   400 if it is not a P5 PGM of exactly the
+                                                   floor's size_cells, 404 for an unknown
+                                                   map or floor, 413 over 32 MiB
+- DELETE /maps/{map_id}/floors/{index}/planning -> SiteMap without it; 404 if there is none
 - PUT    /maps/{map_id}/zones                   -> SiteMap; body {"zones": [MapZone, ...]}
                                                    replaces the map's zones; 404 if unknown,
                                                    400 if a zone cannot be stored
@@ -23,6 +31,8 @@ the bundle**:
          -F floor0/grid.png=@floor0/grid.png -F floor0/cloud.bin=@floor0/cloud.bin \\
          http://localhost:8000/maps
 
+A floor's `floor<N>/planning.pgm` may be sent as well; it is optional.
+
 The field name, not the filename, because a filename is whatever a browser or
 client chooses to send, while a field name is carried verbatim. Only the paths
 the bundle layout names are accepted (`PART_NAME_RE`); anything else is a 400,
@@ -32,7 +42,9 @@ stores them.
 
 Access is the rules in auth/policy.py: reading is open to every role, uploading
 or deleting a map is site configuration, and drawing zones and freezing a map
-(`editZones`) is the supervisor's review of it.
+(`editZones`) is the supervisor's review of it. Setting or removing a floor's
+planning grid is the same review as drawing zones -- both say where the robot
+may walk -- so it is `editZones` too. Neither changes the map's status.
 """
 from __future__ import annotations
 
@@ -54,7 +66,8 @@ from api.common import read_bounded_body
 from shared.schemas.maps import MapStatus, MapZone, SiteMap
 
 from .store import (
-    DEFAULT_MAPS_DIR, MAX_CLOUD_BYTES, UPLOAD_PREFIX, BundleError, MapNotFound, MapStore,
+    DEFAULT_CLEARANCE_M, DEFAULT_MAPS_DIR, MAX_CLOUD_BYTES, MAX_PLANNING_BYTES, UPLOAD_PREFIX,
+    BundleError, FloorNotFound, MapNotFound, MapStore, PlanningNotFound,
 )
 
 logger = logging.getLogger("roverhub.maps")
@@ -72,9 +85,10 @@ MAX_UPLOAD_BYTES = 128 * 1024 * 1024
 # points, so this is room for hundreds of them.
 MAX_ZONES_BODY_BYTES = 1024 * 1024
 
-PART_NAME_RE = re.compile(r"site_map\.json|floor[0-9]{1,3}/(?:grid\.pgm|grid\.png|cloud\.bin)")
+PART_NAME_RE = re.compile(
+    r"site_map\.json|floor[0-9]{1,3}/(?:grid\.pgm|grid\.png|cloud\.bin|planning\.pgm)")
 MEDIA_TYPES = {"grid": "image/x-portable-graymap", "preview": "image/png",
-               "cloud": "application/octet-stream"}
+               "cloud": "application/octet-stream", "planning": "image/x-portable-graymap"}
 _CHUNK = 1024 * 1024
 
 
@@ -183,8 +197,7 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
         finally:
             await form.close()
 
-    @router.get("/maps/{map_id}/floors/{index}/{kind}")
-    def get_artifact(map_id: str, index: int, kind: str):
+    def _serve(map_id: str, index: int, kind: str) -> FileResponse:
         path = store.artifact_path(map_id, index, kind)
         if path is None:
             raise HTTPException(status_code=404, detail="no such file")
@@ -193,6 +206,39 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
         # A re-upload replaces the files under the same URL, so make the browser
         # revalidate (FileResponse supplies the ETag) rather than guess.
         return FileResponse(path, media_type=MEDIA_TYPES[kind], headers={"Cache-Control": "no-cache"})
+
+    def _planning(write):
+        try:
+            return write()
+        except (FloorNotFound, PlanningNotFound) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        except MapNotFound:
+            raise HTTPException(status_code=404, detail="map not found") from None
+        except ValueError as exc:  # BundleError: not a PGM, the wrong size, a bad clearance
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    # The planning routes are declared before the generic artifact route so
+    # that each method of this path has a rule of its own in auth/policy.py.
+    @router.get("/maps/{map_id}/floors/{index}/planning")
+    def get_planning(map_id: str, index: int):
+        return _serve(map_id, index, "planning")
+
+    # The body is the PGM itself, read by hand so the size cap applies before
+    # anything is parsed (as for zones).
+    @router.put("/maps/{map_id}/floors/{index}/planning")
+    async def put_planning(map_id: str, index: int, request: Request,
+                           clearance_m: float = DEFAULT_CLEARANCE_M):
+        raw = await read_bounded_body(request, MAX_PLANNING_BYTES, "planning grid")
+        return await run_in_threadpool(
+            _planning, lambda: store.set_planning(map_id, index, raw, clearance_m))
+
+    @router.delete("/maps/{map_id}/floors/{index}/planning")
+    def delete_planning(map_id: str, index: int):
+        return _planning(lambda: store.delete_planning(map_id, index))
+
+    @router.get("/maps/{map_id}/floors/{index}/{kind}")
+    def get_artifact(map_id: str, index: int, kind: str):
+        return _serve(map_id, index, kind)
 
     # The zone list is read by hand, as the missions router does, so the size cap
     # applies before pydantic parses anything.

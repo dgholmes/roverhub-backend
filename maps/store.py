@@ -7,11 +7,17 @@ A survey is packed into a *bundle* directory by tools/map_prep/pack_map.py:
     floor<N>/grid.pgm   the occupancy grid
     floor<N>/grid.png   the same pixels, for a browser
     floor<N>/cloud.bin  float32 x,y,z triples, if a cloud was packed
+    floor<N>/planning.pgm  the planning grid Nav2 plans on, if one was made
+                        (tools/map_prep/planning_grid.py); optional
 
 `save_bundle` takes such a directory and keeps it under `<root>/<map_id>/` as
 
     map.json            the validated SiteMap (floors joined in)
-    floor<N>/...        the three artifacts, byte for byte
+    floor<N>/...        the artifacts, byte for byte
+
+A floor's planning grid can also be set or removed on a stored map
+(`set_planning`, `delete_planning`): it is usually made after the survey, from
+the survey, on the machine that runs Nav2.
 
 No database, like runs/store.py: the directory is re-read on every call.
 
@@ -32,11 +38,11 @@ import shutil
 import tempfile
 import threading
 from pathlib import Path
-from typing import List, Optional, get_args
+from typing import Callable, Dict, List, Optional, Tuple, get_args
 
 from pydantic import ValidationError
 
-from shared.schemas.maps import MapFloor, MapStatus, MapZone, SiteMap
+from shared.schemas.maps import MapFloor, MapStatus, MapZone, PlanningGrid, SiteMap
 
 logger = logging.getLogger("roverhub.maps")
 
@@ -59,8 +65,35 @@ MAP_FILE = "map.json"
 
 # kind (as it appears in a URL) -> file name inside floor<N>/. The whole of what
 # a caller may ask for.
-ARTIFACT_FILES = {"grid": "grid.pgm", "preview": "grid.png", "cloud": "cloud.bin"}
+ARTIFACT_FILES = {"grid": "grid.pgm", "preview": "grid.png", "cloud": "cloud.bin",
+                  "planning": "planning.pgm"}
 _REQUIRED = ("grid", "preview")
+PLANNING_FILE = ARTIFACT_FILES["planning"]
+
+# The planner's padded half-width (PlanningGrid.clearance_m's default).
+DEFAULT_CLEARANCE_M = 0.2
+# A planning grid is one byte per cell: 32 MiB is a 5,600 x 5,600 grid, 280 m a
+# side at 5 cm, and the same as an image part of an upload (router.MAX_IMAGE_BYTES).
+MAX_PLANNING_BYTES = 32 * 1024 * 1024
+
+# How Nav2's map_server reads a trinary PGM (negate 0): a cell is occupied when
+# (255 - v) / 255 > occupied_thresh, free when it is < free_thresh, and unknown
+# otherwise. The figures are the planning grid's own yaml's (planning_grid.py),
+# and the expression is planning_grid.py's read_like(), so the counts here are
+# the counts Nav2 sees: 0 is occupied, 254 free, 205 unknown.
+OCCUPIED_THRESH = 0.65
+FREE_THRESH = 0.196
+_CELL_CLASS = bytes(
+    ord("o") if (255.0 - v) / 255.0 > OCCUPIED_THRESH
+    else ord("f") if (255.0 - v) / 255.0 < FREE_THRESH
+    else ord("u")
+    for v in range(256))
+
+# tools/map_prep/pack_map.py's header pattern. Nav2's map_saver puts a
+# `# CREATOR:` comment between the magic number and the size; exactly one
+# whitespace byte follows maxval, and the pixels start right after it.
+_PGM_HEADER = re.compile(
+    rb"(?:\s|#[^\n]*\n)*P5(?:\s|#[^\n]*\n)+(\d+)(?:\s|#[^\n]*\n)+(\d+)(?:\s|#[^\n]*\n)+(\d+)\s")
 
 # Concatenated into a path, so allowlisted. Must start with a letter or digit:
 # that rules out "." and "..", and makes every scratch name below (which starts
@@ -110,8 +143,80 @@ def _check_floor(floor: MapFloor) -> None:
                           % (where, width, height, width * height, counted))
 
 
+def parse_pgm(data: bytes) -> Tuple[int, int, bytes]:
+    """(width, height, pixels) of an 8-bit binary PGM. Raises BundleError.
+
+    The pixels must be exactly width x height bytes: a short or long file is
+    refused rather than trimmed into agreement."""
+    match = _PGM_HEADER.match(data)
+    if match is None:
+        raise BundleError("the planning grid is not a binary PGM (P5)")
+    width, height, maxval = (int(group) for group in match.groups())
+    if maxval != 255:
+        raise BundleError("the planning grid has maxval %d; only 8-bit (255) grids are handled" % maxval)
+    pixels = data[match.end():]
+    if len(pixels) != width * height:
+        raise BundleError("the planning grid's header says %d x %d = %d cells, but %d bytes of pixels follow"
+                          % (width, height, width * height, len(pixels)))
+    return width, height, pixels
+
+
+def count_cells(pixels: bytes) -> Tuple[int, int, int]:
+    """(free, occupied, unknown) by Nav2's thresholds (see OCCUPIED_THRESH)."""
+    classes = pixels.translate(_CELL_CLASS)
+    return classes.count(b"f"), classes.count(b"o"), classes.count(b"u")
+
+
+def planning_grid_for(floor: MapFloor, data: bytes,
+                      clearance_m: float = DEFAULT_CLEARANCE_M) -> PlanningGrid:
+    """The PlanningGrid that `data` (a PGM) is for `floor`. Raises BundleError
+    if it is not a PGM, is not exactly the floor's size, or the clearance is not
+    a distance the schema takes."""
+    where = "floor %d" % floor.index
+    if (isinstance(clearance_m, bool) or not isinstance(clearance_m, (int, float))
+            or not math.isfinite(clearance_m) or not 0 < clearance_m < 2):
+        raise BundleError("clearance_m is %r; it must be a distance between 0 and 2 m" % (clearance_m,))
+    try:
+        width, height, pixels = parse_pgm(data)
+    except BundleError as exc:
+        raise BundleError("%s: %s" % (where, exc)) from None
+    if (width, height) != tuple(floor.size_cells):
+        raise BundleError(
+            "%s: the planning grid is %d x %d cells but the floor's grid is %d x %d; it must be made "
+            "in exactly the floor's frame, origin, size and resolution"
+            % (where, width, height, floor.size_cells[0], floor.size_cells[1]))
+    free, occupied, unknown = count_cells(pixels)
+    return PlanningGrid(free_cells=free, occupied_cells=occupied, unknown_cells=unknown,
+                        clearance_m=float(clearance_m))
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write `path` through a uniquely named temp file beside it and os.replace,
+    so a reader sees the old file or the new one. The name is unique because a
+    second process (the set_planning CLI) may be writing the same directory."""
+    fd, staged = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + "-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(staged, path)
+    except BaseException:
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+        raise
+
+
 class MapNotFound(LookupError):
     """No map by that id (or an id that cannot name one)."""
+
+
+class FloorNotFound(MapNotFound):
+    """The map exists but has no floor by that index. The message says so."""
+
+
+class PlanningNotFound(MapNotFound):
+    """The floor exists but has no planning grid. The message says so."""
 
 
 def valid_map_id(map_id: object) -> bool:
@@ -120,11 +225,16 @@ def valid_map_id(map_id: object) -> bool:
 
 
 class MapStore:
-    def __init__(self, root):
+    def __init__(self, root, sweep: bool = True):
+        """`sweep=False` for a second process beside a running server (the
+        set_planning CLI): the sweep assumes one owner, and run beside a live
+        server it would remove that server's in-progress upload, or put back a
+        map it is midway through replacing."""
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._sweep_stale()
+        if sweep:
+            self._sweep_stale()
 
     def _sweep_stale(self) -> None:
         """Clear what a crash left behind. Assumes one process owns the store.
@@ -240,6 +350,7 @@ class MapStore:
 
         scratch = Path(tempfile.mkdtemp(dir=self.root, prefix=_SCRATCH_PREFIX))
         try:
+            planning: Dict[int, PlanningGrid] = {}
             for floor in site_map.floors:
                 floor_dir = scratch / ("floor%d" % floor.index)
                 floor_dir.mkdir()
@@ -248,13 +359,27 @@ class MapStore:
                     if not source.is_file():
                         if kind in _REQUIRED:
                             raise BundleError("floor %d has no %s" % (floor.index, file_name))
+                        if kind == "planning" and floor.planning is not None:
+                            raise BundleError("floor %d describes a planning grid but has no %s"
+                                              % (floor.index, file_name))
                         continue
                     # The router refuses this on upload and on serving too; a
                     # direct caller (a seeding script) must not be able to store
                     # a map whose cloud can never be served.
                     if kind == "cloud" and source.stat().st_size > MAX_CLOUD_BYTES:
                         raise BundleError("floor %d's cloud exceeds %d bytes" % (floor.index, MAX_CLOUD_BYTES))
+                    if kind == "planning":
+                        # Counted from the file, never taken from the manifest:
+                        # only the clearance is the bundle's to say.
+                        clearance = floor.planning.clearance_m if floor.planning else DEFAULT_CLEARANCE_M
+                        planning[floor.index] = planning_grid_for(floor, source.read_bytes(), clearance)
                     shutil.copyfile(source, floor_dir / file_name)
+            # A floor's planning grid is the bundle's or nothing. One stored on
+            # the map being replaced is not carried over (unlike its zones): it
+            # was made in the old survey's frame and says where the robot may
+            # walk, so it must be made again from the new survey.
+            site_map = site_map.model_copy(update={"floors": [
+                f.model_copy(update={"planning": planning.get(f.index)}) for f in site_map.floors]})
 
             with self._lock:
                 # The zones operators drew are not in a bundle, and when a map
@@ -346,16 +471,105 @@ class MapStore:
             if current is None:
                 raise MapNotFound(map_id)
             updated = current.model_copy(update=change(current))
-            scratch = directory / (MAP_FILE + ".tmp")
+            self._write_map_file(directory, updated)
+        return updated
+
+    @staticmethod
+    def _write_map_file(directory: Path, site_map: SiteMap) -> None:
+        _atomic_write(directory / MAP_FILE, site_map.model_dump_json(indent=2).encode("utf-8"))
+
+    # --- the planning grid ---------------------------------------------------
+
+    def set_planning(self, map_id: str, floor_index: int, pgm: bytes,
+                     clearance_m: float = DEFAULT_CLEARANCE_M) -> SiteMap:
+        """Store `pgm` as floor `floor_index`'s planning grid and record its
+        counts in that floor's `planning`, replacing any earlier one.
+
+        Raises MapNotFound (or FloorNotFound) for a map or floor that is not
+        there, and BundleError for bytes that are not a PGM of exactly the
+        floor's size_cells, or a clearance the schema refuses.
+
+        The map's status is left alone, on purpose. A re-upload drops a map to
+        draft because it changes the frame its zones were drawn in; a planning
+        grid is made in exactly that frame and only narrows where the robot may
+        walk inside it, so nothing a reviewer checked has moved.
+        """
+        if len(pgm) > MAX_PLANNING_BYTES:
+            raise BundleError("the planning grid exceeds %d bytes" % MAX_PLANNING_BYTES)
+
+        def change(floor: MapFloor) -> Tuple[Optional[bytes], Optional[PlanningGrid]]:
+            return pgm, planning_grid_for(floor, pgm, clearance_m)
+
+        return self._swap_planning(map_id, floor_index, change)
+
+    def delete_planning(self, map_id: str, floor_index: int) -> SiteMap:
+        """Remove floor `floor_index`'s planning grid. Raises MapNotFound,
+        FloorNotFound, or PlanningNotFound when the floor has none. Like
+        set_planning, the map's status is left alone."""
+        def change(floor: MapFloor) -> Tuple[Optional[bytes], Optional[PlanningGrid]]:
+            return None, None
+
+        return self._swap_planning(map_id, floor_index, change, must_exist=True)
+
+    def _swap_planning(self, map_id: str, floor_index: int,
+                       change: Callable[[MapFloor], Tuple[Optional[bytes], Optional[PlanningGrid]]],
+                       must_exist: bool = False) -> SiteMap:
+        """Under the lock, re-read the map, let `change(floor)` say the new file
+        (None: none) and the new `planning`, then put both in place.
+
+        The file and map.json are two writes, so the old file is moved aside
+        first and put back if anything after it fails: a reader may see the old
+        pair or the new pair, and never a planning.pgm that map.json does not
+        describe once this returns or raises."""
+        directory = self._dir(map_id)
+        if directory is None:
+            raise MapNotFound(map_id)
+        if not isinstance(floor_index, int) or isinstance(floor_index, bool) or floor_index < 0:
+            raise FloorNotFound("map %s has no floor %r" % (map_id, floor_index))
+        with self._lock:
+            current = self.get(map_id)
+            if current is None:
+                raise MapNotFound(map_id)
+            floor = next((f for f in current.floors if f.index == floor_index), None)
+            if floor is None:
+                raise FloorNotFound("map %s has no floor %d" % (map_id, floor_index))
+            floor_dir = directory / ("floor%d" % floor_index)
+            target = floor_dir / PLANNING_FILE
+            if must_exist and floor.planning is None and not target.is_file():
+                raise PlanningNotFound("floor %d of map %s has no planning grid" % (floor_index, map_id))
+            data, planning = change(floor)
+            updated = current.model_copy(update={"floors": [
+                f.model_copy(update={"planning": planning}) if f.index == floor_index else f
+                for f in current.floors]})
+
+            floor_dir.mkdir(exist_ok=True)
+            aside: Optional[Path] = None
+            placed = False
             try:
-                scratch.write_text(updated.model_dump_json(indent=2), encoding="utf-8")
-                os.replace(scratch, directory / MAP_FILE)
+                if target.is_file():
+                    fd, name = tempfile.mkstemp(dir=floor_dir, prefix="." + PLANNING_FILE + "-old-")
+                    os.close(fd)
+                    aside = Path(name)
+                    os.replace(target, aside)
+                if data is not None:
+                    _atomic_write(target, data)
+                    placed = True
+                self._write_map_file(directory, updated)
             except BaseException:
                 try:
-                    scratch.unlink()
+                    if placed:
+                        target.unlink()
+                    if aside is not None:
+                        os.replace(aside, target)
                 except OSError:
-                    pass
+                    logger.exception("could not restore the planning grid of floor %d of map %s",
+                                     floor_index, map_id)
                 raise
+            if aside is not None:
+                try:
+                    aside.unlink()
+                except OSError:
+                    logger.warning("could not remove %s", aside)
         return updated
 
     def delete(self, map_id: str) -> bool:
