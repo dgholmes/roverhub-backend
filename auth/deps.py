@@ -4,7 +4,8 @@ Three kinds of caller:
 - a signed-in **user**, by session token (Authorization header, or the
   session cookie on GET so <img>/<video>/download links work);
 - an edge **device**, by its device key (DEVICE_KEYS), for the few routes a
-  bridge calls -- snapshots, run events, fetching a Speak clip;
+  bridge calls -- snapshots, run events, fetching a Speak clip, and uploading
+  the draft map of a survey it made, at its own site only (`device_own_site`);
 - **dev**, when AUTH_ENABLED is off: everyone, allowed everything, exactly as
   before sign-in existed.
 """
@@ -55,6 +56,9 @@ class Principal:
     kind: str  # "user" | "device" | "dev"
     id: str
     user: Optional[User] = None
+    # A device: the site its robot registered at, when the registry knows it
+    # (Auth.device_site_of). What `device_own_site` routes hold it to.
+    device_site: Optional[str] = None
 
     def can(self, capability: str, site_id: Optional[str]) -> bool:
         if self.kind == "dev":
@@ -150,7 +154,8 @@ class Auth:
     def __init__(self, *, enabled: bool, users: UserStore, issuer: TokenIssuer,
                  device_keys: Optional[Dict[str, str]] = None, broker_service_password: str = "",
                  resolve_site: Optional[SiteResolver] = None, secure_cookie: bool = False,
-                 allow_unkeyed_bridges: bool = False):
+                 allow_unkeyed_bridges: bool = False,
+                 device_site_of: Optional[Callable[[str], Optional[str]]] = None):
         self.enabled = enabled
         self.users = users
         self.issuer = issuer
@@ -162,9 +167,14 @@ class Auth:
         # yet may still call the device routes, as they could before sign-in.
         self.allow_unkeyed_bridges = allow_unkeyed_bridges
         self.bridges = BridgeBindings()
+        # robot_id -> the site it registered at, or None (the registry, in the
+        # app). Holds a device to its own site on `device_own_site` routes; with
+        # none, such a device is refused there.
+        self.device_site_of = device_site_of
 
     @classmethod
-    def from_env(cls, resolve_site: Optional[SiteResolver] = None) -> "Auth":
+    def from_env(cls, resolve_site: Optional[SiteResolver] = None,
+                 device_site_of: Optional[Callable[[str], Optional[str]]] = None) -> "Auth":
         users_file = os.environ.get("USERS_FILE", DEFAULT_USERS_FILE)
         secret_file = str(Path(users_file).parent / "auth_secret")
         enabled = _truthy(os.environ.get("AUTH_ENABLED"))
@@ -178,6 +188,7 @@ class Auth:
             resolve_site=resolve_site,
             secure_cookie=_truthy(os.environ.get("AUTH_COOKIE_SECURE")),
             allow_unkeyed_bridges=_truthy(os.environ.get("AUTH_ALLOW_UNKEYED_BRIDGES")),
+            device_site_of=device_site_of,
         )
         if enabled and auth.users.is_empty():
             logger.warning("sign-in is on and there are no users yet. Create the first owner with: "
@@ -224,6 +235,15 @@ class Auth:
                 return robot_id
         return None
 
+    def _device_site(self, robot_id: str) -> Optional[str]:
+        if self.device_site_of is None:
+            return None
+        try:
+            return self.device_site_of(robot_id)
+        except Exception:
+            logger.exception("could not look up the site of device %s", robot_id)
+            return None
+
     def user_for_token(self, token: str) -> Optional[User]:
         claims = self.issuer.verify(token)
         if claims is None:
@@ -246,7 +266,7 @@ class Auth:
             return None
         device = self.device_for_key(token) if "." not in token else None
         if device is not None:
-            return Principal(kind="device", id=device)
+            return Principal(kind="device", id=device, device_site=self._device_site(device))
         user = self.user_for_token(token)
         return Principal(kind="user", id=user.user_id, user=user) if user else None
 
@@ -275,10 +295,15 @@ class Auth:
             raise HTTPException(status_code=401, detail="sign in to continue",
                                 headers={"WWW-Authenticate": "Bearer"})
         if principal.kind == "device":
-            if not rule.device:
+            if not (rule.device or rule.device_own_site):
                 raise HTTPException(status_code=403, detail="edge devices may not call this")
             if robot_id is not None and robot_id != principal.id:
                 raise HTTPException(status_code=403, detail=f"this device key belongs to {principal.id}")
+            if rule.device_own_site and not rule.device:
+                # A site the path names (a map's); one only the body names is
+                # checked by the handler (require_site_capability), and a record
+                # that does not exist yet is the handler's 404.
+                device_may_use_site(principal, site_id, check_site=site_id is not None)
             return
         if rule.signed_in:
             return
@@ -291,6 +316,23 @@ class Auth:
         if rule.capabilities and any(principal.can(c, site_id) for c in rule.capabilities):
             return
         raise HTTPException(status_code=403, detail=_forbidden(rule.capabilities, site_id))
+
+
+def device_may_use_site(principal: Principal, site_id: Optional[str], check_site: bool = True) -> None:
+    """403 unless the device `principal` is known to be at `site_id` -- the
+    site its robot registered at. A device whose robot has not registered
+    since the backend started (or was deleted) has no known site, and is
+    refused even before any site is compared."""
+    home = principal.device_site
+    if home is None:
+        raise HTTPException(
+            status_code=403,
+            detail=(f"the cloud does not know which site {principal.id} is at yet: it has not registered "
+                    "since the backend started. Wait for its bridge to connect, then try again"))
+    if check_site and site_id != home:
+        raise HTTPException(
+            status_code=403,
+            detail=f"this device key belongs to {principal.id} at site {home}, not site {site_id or 'unknown'}")
 
 
 def _forbidden(capabilities, site_id: Optional[str]) -> str:
@@ -309,8 +351,12 @@ def site_visible(request: Request, site_id: Optional[str]) -> bool:
     tests); a signed-in person only at sites where they hold a role. A record
     with no site is shown to anyone who holds a role somewhere."""
     principal = principal_of(request)
-    if principal is None or principal.kind in ("dev", "device"):
+    if principal is None or principal.kind == "dev":
         return True
+    if principal.kind == "device":
+        # Only on `device_own_site` routes does a device reach a list or a
+        # record checked here: it sees its own site's, nothing else.
+        return principal.device_site is not None and site_id == principal.device_site
     if site_id is None:
         return principal.user is not None and bool(principal.user.site_roles)
     return principal.visible_site(site_id)
@@ -338,9 +384,14 @@ def require_site_capability(request: Request, site_id: Optional[str], capabiliti
     """For a write whose body names its site. The guard checks the site in the
     path (or the stored record's), so a body naming another site -- a create,
     or an edit that moves a record -- is checked here: 403 unless the caller
-    holds one of `capabilities` at the body's site."""
+    holds one of `capabilities` at the body's site. A device holds no
+    capabilities; where the guard let one in (`device_own_site`), it may write
+    only at the site its robot registered at."""
     principal = principal_of(request)
-    if principal is None or principal.kind in ("dev", "device"):
+    if principal is None or principal.kind == "dev":
+        return
+    if principal.kind == "device":
+        device_may_use_site(principal, site_id)
         return
     if not any(principal.can(c, site_id) for c in capabilities):
         raise HTTPException(status_code=403, detail=_forbidden(capabilities, site_id))
@@ -380,6 +431,7 @@ def acting_user_id(request: Request, claimed: Optional[str]) -> Optional[str]:
 
 
 __all__ = ["Auth", "AuditScope", "BridgeBindings", "Principal", "principal_of", "acting_user_id",
-           "audit_scope", "require_site_capability", "site_visible", "visible", "visible_sites",
+           "audit_scope", "device_may_use_site", "require_site_capability", "site_visible", "visible",
+           "visible_sites",
            "SESSION_COOKIE",
            "DEV_USER_ID", "ALL_SITES", "parse_device_keys"]

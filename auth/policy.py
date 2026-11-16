@@ -67,6 +67,27 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     # Retry a run the robot paused as blocked (0.0.16): it sets a patrol going
     # again, so it is the same capability as starting one.
     "RESUME": ("dispatchPatrols",),
+    # Surveying from the console (schema 0.0.23, shared/schemas/survey.py).
+    # A survey ends in a draft map the robot uploads with its own device key
+    # (POST /map-surveys, then PUT planning), and one that names a map_id
+    # replaces that map's bundle: both are what POST /map-surveys means by site
+    # configuration, so starting one is `configure` -- the engineer's, as for an
+    # upload by hand. Supervisors (`editZones`) review and freeze the draft; they
+    # do not make it, so one person does not both make a map and sign it off.
+    # Stopping is `configure` too, not _STOPPING: STOP_SURVEY moves and stops
+    # nothing (E-Stop and Release control do that, and E-Stop does not end the
+    # recording), and both of its outcomes -- a draft map, or the recording
+    # thrown away -- are the survey's, not a safety decision.
+    "START_SURVEY": ("configure",),
+    "STOP_SURVEY": ("configure",),
+    # Re-running the moving-object search replaces a floor's "probably moved"
+    # layer, which is the map editor's PUT .../moved: `editZones` or `configure`.
+    "FIND_MOVING": ("editZones", "configure"),
+    # Where the lidar sits changes where the robot believes it is, and the
+    # calibration mode lets the bridge change it by itself: robot configuration,
+    # the engineer's (shared/schemas/sensors.py).
+    "SET_LIDAR_MOUNT": ("configure",),
+    "SET_CALIBRATION_MODE": ("configure",),
 }
 
 
@@ -83,7 +104,12 @@ class Rule:
 
     `capabilities`: a signed-in user needs any one of these at the request's
     site (or, when the site cannot be told from the path, at any site).
-    `device`: an edge device's key is accepted. `org_admin`: only an org owner
+    `device`: an edge device's key is accepted. `device_own_site`: an edge
+    device's key is accepted for records at the site its robot registered at,
+    and nowhere else: the guard checks a site the path names, the handler one
+    the body names (deps.py `require_site_capability`, `site_visible`). Unlike
+    `device`, it is never opened to unkeyed bridges (AUTH_ALLOW_UNKEYED_BRIDGES):
+    without a key there is no robot, so no site to hold it to. `org_admin`: only an org owner
     or admin. `public`: nothing at all. `signed_in`: any signed-in user.
     `auditors`: also anyone holding the "audit access" flag (roles.ts's folded
     Auditor role) and org owners/admins -- the handler then narrows what they
@@ -91,6 +117,7 @@ class Rule:
     """
     capabilities: Tuple[str, ...] = ()
     device: bool = False
+    device_own_site: bool = False
     org_admin: bool = False
     public: bool = False
     signed_in: bool = False
@@ -98,6 +125,8 @@ class Rule:
 
 
 _READ = Rule(capabilities=("watchLive",))
+# Read like _READ, and by a robot's own device key at its own site.
+_READ_OR_OWN_DEVICE = Rule(capabilities=("watchLive",), device_own_site=True)
 
 # Keyed by (method, FastAPI path template). A route missing here is refused
 # (see deps.py), so a new endpoint cannot ship unprotected by accident.
@@ -172,8 +201,10 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     # and engineers do not: the engineer who uploads a survey (`configure`) does
     # not also sign it off, and a re-upload drops an active map back to draft.
     ("GET", "/maps"): _READ,
-    ("GET", "/maps/{map_id}"): _READ,
-    ("GET", "/maps/{map_id}/floors/{index}/{kind}"): _READ,
+    # A robot reads back the draft it uploaded (its floor's size, origin and
+    # survey.json) to build the planning grid on it -- at its own site only.
+    ("GET", "/maps/{map_id}"): _READ_OR_OWN_DEVICE,
+    ("GET", "/maps/{map_id}/floors/{index}/{kind}"): _READ_OR_OWN_DEVICE,
     ("POST", "/maps"): Rule(capabilities=("configure",)),
     ("PUT", "/maps/{map_id}/zones"): Rule(capabilities=("editZones",)),
     # A floor's planning grid (the map Nav2 plans on) is read like its survey
@@ -183,10 +214,17 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     # version and drop the map to draft, so a supervisor still signs it off
     # (PUT status, `editZones`) before missions use it: the supervisor and the
     # engineer who uploaded the survey may both clean it.
-    ("GET", "/maps/{map_id}/floors/{index}/planning"): _READ,
-    ("PUT", "/maps/{map_id}/floors/{index}/planning"): Rule(capabilities=("editZones", "configure")),
+    # The robot's own survey pipeline (roverhub-edge survey_pipeline/, schema
+    # 0.0.23) uploads its draft with its device key: the survey, then the
+    # planning grid, and -- after FIND_MOVING -- a new moved layer. Only for
+    # maps at the site its robot registered at (`device_own_site`). A robot
+    # never removes a planning grid, freezes a map or edits its cloud.
+    ("GET", "/maps/{map_id}/floors/{index}/planning"): _READ_OR_OWN_DEVICE,
+    ("PUT", "/maps/{map_id}/floors/{index}/planning"): Rule(capabilities=("editZones", "configure"),
+                                                            device_own_site=True),
     ("DELETE", "/maps/{map_id}/floors/{index}/planning"): Rule(capabilities=("editZones",)),
-    ("PUT", "/maps/{map_id}/floors/{index}/moved"): Rule(capabilities=("editZones", "configure")),
+    ("PUT", "/maps/{map_id}/floors/{index}/moved"): Rule(capabilities=("editZones", "configure"),
+                                                         device_own_site=True),
     ("POST", "/maps/{map_id}/floors/{index}/cloud-edits"): Rule(capabilities=("editZones", "configure")),
     ("PUT", "/maps/{map_id}/status"): Rule(capabilities=("editZones",)),
     ("DELETE", "/maps/{map_id}"): Rule(capabilities=("configure",)),
@@ -199,9 +237,9 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     # the handler (maps/router.py _quality_gate) because only the body says so.
     # A job's site is in its record, not its path: the handlers hide jobs at
     # sites the caller cannot see.
-    ("POST", "/map-surveys"): Rule(capabilities=("configure",)),
-    ("GET", "/map-jobs"): _READ,
-    ("GET", "/map-jobs/{job_id}"): _READ,
+    ("POST", "/map-surveys"): Rule(capabilities=("configure",), device_own_site=True),
+    ("GET", "/map-jobs"): _READ_OR_OWN_DEVICE,
+    ("GET", "/map-jobs/{job_id}"): _READ_OR_OWN_DEVICE,
     ("GET", "/maps/{map_id}/quality"): _READ,
     ("POST", "/maps/{map_id}/quality"): Rule(capabilities=("editZones", "configure")),
     ("GET", "/maps/{map_id}/versions"): _READ,

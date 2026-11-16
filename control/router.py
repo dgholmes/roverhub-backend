@@ -11,17 +11,79 @@ from auth.policy import command_capabilities
 
 from control.commands import CommandStore
 from realtime.mqtt_client import CommandPublishError, UnknownRobotError
+from realtime.mqtt_client import _parse_version
 from shared.schemas.commands import (
     WIRED_COMMAND_TYPES, Command, CommandRequest, CommandStageEvent, NavGotoParams,
     ResetPositionParams, ResumeParams, command_ttl_s,
 )
+from shared.schemas.sensors import SetCalibrationModeParams, SetLidarMountParams
+from shared.schemas.survey import FindMovingParams, StartSurveyParams, StopSurveyParams
+
+# Surveying and lidar calibration (schema 0.0.23). A bridge older than that
+# does not know these types; refused here with the reason rather than sent to
+# sit at "Sending..." (the console also offers them only from 0.0.23).
+SURVEY_SCHEMA_VERSION = "0.0.23"
+_SITE_SETUP_PARAMS = {
+    "START_SURVEY": StartSurveyParams,
+    "STOP_SURVEY": StopSurveyParams,
+    "FIND_MOVING": FindMovingParams,
+    "SET_LIDAR_MOUNT": SetLidarMountParams,
+    "SET_CALIBRATION_MODE": SetCalibrationModeParams,
+}
+# What each one's params are, in the 422's words.
+_SITE_SETUP_NOUN = {
+    "START_SURVEY": "a survey to start",
+    "STOP_SURVEY": "a survey to stop",
+    "FIND_MOVING": "a moving-object search",
+    "SET_LIDAR_MOUNT": "a lidar mount",
+    "SET_CALIBRATION_MODE": "a calibration mode (off, suggest or auto)",
+}
+# STOP_SURVEY is a stop: never refused on a version guess (an old bridge has no
+# survey to stop, and says so itself).
+_NEEDS_SURVEY_SCHEMA = frozenset(_SITE_SETUP_PARAMS) - {"STOP_SURVEY"}
 
 
-def build_router(command_store: CommandStore, mqtt_client, registry=None) -> APIRouter:
+def _bad_fields(exc: ValidationError) -> str:
+    return ", ".join(".".join(str(p) for p in e["loc"]) or "params" for e in exc.errors())
+
+
+def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lookup=None) -> APIRouter:
     """`registry` lets an unknown robot be refused before the command is even
     recorded. Without it the MQTT client still refuses to publish one
-    (UnknownRobotError), so the answer is the same 404, just after the store."""
+    (UnknownRobotError), so the answer is the same 404, just after the store.
+    `map_lookup(map_id)` -> SiteMap or None: the map a START_SURVEY (re-survey)
+    or FIND_MOVING names must be at the robot's site. Without it that is not
+    checked here (the robot's own upload is still held to its site)."""
     router = APIRouter()
+
+    def _check_site_setup(robot_id: str, command_type: str, params) -> None:
+        """422 / 404 / 409 for a survey or calibration command that cannot work."""
+        try:
+            parsed = _SITE_SETUP_PARAMS[command_type].model_validate(params or {})
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{command_type} params are not {_SITE_SETUP_NOUN[command_type]} ({_bad_fields(exc)})",
+            ) from exc
+        robot = registry.get(robot_id) if registry is not None else None
+        if robot is not None and command_type in _NEEDS_SURVEY_SCHEMA:
+            version = _parse_version(robot.schema_version)
+            if version is None or version < _parse_version(SURVEY_SCHEMA_VERSION):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"update the edge device: it runs schema {robot.schema_version or 'unknown'}, "
+                            f"surveys and lidar calibration need {SURVEY_SCHEMA_VERSION}"))
+        map_id = getattr(parsed, "map_id", None)
+        if map_id is None or map_lookup is None:
+            return
+        site_map = map_lookup(map_id)
+        robot_site = robot.site_id if robot is not None else None
+        # A map at another site reads as not found: the robot's key could not
+        # upload to it, and this caller's role here says nothing about there.
+        if site_map is None or (robot_site is not None and site_map.site_id != robot_site):
+            raise HTTPException(status_code=404, detail=f"map {map_id} not found at this robot's site")
+        if command_type == "FIND_MOVING" and not any(f.index == parsed.floor_index for f in site_map.floors):
+            raise HTTPException(status_code=404, detail=f"map {map_id} has no floor {parsed.floor_index}")
 
     @router.post("/robots/{robot_id}/commands")
     def issue_command(robot_id: str, request: CommandRequest, http: Request):
@@ -55,16 +117,17 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None) -> API
             try:
                 NavGotoParams.model_validate(request.params)
             except ValidationError as exc:
-                fields = ", ".join(".".join(str(p) for p in e["loc"]) or "params" for e in exc.errors())
                 raise HTTPException(
-                    status_code=422, detail=f"NAV_GOTO params are not a usable goal ({fields})") from exc
+                    status_code=422, detail=f"NAV_GOTO params are not a usable goal ({_bad_fields(exc)})") from exc
         elif request.type == "RESET_POSITION":
             try:
                 ResetPositionParams.model_validate(request.params)
             except ValidationError as exc:
-                fields = ", ".join(".".join(str(p) for p in e["loc"]) or "params" for e in exc.errors())
                 raise HTTPException(
-                    status_code=422, detail=f"RESET_POSITION params are not a usable pose ({fields})") from exc
+                    status_code=422,
+                    detail=f"RESET_POSITION params are not a usable pose ({_bad_fields(exc)})") from exc
+        elif request.type in _SITE_SETUP_PARAMS:
+            _check_site_setup(robot_id, request.type, request.params)
         elif request.type == "RESUME":
             # The run_id is what stops a late Retry restarting some other paused run.
             try:

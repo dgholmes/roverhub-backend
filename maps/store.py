@@ -164,6 +164,9 @@ MAX_TRACK_BYTES = 8 * 1024 * 1024
 # The moved layer is a few hundred bytes per blob; 4 MiB is thousands of them.
 # Its points (moved.pcd) are a cloud, and are held to MAX_CLOUD_BYTES like one.
 MAX_MOVED_BYTES = 4 * 1024 * 1024
+# The frames a moved layer may be sent in (MapStore.set_moved): the map's own,
+# or that of the cloud sent to POST /map-surveys, before the server levelled it.
+MOVED_FRAMES = ("map", "survey")
 
 
 class BundleError(ValueError):
@@ -869,25 +872,64 @@ class MapStore:
                                detail={"floor": floor_index, "clearance_m": clearance_m, **(detail or {})})
 
     def set_moved(self, map_id: str, floor_index: int, data: bytes,
-                  detail: Optional[dict] = None) -> Tuple[SiteMap, int, dict]:
+                  detail: Optional[dict] = None, frame: str = "map",
+                  moved_cloud: Optional[bytes] = None) -> Tuple[SiteMap, int, dict]:
         """Replace a floor's moved layer, as a new version: (map, version,
-        {"blobs", "dropped", "added", "moved_cloud_points_removed"}).
+        {"blobs", "dropped", "added", "moved_cloud_points_removed",
+        "moved_cloud_replaced"}).
 
         The usual call is "Keep": the same layer with some blobs taken off the
         list. The points of a blob no longer listed are taken out of moved.pcd
         too, so the amber 3D layer shows what the list shows. The cloud and the
-        grids are not touched. Raises BundleError for a layer that does not
-        parse, MapNotFound / FloorNotFound."""
-        from .cloud_edit import blob_points_mask, moved_bytes, parse_moved, pcd_bytes, read_pcd_bytes
+        grids are not touched.
+
+        `moved_cloud` (a PCD) given: it REPLACES moved.pcd -- a fresh run of the
+        moving-object search (FIND_MOVING), whose blobs are new, so nothing is
+        subtracted. `frame="survey"`: the layer and its points are in the frame
+        of the cloud sent to POST /map-surveys and are turned through the same
+        levelling rotation (the floor's survey.json), as at that upload. Raises
+        BundleError for a layer or cloud that does not parse, an unknown frame,
+        or frame "survey" on a floor with no survey.json; MapNotFound /
+        FloorNotFound."""
+        from .cloud_edit import blob_points_mask, moved_bytes, parse_moved, pcd_bytes, read_pcd_bytes, rotate_moved
 
         import numpy as np
 
+        if frame not in MOVED_FRAMES:
+            raise BundleError("frame must be one of: %s" % ", ".join(MOVED_FRAMES))
         if len(data) > MAX_MOVED_BYTES:
             raise BundleError("the moved layer exceeds %d bytes" % MAX_MOVED_BYTES)
-        doc = parse_moved(data)
+        parsed = parse_moved(data)
+        new_points = None
+        if moved_cloud is not None:
+            if len(moved_cloud) > MAX_CLOUD_BYTES:
+                raise BundleError("the moved cloud exceeds %d bytes" % MAX_CLOUD_BYTES)
+            new_points = read_pcd_bytes(moved_cloud, MAX_CLOUD_BYTES // 12)
         outcome: dict = {}
 
         def change(current: SiteMap, floor: MapFloor, floor_dir: Path, write) -> dict:
+            doc, points_in = parsed, new_points
+            if frame == "survey":
+                survey_path = floor_dir / ARTIFACT_FILES["survey"]
+                try:
+                    levelling = json.loads(survey_path.read_text(encoding="utf-8")).get("levelling") or {}
+                except (OSError, ValueError, AttributeError):
+                    raise BundleError(
+                        "map %s floor %d was not made from a survey upload (it has no readable survey.json), "
+                        "so a layer in the survey's frame cannot be placed on it; send it in the map's frame "
+                        "(frame=map)" % (map_id, floor_index)) from None
+                if levelling.get("rotated"):
+                    rotation = levelling.get("rotation")
+                    try:
+                        matrix = np.asarray(rotation, dtype=np.float64)
+                    except (TypeError, ValueError):
+                        matrix = None
+                    if matrix is None or matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+                        raise BundleError("map %s floor %d has a survey.json without a usable levelling "
+                                          "rotation" % (map_id, floor_index))
+                    doc = rotate_moved(doc, matrix, float(levelling.get("angle_deg") or 0.0))
+                    if points_in is not None:
+                        points_in = points_in @ matrix.T
             old_path = floor_dir / ARTIFACT_FILES["moved"]
             old_ids: set = set()
             dropped: list = []
@@ -901,7 +943,9 @@ class MapStore:
                 old_ids = {b["id"] for b in old["blobs"]}
             removed = 0
             cloud_path = floor_dir / ARTIFACT_FILES["moved_cloud"]
-            if dropped and cloud_path.is_file():
+            if points_in is not None:
+                write("moved_cloud", pcd_bytes(points_in))
+            elif dropped and cloud_path.is_file():
                 points = read_pcd_bytes(cloud_path.read_bytes(), MAX_CLOUD_BYTES // 12)
                 gone = np.zeros(len(points), dtype=bool)
                 for blob in dropped:
@@ -912,11 +956,13 @@ class MapStore:
             write("moved", moved_bytes(doc))
             outcome.update({"blobs": len(doc["blobs"]), "dropped": [b["id"] for b in dropped],
                             "added": sorted({b["id"] for b in doc["blobs"]} - old_ids),
-                            "moved_cloud_points_removed": removed})
+                            "moved_cloud_points_removed": removed,
+                            "moved_cloud_replaced": points_in is not None})
             return {}
 
         saved, number = self.edit_floor(map_id, floor_index, change, source="moved",
-                                        detail={"floor": floor_index, **(detail or {})})
+                                        detail={"floor": floor_index, "frame": frame,
+                                                "moved_cloud_replaced": new_points is not None, **(detail or {})})
         return saved, number, outcome
 
     # --- the quality report (maps/quality.py computes it) ------------------

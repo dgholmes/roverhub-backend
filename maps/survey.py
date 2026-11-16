@@ -74,6 +74,8 @@ TRACK_AGREES_DEG = 1.0
 # A track flatter than this is taken to be already levelled.
 LEVEL_TRACK_DEG = 1.0
 TRACK_FRAMES = ("auto", "raw", "level")
+# StartSurveyParams.survey_id's bounds (shared/schemas/survey.py).
+MAX_SURVEY_ID_CHARS = 64
 WEB_CLOUD_POINTS = 200_000
 
 
@@ -87,6 +89,12 @@ class SurveyRequest:
     track_frame: str = "auto"
     cloud_name: str = "cloud.pcd"
     track_name: str = "track.csv"
+    # Which console survey made this (StartSurveyParams.survey_id) and on which
+    # robot, when known: kept in survey.json so the map editor's "Find moving
+    # things again" (FIND_MOVING) can name the kept recording and the robot
+    # holding it, through restores and versions (schema 0.0.23).
+    survey_id: Optional[str] = None
+    robot_id: Optional[str] = None
 
     def check(self) -> None:
         from .survey_math import SurveyError
@@ -103,6 +111,9 @@ class SurveyRequest:
             raise SurveyError("resolution_m must be between 0.01 and 0.5 m")
         if self.track_frame not in TRACK_FRAMES:
             raise SurveyError("track_frame must be one of %s" % ", ".join(TRACK_FRAMES))
+        if self.survey_id is not None and not (
+                isinstance(self.survey_id, str) and 1 <= len(self.survey_id) <= MAX_SURVEY_ID_CHARS):
+            raise SurveyError("survey_id must be 1 to %d characters" % MAX_SURVEY_ID_CHARS)
 
 
 def slug(text: str) -> str:
@@ -259,6 +270,8 @@ def process_survey(store: MapStore, request: SurveyRequest, cloud_path: Path, tr
                  "min_ground_hits": grid["min_ground_hits"],
                  "method": "tools/map_prep/pcd_to_floorgrid.py defaults (observed ground, no ray casting)"},
         "cloud_sample_points": cloud_points,
+        # Which console survey and robot made it; nulls for an upload by hand.
+        "survey": {"survey_id": request.survey_id, "robot_id": request.robot_id},
     }
     (floor_dir / ARTIFACT_FILES["survey"]).write_text(json.dumps(sm_safe(survey_doc), indent=2), encoding="utf-8")
     floors = [{

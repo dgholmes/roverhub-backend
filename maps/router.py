@@ -32,7 +32,17 @@
                                                    untouched. A new version, draft, quality
                                                    queued, like PUT planning. 400 for a layer
                                                    that does not parse (maps/cloud_edit.py
-                                                   parse_moved), 404, 413 over 4 MiB
+                                                   parse_moved), 404, 413 over 4 MiB.
+         [?frame=map|survey]                       Or multipart: a `moved` part (moved.json)
+                                                   and an optional `moved_cloud` file part
+                                                   (moved.pcd), which then REPLACES the
+                                                   floor's moved.pcd ("moved_cloud_replaced":
+                                                   true) -- a re-run of the moving-object
+                                                   search (FIND_MOVING). frame=survey: both
+                                                   are in the frame of the cloud sent to POST
+                                                   /map-surveys and are carried through the
+                                                   levelling it got (its survey.json); 400
+                                                   for a floor that has none
 - POST   /maps/{map_id}/floors/{index}/cloud-edits
                                                 -> 202 + job (kind "cloud_edit"); body
                                                    {"delete_boxes": [{"min": [x,y,z], "max":
@@ -64,7 +74,13 @@ The survey pipeline, quality and versions (tracker 1-5-02, -04, -05, -06):
                                                    csv), text fields `site_id`, `name`, and
                                                    optional `map_id` (default "map-<slug of
                                                    name>"), `floor` (0), `resolution_m` (0.05),
-                                                   `track_frame` (auto | raw | level). The job
+                                                   `track_frame` (auto | raw | level),
+                                                   `survey_id` (1-64 chars: the console survey
+                                                   that made it) and `robot_id` (a robot at
+                                                   `site_id`; a device key's own robot always
+                                                   wins). Both go into the job's detail and
+                                                   the floor's survey.json ("survey": {...}),
+                                                   null when not sent. The job
                                                    levels it, grids it, stores it as a draft
                                                    (maps/survey.py), then runs the quality
                                                    report. 413 over max_survey_bytes
@@ -152,8 +168,8 @@ from .jobs import JobRunner
 from .quality import is_current, run_quality
 from .store import (
     ARTIFACT_FILES, DEFAULT_CLEARANCE_M, DEFAULT_MAPS_DIR, MAX_CLOUD_BYTES, MAX_MOVED_BYTES, MAX_PLANNING_BYTES,
-    MAX_TRACK_BYTES, UPLOAD_PREFIX, BundleError, FloorNotFound, MapNotFound, MapStore, PlanningNotFound,
-    VersionNotFound, valid_map_id,
+    MAX_TRACK_BYTES, MOVED_FRAMES, UPLOAD_PREFIX, BundleError, FloorNotFound, MapNotFound, MapStore,
+    PlanningNotFound, VersionNotFound, valid_map_id,
 )
 
 logger = logging.getLogger("roverhub.maps")
@@ -183,7 +199,7 @@ MEDIA_TYPES = {"grid": "image/x-portable-graymap", "preview": "image/png",
 # .pcd is 88 MB for 2.76 M points with normals; 1 GiB is a building ten times
 # that, and survey_math.MAX_POINTS refuses more points than the server holds.
 MAX_SURVEY_BYTES = 1024 * 1024 * 1024
-SURVEY_FIELDS = ("site_id", "name", "map_id", "floor", "resolution_m", "track_frame")
+SURVEY_FIELDS = ("site_id", "name", "map_id", "floor", "resolution_m", "track_frame", "survey_id", "robot_id")
 # File parts of a survey upload. `moved` / `moved_cloud` (optional) are the
 # "probably moved" layer, in the uploaded cloud's frame (maps/survey.py).
 SURVEY_FILES = ("cloud", "track", "moved", "moved_cloud")
@@ -222,7 +238,8 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                       audit: Optional[AuditFn] = None,
                       jobs_dir: Optional[str] = None,
                       start_jobs: bool = True,
-                      max_survey_bytes: int = MAX_SURVEY_BYTES) -> APIRouter:
+                      max_survey_bytes: int = MAX_SURVEY_BYTES,
+                      robot_site_of: Optional[Callable[[str], Optional[str]]] = None) -> APIRouter:
     """`on_status(map)` after a status change is stored (the audit log).
     `audit` (history/audit.py AuditRecorder.record) is told every upload,
     zone edit, planning-grid change, delete, restore and quality override.
@@ -230,7 +247,11 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
     Background jobs keep their records in `jobs_dir`, by default `map-jobs`
     beside `maps_dir` (outside the store, whose directory names are map ids).
     `start_jobs=False` (tests) queues jobs without a worker thread; call
-    `router.jobs.run_pending()`."""
+    `router.jobs.run_pending()`.
+
+    `robot_site_of(robot_id)` -> the site a robot registered at, or None: a
+    survey upload's `robot_id` field must name a robot at the survey's site.
+    Without it (unit tests) the field is taken as sent."""
     router = APIRouter()
     store = MapStore(maps_dir)
     router.store = store  # type: ignore[attr-defined]  # tests and the app share it
@@ -259,12 +280,26 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
             logger.exception("could not queue a quality check of map %s", site_map.map_id)
             return None
 
+    def _device_of(request: Request) -> Optional[str]:
+        """The robot whose device key made this request, or None for a person.
+        A robot uploads the draft of a survey it made (auth/policy.py
+        `device_own_site`); the audit row then names it as the robot too."""
+        principal = principal_of(request)
+        return principal.id if principal is not None and principal.kind == "device" else None
+
     def _audit(action: str, site_map: Optional[SiteMap], map_id: str, detail: dict,
-               site_id: Optional[str] = None, actor: Optional[str] = None) -> None:
+               site_id: Optional[str] = None, actor: Optional[str] = None,
+               request: Optional[Request] = None) -> None:
         if audit is None:
             return
         # `actor` only off a request (a job's worker thread has none bound).
-        extra = {"actor": actor} if actor is not None else {}
+        extra: dict = {"actor": actor} if actor is not None else {}
+        device = _device_of(request) if request is not None else None
+        if device is not None:
+            # The actor is already the device (the request's principal); say so
+            # in the row as well, so "rover-jetson" is not read as a person.
+            detail = {**detail, "by_device": device}
+            extra["robot_id"] = device
         try:
             audit(action, map_id, "ok", detail,
                   site_id=site_id or (site_map.site_id if site_map is not None else None), **extra)
@@ -430,7 +465,8 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
         _audit("map.planning.set", saved, map_id,
                {"floor": index, "clearance_m": clearance_m, "bytes": len(raw), "version": version,
                 "free_cells": floor.planning.free_cells if floor.planning else None,
-                "occupied_cells": floor.planning.occupied_cells if floor.planning else None})
+                "occupied_cells": floor.planning.occupied_cells if floor.planning else None},
+               request=request)
         job_id = _edited(saved, version, request)
         headers = {"X-Map-Version": str(version)}
         if job_id:
@@ -446,16 +482,71 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
 
     # --- the map editor: the moved layer and cloud edits (maps/cloud_edit.py) -
 
+    async def _moved_parts(request: Request) -> tuple:
+        """(moved.json bytes, moved.pcd bytes or None) from a multipart PUT
+        moved: a `moved` part (file or text) and an optional `moved_cloud`
+        file part. Counted as it arrives, like a survey upload."""
+        limit = MAX_MOVED_BYTES + MAX_CLOUD_BYTES + 64 * 1024
+        declared = request.headers.get("content-length")
+        if declared is not None and declared.isdigit() and int(declared) > limit:
+            raise HTTPException(status_code=413, detail="the moved layer upload exceeds %d bytes" % limit)
+        received = 0
+
+        async def counting_receive():
+            nonlocal received
+            message = await request.receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    raise HTTPException(status_code=413, detail="the moved layer upload exceeds %d bytes" % limit)
+            return message
+
+        form = await Request(request.scope, counting_receive).form(max_files=2, max_fields=1)
+        try:
+            found: Dict[str, bytes] = {}
+            for name, part in form.multi_items():
+                if name not in ("moved", "moved_cloud"):
+                    raise HTTPException(status_code=400, detail="%r is not part of a moved layer upload" % name)
+                if name in found:
+                    raise HTTPException(status_code=400, detail="%r was sent twice" % name)
+                cap = MAX_MOVED_BYTES if name == "moved" else MAX_CLOUD_BYTES
+                if isinstance(part, UploadFile):
+                    data = await run_in_threadpool(part.file.read, cap + 1)
+                elif name == "moved":
+                    data = part.encode("utf-8")
+                else:
+                    raise HTTPException(status_code=400, detail="'moved_cloud' must be a file part")
+                if len(data) > cap:
+                    raise HTTPException(status_code=413, detail="the %s exceeds %d bytes" % (
+                        "moved layer" if name == "moved" else "moved cloud", cap))
+                found[name] = data
+            if "moved" not in found:
+                raise HTTPException(status_code=400, detail="the upload needs a 'moved' part (moved.json)")
+            return found["moved"], found.get("moved_cloud")
+        finally:
+            await form.close()
+
     @router.put("/maps/{map_id}/floors/{index}/moved")
-    async def put_moved(map_id: str, index: int, request: Request):
-        raw = await read_bounded_body(request, MAX_MOVED_BYTES, "moved layer")
+    async def put_moved(map_id: str, index: int, request: Request, frame: str = "map"):
+        # frame=survey: the layer is in the frame of the cloud that was sent to
+        # POST /map-surveys (the robot's re-run of the moving-object search,
+        # FIND_MOVING); it is carried through the levelling that survey got.
+        if frame not in MOVED_FRAMES:
+            raise HTTPException(status_code=400, detail="frame must be one of: %s" % ", ".join(MOVED_FRAMES))
+        moved_cloud = None
+        if request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+            raw, moved_cloud = await _moved_parts(request)
+        else:
+            raw = await read_bounded_body(request, MAX_MOVED_BYTES, "moved layer")
         saved, version, outcome = await run_in_threadpool(
-            _planning, lambda: store.set_moved(map_id, index, raw))
+            _planning, lambda: store.set_moved(map_id, index, raw, frame=frame, moved_cloud=moved_cloud))
         _audit("map.moved.set", saved, map_id,
                {"floor": index, "version": version, "blobs": outcome["blobs"],
                 "dropped": len(outcome["dropped"]), "dropped_ids": outcome["dropped"][:50],
                 "added": len(outcome["added"]),
-                "moved_cloud_points_removed": outcome["moved_cloud_points_removed"]})
+                "moved_cloud_points_removed": outcome["moved_cloud_points_removed"],
+                "moved_cloud_replaced": outcome["moved_cloud_replaced"], "frame": frame},
+               request=request)
         job_id = _edited(saved, version, request)
         return {"map": saved.model_dump(mode="json"), "version": version, "quality_job_id": job_id, **outcome}
 
@@ -645,7 +736,9 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                 raise HTTPException(status_code=400, detail="%s must be a number" % key) from None
 
         name = fields.get("name", "").strip()
+        survey_id = fields.get("survey_id")
         survey = SurveyRequest(
+            survey_id=survey_id,
             map_id=fields.get("map_id", "").strip() or "map-" + slug(name),
             site_id=fields.get("site_id", "").strip(), name=name,
             floor_index=number("floor", 0, int), resolution_m=number("resolution_m", 0.05, float),
@@ -670,6 +763,30 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                     raise _TooLarge("the %s exceeds %d bytes" % (label, limit))
                 handle.write(chunk)
         return size
+
+    def _survey_robot(request: Request, site_id: str, claimed: Optional[str]) -> Optional[str]:
+        """The robot a survey upload is from: a device key's own robot (a
+        `robot_id` field naming another is a 400), else the field, which must
+        name a robot registered at the survey's site; None when not sent."""
+        claimed = claimed.strip() if claimed is not None else None
+        device = _device_of(request)
+        if device is not None:
+            if claimed and claimed != device:
+                raise HTTPException(status_code=400,
+                                    detail="robot_id must be this device's own robot (%s)" % device)
+            return device
+        if not claimed:
+            return None
+        if robot_site_of is not None:
+            try:
+                robot_site = robot_site_of(claimed)
+            except Exception:
+                logger.exception("could not look up the site of robot %s", claimed)
+                robot_site = None
+            if robot_site != site_id:
+                raise HTTPException(status_code=400,
+                                    detail="robot_id %s is not a robot at site %s" % (claimed, site_id))
+        return claimed
 
     @router.post("/map-surveys", status_code=202)
     async def upload_survey(request: Request):
@@ -710,6 +827,7 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                     raise HTTPException(status_code=400, detail="the survey needs a %r file part" % name)
             survey = _survey_request(fields, files["cloud"].filename, files["track"].filename)
             require_site_capability(request, survey.site_id, ("configure",))
+            survey.robot_id = _survey_robot(request, survey.site_id, fields.get("robot_id"))
             existing = store.get(survey.map_id)
             if existing is not None and existing.site_id != survey.site_id:
                 require_site_capability(request, existing.site_id, ("configure",))
@@ -750,11 +868,13 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                               requested_by=_requested_by(request), job_id=job_id,
                               detail={"name": survey.name, "floor": survey.floor_index,
                                       "cloud": survey.cloud_name, "track": survey.track_name,
-                                      "moved": "moved" in files, "replaces": existing is not None})
+                                      "moved": "moved" in files, "replaces": existing is not None,
+                                      "survey_id": survey.survey_id, "robot_id": survey.robot_id})
             _audit("map.survey", existing, survey.map_id,
                    {"job_id": job_id, "floor": survey.floor_index,
-                    "cloud": survey.cloud_name, "replaces": existing is not None},
-                   site_id=survey.site_id)
+                    "cloud": survey.cloud_name, "replaces": existing is not None,
+                    "survey_id": survey.survey_id, "robot_id": survey.robot_id},
+                   site_id=survey.site_id, request=request)
             return job
         finally:
             await form.close()

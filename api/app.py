@@ -164,7 +164,10 @@ def _resolve_site(params):
 # Sign-in (auth/). Off unless AUTH_ENABLED=true. The guard is an app-wide
 # dependency, so every route -- including ones added later -- is checked
 # against auth/policy.py, and a route with no rule there is refused.
-auth = Auth.from_env(resolve_site=_resolve_site)
+auth = Auth.from_env(resolve_site=_resolve_site,
+                     # The site a device's robot registered at: where its key may
+                     # upload a survey draft (auth/policy.py `device_own_site`).
+                     device_site_of=lambda robot_id: _site_for(robot_id))
 
 
 async def _bind_audit_actor(request: Request) -> None:
@@ -183,7 +186,10 @@ app.include_router(build_auth_router(auth, on_login=history.audit.login, audit=h
 # The broker's checks. A device's writes are pinned to the site its robot
 # registered at (auth/mqtt_hooks.py).
 app.include_router(build_mqtt_hooks_router(auth, site_of=lambda robot_id: _site_for(robot_id)))
-app.include_router(build_router(command_store, mqtt_client, registry=registry))
+# A survey or FIND_MOVING command names a map, checked against the robot's
+# site before it is sent (the map store is built further down; late-bound).
+app.include_router(build_router(command_store, mqtt_client, registry=registry,
+                                map_lookup=lambda map_id: maps_router.store.get(map_id)))
 # POST /robots/{id}/logs/request asks a robot for its journal; the answer goes
 # robot -> browser through the broker (shared/schemas/logs.py). Late-bound,
 # like the command routes' publish, so a test can stand in for the broker.
@@ -214,6 +220,8 @@ maps_router = build_maps_router(
     maps_dir=os.environ.get("MAPS_DIR", DEFAULT_MAPS_DIR),
     on_status=lambda m: history.audit.map_status(m.map_id, m.status, m.site_id) if m is not None else None,
     audit=history.audit.record,
+    # A survey upload's robot_id must be a robot at the survey's site.
+    robot_site_of=_site_for,
 )
 app.include_router(maps_router)
 _tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)

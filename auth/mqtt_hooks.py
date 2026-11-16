@@ -37,8 +37,14 @@ ACC_READ, ACC_WRITE, ACC_READWRITE, ACC_SUBSCRIBE = 1, 2, 3, 4
 # without it here a signed-in broker refused it and the live scan went dark.
 # logs is the robot's own journal, edge -> browser; logs/request is the
 # backend asking for it (schema 0.0.22, shared/schemas/logs.py).
+# survey/status (retained), survey/map and sensors/lidar_mount (retained) are
+# the bridge's survey and lidar-calibration feeds, edge -> browser (schema
+# 0.0.23, shared/schemas/survey.py and sensors.py): the device writes its own,
+# people read them at their sites. A retained message is a publish like any
+# other here; the broker checks its delivery (ACC_READ) per reader as usual.
 _ROBOT_TOPICS = {"telemetry", "state", "heartbeat", "lower_state", "commands", "ack", "run", "scan",
-                 "incidents", "perception/status", "logs", "logs/request"}
+                 "incidents", "perception/status", "logs", "logs/request",
+                 "survey/status", "survey/map", "sensors/lidar_mount"}
 # What a bridge receives rather than sends. Only the backend (superuser) writes
 # these, and browsers may not even read them: commands go through REST, where
 # roles are checked per command, and a log request through
