@@ -492,10 +492,11 @@ def test_freezing_needs_a_current_passed_report_or_an_override(client, router, t
     assert refused.json()["detail"]["code"] == "quality_failed"
     assert "level_evidence" in refused.json()["detail"]["failed"]
 
-    # A planning grid changes an input: the report is stale until it runs again.
+    # A planning grid (the map editor's brush) is a new version, which has no
+    # report until its own check runs -- the one PUT planning queued.
     assert client.put("/maps/map-venue/floors/0/planning", content=b"P5\n4 2\n255\n" + bytes([254] * 8)).status_code == 200
     refused = client.put("/maps/map-venue/status", json={**freeze, "override_quality": True})
-    assert refused.status_code == 409 and refused.json()["detail"]["code"] == "quality_stale"
+    assert refused.status_code == 409 and refused.json()["detail"]["code"] == "quality_missing"
     router.jobs.run_pending()
 
     frozen = client.put("/maps/map-venue/status", json={**freeze, "override_quality": True, "reason": "bench map"})

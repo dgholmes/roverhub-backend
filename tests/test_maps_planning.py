@@ -356,10 +356,44 @@ def test_put_planning_over_the_cap_is_413(client, monkeypatch):
     assert client.put(URL, content=PLANNING).status_code == 413
 
 
-def test_put_planning_leaves_the_status_alone(client, router):
+def test_put_planning_is_a_new_version_and_drops_an_active_map_to_draft(client, router):
+    # The map editor's brush (2026-11-16): every save is restorable, and a map
+    # whose walkable area changed needs signing off again. DELETE (not the
+    # editor's) still edits in place and leaves the status alone.
+    zone = MapZone(zone_id="z1", map_id="map-venue", kind="no_go", label="Stairwell",
+                   polygon=[(0, 0), (1, 0), (1, 1)])
+    router.store.save_zones("map-venue", [zone])
     router.store.set_status("map-venue", "active")
-    assert client.put(URL, content=PLANNING).json()["status"] == "active"
+    response = client.put(URL, content=PLANNING)
+    assert response.status_code == 200
+    assert response.json()["status"] == "draft"
+    assert [z["zone_id"] for z in response.json()["zones"]] == ["z1"]
+    assert response.headers["X-Map-Version"] == "2"
+    job = router.jobs.get(response.headers["X-Quality-Job"])
+    assert job["kind"] == "quality" and job["status"] == "queued"
+    items = client.get("/maps/map-venue/versions").json()["items"]
+    assert [(i["version"], i["current"], i["source"]) for i in items] == [
+        (2, True, "planning"), (1, False, "upload")]
+    assert items[0]["detail"] == {"floor": 0, "clearance_m": 0.2}
+    assert items[0]["floors"][0]["has_planning"] and not items[1]["floors"][0]["has_planning"]
+    # The edit did not write through to the kept version.
+    assert client.get("/maps/map-venue/versions/1/floors/0/planning").status_code == 404
+    restored = client.post("/maps/map-venue/versions/1/restore").json()
+    assert restored["floors"][0]["planning"] is None and restored["status"] == "draft"
+
+    router.store.set_status("map-venue", "active")
+    client.put(URL, content=PLANNING)
+    router.store.set_status("map-venue", "active")
     assert client.delete(URL).json()["status"] == "active"
+
+
+def test_put_planning_never_changes_the_kept_versions_files(client, router, tmp_path):
+    # The new version is assembled from hard links to the live files: writing
+    # the new grid must replace the link, never write through it.
+    client.put(URL, content=PLANNING)
+    client.put(URL, content=OTHER)
+    assert client.get("/maps/map-venue/versions/2/floors/0/planning").content == PLANNING
+    assert client.get(URL).content == OTHER
 
 
 def test_a_bundle_upload_may_include_a_planning_grid(client, tmp_path):
@@ -388,14 +422,19 @@ def test_the_planning_routes_have_rules_and_are_on_the_app(router):
     assert ("HEAD", PLANNING_ROUTE) in ROUTES
 
 
-def test_reading_is_like_the_grid_and_writing_like_zones():
+def test_reading_is_like_the_grid_and_writing_is_the_supervisors_or_the_engineers():
     assert ROUTES[("GET", PLANNING_ROUTE)] == ROUTES[("GET", "/maps/{map_id}/floors/{index}/{kind}")]
-    for method in ("PUT", "DELETE"):
-        assert ROUTES[(method, PLANNING_ROUTE)] == ROUTES[("PUT", "/maps/{map_id}/zones")]
-        capabilities = ROUTES[(method, PLANNING_ROUTE)].capabilities
-        assert any(role_can("supervisor", c) for c in capabilities)
-        for role in ("viewer", "operator", "technician", "engineer"):
-            assert not any(role_can(role, c) for c in capabilities), (method, role)
+    # Removing one is like drawing zones.
+    assert ROUTES[("DELETE", PLANNING_ROUTE)] == ROUTES[("PUT", "/maps/{map_id}/zones")]
+    # Setting one is a map-editor save: a new version, draft, so the
+    # supervisor still signs it off; the engineer who uploaded may clean it.
+    capabilities = ROUTES[("PUT", PLANNING_ROUTE)].capabilities
+    for role in ("supervisor", "engineer"):
+        assert any(role_can(role, c) for c in capabilities), role
+    for role in ("viewer", "operator", "technician"):
+        assert not any(role_can(role, c) for c in capabilities), role
+    for role in ("viewer", "operator", "technician", "engineer"):
+        assert not any(role_can(role, c) for c in ROUTES[("DELETE", PLANNING_ROUTE)].capabilities), role
 
 
 PASSWORD = "correct horse"
@@ -435,7 +474,7 @@ def test_with_sign_in_off_anyone_may_set_and_remove_it(app_map):
     assert client.delete(url).status_code == 200
 
 
-def test_with_sign_in_on_everyone_reads_it_and_only_a_supervisor_changes_it(auth_on, app_map):
+def test_with_sign_in_on_everyone_reads_it_and_a_supervisor_or_engineer_sets_it(auth_on, app_map):
     client = TestClient(backend.app)
     url = "/maps/%s/floors/0/planning" % app_map
     vic, ana, eve, sue = (_bearer(client, n) for n in ("vic", "ana", "eve", "sue"))
@@ -444,8 +483,9 @@ def test_with_sign_in_on_everyone_reads_it_and_only_a_supervisor_changes_it(auth
     anonymous = TestClient(backend.app)
 
     assert anonymous.put(url, content=PLANNING).status_code == 401
-    for who in (vic, ana, eve):
+    for who in (vic, ana):
         assert client.put(url, content=PLANNING, headers=who).status_code == 403
+    assert client.put(url, content=PLANNING, headers=eve).status_code == 200
     assert client.put(url, content=PLANNING, headers=sue).status_code == 200
 
     assert anonymous.get(url).status_code == 401

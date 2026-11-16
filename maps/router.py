@@ -4,17 +4,49 @@
 - GET    /maps/{map_id}                         -> SiteMap, 404 if unknown
 - POST   /maps                                  -> 201 + SiteMap; replaces any map with that id
 - GET    /maps/{map_id}/floors/{index}/{kind}   -> the floor's `grid` (PGM), `preview`
-                                                   (PNG) or `cloud` (float32 xyz); 404 if
+                                                   (PNG), `cloud` (float32 xyz), `track`
+                                                   (csv), `survey` (json), `moved` (the
+                                                   "probably moved" layer, json) or
+                                                   `moved_cloud` (its points, PCD); 404 if
                                                    there is no such file, 413 if a cloud is
                                                    over 8 MiB
 - GET    /maps/{map_id}/floors/{index}/planning -> the floor's planning grid (PGM), the map
                                                    Nav2 plans on; 404 if it has none
 - PUT    /maps/{map_id}/floors/{index}/planning -> SiteMap; the raw PGM as the body
-         [?clearance_m=0.2]                        sets it (floor.planning gets its counts);
-                                                   400 if it is not a P5 PGM of exactly the
-                                                   floor's size_cells, 404 for an unknown
-                                                   map or floor, 413 over 32 MiB
-- DELETE /maps/{map_id}/floors/{index}/planning -> SiteMap without it; 404 if there is none
+         [?clearance_m=0.2]                        sets it (floor.planning gets its counts)
+                                                   AS A NEW VERSION: the map drops to draft
+                                                   (zones kept) and a quality check is
+                                                   queued (headers X-Map-Version,
+                                                   X-Quality-Job); 400 if it is not a P5 PGM
+                                                   of exactly the floor's size_cells, 404
+                                                   for an unknown map or floor, 413 over
+                                                   32 MiB
+- DELETE /maps/{map_id}/floors/{index}/planning -> SiteMap without it; 404 if there is none.
+                                                   In place, status kept (no version)
+- PUT    /maps/{map_id}/floors/{index}/moved    -> {"map": SiteMap, "version", "quality_job_id",
+                                                   "blobs", "dropped", "added",
+                                                   "moved_cloud_points_removed"}; the body is
+                                                   the whole moved.json. "Keep" is this with
+                                                   the kept blob left out: the blob's points
+                                                   leave moved.pcd, the cloud and grids are
+                                                   untouched. A new version, draft, quality
+                                                   queued, like PUT planning. 400 for a layer
+                                                   that does not parse (maps/cloud_edit.py
+                                                   parse_moved), 404, 413 over 4 MiB
+- POST   /maps/{map_id}/floors/{index}/cloud-edits
+                                                -> 202 + job (kind "cloud_edit"); body
+                                                   {"delete_boxes": [{"min": [x,y,z], "max":
+                                                   [x,y,z]}], "resolve_moved": ["b001"],
+                                                   "keep_moved": ["b002"], "reason": "..."},
+                                                   every key optional but one. The job
+                                                   deletes the points, re-rasterises the
+                                                   planning grid under them
+                                                   (maps/cloud_edit.py), saves ONE new
+                                                   version (draft) and queues the quality
+                                                   check (result.quality_job_id). 400 for a
+                                                   bad box (min > max, not finite, over
+                                                   500), an unknown blob, or a floor with no
+                                                   cloud; 404; 413 over 1 MiB
 - PUT    /maps/{map_id}/zones                   -> SiteMap; body {"zones": [MapZone, ...]}
                                                    replaces the map's zones; 404 if unknown,
                                                    400 if a zone cannot be stored
@@ -51,8 +83,8 @@ The survey pipeline, quality and versions (tracker 1-5-02, -04, -05, -06):
 - POST   /maps/{map_id}/versions/{v}/restore    -> SiteMap; version v becomes the live bundle
                                                    again (as a new version), zones kept, draft
 
-A quality job is also queued after every upload, restore and planning-grid
-change, so the console usually finds a fresh report waiting. PUT status
+A quality job is also queued after every upload, restore, planning-grid
+change and map-editor save, so the console usually finds a fresh report waiting. PUT status
 `active` refuses with 409 unless the report is current (detail.code
 `quality_missing` / `quality_stale`) and passed (`quality_failed`, with
 `failed`); `{"status": "active", "override_quality": true, "reason": "..."}`
@@ -69,7 +101,9 @@ the bundle**:
 
 A floor's `floor<N>/planning.pgm` may be sent as well; it is optional. So may
 `floor<N>/track.csv`, the path the survey walked in the bundle's (levelled)
-frame: the quality report needs it for path coverage, drift and track tilt.
+frame: the quality report needs it for path coverage, drift and track tilt. So
+may `floor<N>/moved.json` and `floor<N>/moved.pcd`, the "probably moved" layer
+tools/map_prep/transient_filter.py writes (pack_map.py --moved/--moved-cloud).
 
 The field name, not the filename, because a filename is whatever a browser or
 client chooses to send, while a field name is carried verbatim. Only the paths
@@ -82,7 +116,10 @@ Access is the rules in auth/policy.py: reading is open to every role, uploading
 or deleting a map is site configuration, and drawing zones and freezing a map
 (`editZones`) is the supervisor's review of it. Setting or removing a floor's
 planning grid is the same review as drawing zones -- both say where the robot
-may walk -- so it is `editZones` too. Neither changes the map's status.
+may walk. The map editor's saves (PUT planning, PUT moved, POST cloud-edits)
+drop the map to draft, so the supervisor's sign-off is still needed after
+them: the engineer who uploads a survey may clean it too, so they are
+`editZones` or `configure`. Removing a planning grid is `editZones`.
 A survey upload and a version restore replace the bundle, like an upload, so
 they are `configure`; running the quality check is either role's; freezing a
 map whose report failed also needs `override`.
@@ -112,8 +149,9 @@ from shared.schemas.maps import MapStatus, MapZone, SiteMap
 from .jobs import JobRunner
 from .quality import is_current, run_quality
 from .store import (
-    DEFAULT_CLEARANCE_M, DEFAULT_MAPS_DIR, MAX_CLOUD_BYTES, MAX_PLANNING_BYTES, MAX_TRACK_BYTES, UPLOAD_PREFIX,
-    BundleError, FloorNotFound, MapNotFound, MapStore, PlanningNotFound, VersionNotFound, valid_map_id,
+    ARTIFACT_FILES, DEFAULT_CLEARANCE_M, DEFAULT_MAPS_DIR, MAX_CLOUD_BYTES, MAX_MOVED_BYTES, MAX_PLANNING_BYTES,
+    MAX_TRACK_BYTES, UPLOAD_PREFIX, BundleError, FloorNotFound, MapNotFound, MapStore, PlanningNotFound,
+    VersionNotFound, valid_map_id,
 )
 
 logger = logging.getLogger("roverhub.maps")
@@ -132,16 +170,21 @@ MAX_UPLOAD_BYTES = 128 * 1024 * 1024
 MAX_ZONES_BODY_BYTES = 1024 * 1024
 
 PART_NAME_RE = re.compile(
-    r"site_map\.json|floor[0-9]{1,3}/(?:grid\.pgm|grid\.png|cloud\.bin|planning\.pgm|track\.csv)")
+    r"site_map\.json|floor[0-9]{1,3}/(?:grid\.pgm|grid\.png|cloud\.bin|planning\.pgm|track\.csv"
+    r"|moved\.json|moved\.pcd)")
 MEDIA_TYPES = {"grid": "image/x-portable-graymap", "preview": "image/png",
                "cloud": "application/octet-stream", "planning": "image/x-portable-graymap",
-               "track": "text/csv", "survey": "application/json"}
+               "track": "text/csv", "survey": "application/json",
+               "moved": "application/json", "moved_cloud": "application/octet-stream"}
 
 # A survey upload: the raw cloud is the bulk. The 2026-11-09 office survey's
 # .pcd is 88 MB for 2.76 M points with normals; 1 GiB is a building ten times
 # that, and survey_math.MAX_POINTS refuses more points than the server holds.
 MAX_SURVEY_BYTES = 1024 * 1024 * 1024
 SURVEY_FIELDS = ("site_id", "name", "map_id", "floor", "resolution_m", "track_frame")
+# File parts of a survey upload. `moved` / `moved_cloud` (optional) are the
+# "probably moved" layer, in the uploaded cloud's frame (maps/survey.py).
+SURVEY_FILES = ("cloud", "track", "moved", "moved_cloud")
 _CHUNK = 1024 * 1024
 
 
@@ -164,6 +207,10 @@ def _limit_for(name: str) -> int:
         return MAX_CLOUD_BYTES
     if name.endswith("track.csv"):
         return MAX_TRACK_BYTES
+    if name.endswith("moved.json"):
+        return MAX_MOVED_BYTES
+    if name.endswith("moved.pcd"):
+        return MAX_CLOUD_BYTES
     return MAX_IMAGE_BYTES
 
 
@@ -211,12 +258,14 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
             return None
 
     def _audit(action: str, site_map: Optional[SiteMap], map_id: str, detail: dict,
-               site_id: Optional[str] = None) -> None:
+               site_id: Optional[str] = None, actor: Optional[str] = None) -> None:
         if audit is None:
             return
+        # `actor` only off a request (a job's worker thread has none bound).
+        extra = {"actor": actor} if actor is not None else {}
         try:
             audit(action, map_id, "ok", detail,
-                  site_id=site_id or (site_map.site_id if site_map is not None else None))
+                  site_id=site_id or (site_map.site_id if site_map is not None else None), **extra)
         except Exception:
             logger.exception("could not audit %s of map %s", action, map_id)
 
@@ -340,7 +389,7 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
         path = store.artifact_path(map_id, index, kind)
         if path is None:
             raise HTTPException(status_code=404, detail="no such file")
-        if kind == "cloud" and os.path.getsize(path) > MAX_CLOUD_BYTES:
+        if kind in ("cloud", "moved_cloud") and os.path.getsize(path) > MAX_CLOUD_BYTES:
             raise HTTPException(status_code=413, detail="cloud exceeds %d bytes" % MAX_CLOUD_BYTES)
         # A re-upload replaces the files under the same URL, so make the browser
         # revalidate (FileResponse supplies the ETag) rather than guess.
@@ -362,18 +411,29 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
     def get_planning(map_id: str, index: int):
         return _serve(map_id, index, "planning")
 
+    def _edited(saved: SiteMap, version: int, request: Request) -> Optional[str]:
+        """After a map-editor save: queue the quality check, answer with headers."""
+        return _queue_quality_quietly(saved, request)
+
     # The body is the PGM itself, read by hand so the size cap applies before
-    # anything is parsed (as for zones).
+    # anything is parsed (as for zones). The map editor's brush: a new version,
+    # draft, quality queued (MapStore.edit_planning).
     @router.put("/maps/{map_id}/floors/{index}/planning")
     async def put_planning(map_id: str, index: int, request: Request,
                            clearance_m: float = DEFAULT_CLEARANCE_M):
         raw = await read_bounded_body(request, MAX_PLANNING_BYTES, "planning grid")
-        saved = await run_in_threadpool(
-            _planning, lambda: store.set_planning(map_id, index, raw, clearance_m))
+        saved, version = await run_in_threadpool(
+            _planning, lambda: store.edit_planning(map_id, index, raw, clearance_m))
+        floor = next(f for f in saved.floors if f.index == index)
         _audit("map.planning.set", saved, map_id,
-               {"floor": index, "clearance_m": clearance_m, "bytes": len(raw)})
-        _queue_quality_quietly(saved, request)
-        return saved
+               {"floor": index, "clearance_m": clearance_m, "bytes": len(raw), "version": version,
+                "free_cells": floor.planning.free_cells if floor.planning else None,
+                "occupied_cells": floor.planning.occupied_cells if floor.planning else None})
+        job_id = _edited(saved, version, request)
+        headers = {"X-Map-Version": str(version)}
+        if job_id:
+            headers["X-Quality-Job"] = job_id
+        return Response(saved.model_dump_json(), media_type="application/json", headers=headers)
 
     @router.delete("/maps/{map_id}/floors/{index}/planning")
     def delete_planning(map_id: str, index: int, request: Request):
@@ -381,6 +441,77 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
         _audit("map.planning.delete", saved, map_id, {"floor": index})
         _queue_quality_quietly(saved, request)
         return saved
+
+    # --- the map editor: the moved layer and cloud edits (maps/cloud_edit.py) -
+
+    @router.put("/maps/{map_id}/floors/{index}/moved")
+    async def put_moved(map_id: str, index: int, request: Request):
+        raw = await read_bounded_body(request, MAX_MOVED_BYTES, "moved layer")
+        saved, version, outcome = await run_in_threadpool(
+            _planning, lambda: store.set_moved(map_id, index, raw))
+        _audit("map.moved.set", saved, map_id,
+               {"floor": index, "version": version, "blobs": outcome["blobs"],
+                "dropped": len(outcome["dropped"]), "dropped_ids": outcome["dropped"][:50],
+                "added": len(outcome["added"]),
+                "moved_cloud_points_removed": outcome["moved_cloud_points_removed"]})
+        job_id = _edited(saved, version, request)
+        return {"map": saved.model_dump(mode="json"), "version": version, "quality_job_id": job_id, **outcome}
+
+    @router.post("/maps/{map_id}/floors/{index}/cloud-edits", status_code=202)
+    async def post_cloud_edits(map_id: str, index: int, request: Request):
+        from .cloud_edit import (
+            MAX_CLOUD_EDIT_BODY_BYTES, check_against_floor, parse_cloud_edit, parse_moved, run_cloud_edit,
+        )
+
+        raw = await read_bounded_body(request, MAX_CLOUD_EDIT_BODY_BYTES, "cloud edit")
+        try:
+            edit = parse_cloud_edit(raw)
+        except BundleError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        site_map = store.get(map_id)
+        if site_map is None:
+            raise HTTPException(status_code=404, detail="map not found")
+        if not any(f.index == index for f in site_map.floors):
+            raise HTTPException(status_code=404, detail="map %s has no floor %d" % (map_id, index))
+
+        def check() -> None:
+            # Refused now, with the reason, rather than as a failed job; the
+            # job checks again against what it reads.
+            moved_path = store.artifact_path(map_id, index, "moved")
+            moved = parse_moved(moved_path.read_bytes()) if moved_path is not None else None
+            check_against_floor(edit, store.artifact_path(map_id, index, "cloud") is not None, moved)
+
+        try:
+            await run_in_threadpool(check)
+        except BundleError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        requested_by = _requested_by(request)
+        job_id = jobs.new_id()
+
+        def work(progress):
+            result = run_cloud_edit(store, map_id, index, edit, progress, detail={"job_id": job_id})
+            saved = store.get(map_id)
+            result["quality_job_id"] = None
+            try:
+                result["quality_job_id"] = _queue_quality(map_id, saved.site_id if saved else None,
+                                                          requested_by)["job_id"]
+            except Exception:
+                logger.exception("could not queue a quality check of map %s", map_id)
+            planning = result["planning"]
+            _audit("map.cloud_edit", saved, map_id,
+                   {"job_id": job_id, "floor": index, "version": result["version"],
+                    "boxes": len(edit.delete_boxes), "resolved_moved": len(edit.resolve_moved),
+                    "kept_moved": len(edit.keep_moved), "points_removed": result["points_removed"],
+                    "moved_cloud_points_removed": result["moved_cloud_points_removed"],
+                    "cells_freed": planning.get("freed_cells", 0), "reason": edit.reason},
+                   site_id=site_map.site_id, actor=requested_by)
+            return result
+
+        return jobs.submit("cloud_edit", map_id, site_map.site_id, work, requested_by=requested_by,
+                           job_id=job_id,
+                           detail={"floor": index, "boxes": len(edit.delete_boxes),
+                                   "resolve_moved": edit.resolve_moved[:50], "keep_moved": edit.keep_moved[:50],
+                                   "reason": edit.reason})
 
     @router.get("/maps/{map_id}/floors/{index}/{kind}")
     def get_artifact(map_id: str, index: int, kind: str):
@@ -552,14 +683,15 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                     raise HTTPException(status_code=413, detail="upload exceeds %d bytes" % max_survey_bytes)
             return message
 
-        form = await Request(request.scope, counting_receive).form(max_files=2, max_fields=len(SURVEY_FIELDS))
+        form = await Request(request.scope, counting_receive).form(max_files=len(SURVEY_FILES),
+                                                                    max_fields=len(SURVEY_FIELDS))
         try:
             files: Dict[str, UploadFile] = {}
             fields: Dict[str, str] = {}
             for name, part in form.multi_items():
                 if name in files or name in fields:
                     raise HTTPException(status_code=400, detail="%r was sent twice" % name)
-                if name in ("cloud", "track"):
+                if name in SURVEY_FILES:
                     if not isinstance(part, UploadFile):
                         raise HTTPException(status_code=400, detail="%r must be a file part" % name)
                     files[name] = part
@@ -585,6 +717,11 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                 _copy_part(files["cloud"], work_dir / "cloud.pcd", max_survey_bytes, "cloud")
                 track_path = work_dir / "track.csv"
                 _copy_part(files["track"], track_path, MAX_TRACK_BYTES, "track")
+                if "moved" in files:
+                    _copy_part(files["moved"], work_dir / ARTIFACT_FILES["moved"], MAX_MOVED_BYTES, "moved layer")
+                if "moved_cloud" in files:
+                    _copy_part(files["moved_cloud"], work_dir / ARTIFACT_FILES["moved_cloud"], MAX_CLOUD_BYTES,
+                               "moved cloud")
                 return track_path.read_bytes()
 
             try:
@@ -598,14 +735,18 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
 
             def work(progress):
                 from .survey import process_survey
+                moved = work_dir / ARTIFACT_FILES["moved"]
+                moved_cloud = work_dir / ARTIFACT_FILES["moved_cloud"]
                 return process_survey(store, survey, work_dir / "cloud.pcd", track_bytes, work_dir,
-                                      progress, detail={"job_id": job_id})
+                                      progress, detail={"job_id": job_id},
+                                      moved_path=moved if moved.is_file() else None,
+                                      moved_cloud_path=moved_cloud if moved_cloud.is_file() else None)
 
             job = jobs.submit("survey", survey.map_id, survey.site_id, work,
                               requested_by=_requested_by(request), job_id=job_id,
                               detail={"name": survey.name, "floor": survey.floor_index,
                                       "cloud": survey.cloud_name, "track": survey.track_name,
-                                      "replaces": existing is not None})
+                                      "moved": "moved" in files, "replaces": existing is not None})
             _audit("map.survey", existing, survey.map_id,
                    {"job_id": job_id, "floor": survey.floor_index,
                     "cloud": survey.cloud_name, "replaces": existing is not None},

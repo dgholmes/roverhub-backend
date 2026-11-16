@@ -26,7 +26,9 @@ server). A background job (maps/jobs.py) runs `process_survey`:
 
 What is kept: the grid, its preview, a 200k-point sample of the floor's cloud
 (the console's 3D view, as pcd_to_floorgrid.py writes it), the LEVELLED track,
-and survey.json (the rotation applied, both planes before and after, and the
+the "probably moved" layer when one was sent (moved.json and moved.pcd from
+tools/map_prep/transient_filter.py, IN THE UPLOADED CLOUD'S FRAME: rotated
+with the cloud when it is levelled here, see cloud_edit.rotate_moved), and survey.json (the rotation applied, both planes before and after, and the
 grid parameters) -- so the levelling can be reproduced on the full cloud
 locally, e.g. for planning_grid.py. The full cloud itself is not kept.
 
@@ -55,7 +57,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
-from .store import ARTIFACT_FILES, BUNDLE_FILE, MAX_CLOUD_BYTES, MapStore, _link_or_copy, count_cells, valid_map_id
+from .store import (
+    ARTIFACT_FILES, BUNDLE_FILE, MAX_CLOUD_BYTES, MAX_MOVED_BYTES, BundleError, MapStore, _link_or_copy, count_cells,
+    valid_map_id,
+)
 
 # Under this the cloud is already level and is left alone: about the floor
 # fit's own precision, and 5 cm of height across a 30 m building.
@@ -182,14 +187,29 @@ def _now() -> str:
 
 def process_survey(store: MapStore, request: SurveyRequest, cloud_path: Path, track_bytes: bytes,
                    work_dir: Path, progress: Callable[[str], None] = lambda stage: None,
-                   detail: Optional[dict] = None) -> dict:
+                   detail: Optional[dict] = None, moved_path: Optional[Path] = None,
+                   moved_cloud_path: Optional[Path] = None) -> dict:
     """Level, grid, pack and store the survey as a draft; then check its
     quality. Returns the job result. Raises SurveyError / BundleError (shown
     to the uploader) for a survey that cannot be made into a map."""
     from . import survey_math as sm
     from .quality import run_quality
 
+    import numpy as np
+
+    from .cloud_edit import moved_bytes, parse_moved, pcd_bytes, read_pcd_bytes, rotate_moved
+
     request.check()
+    # The moved layer is checked before the long work, so a bad one fails fast.
+    moved = moved_points = None
+    if moved_path is not None:
+        if moved_path.stat().st_size > MAX_MOVED_BYTES:
+            raise BundleError("the moved layer exceeds %d bytes" % MAX_MOVED_BYTES)
+        moved = parse_moved(moved_path.read_bytes())
+    if moved_cloud_path is not None:
+        if moved_cloud_path.stat().st_size > MAX_CLOUD_BYTES:
+            raise BundleError("the moved cloud exceeds %d bytes" % MAX_CLOUD_BYTES)
+        moved_points = read_pcd_bytes(moved_cloud_path.read_bytes(), MAX_CLOUD_BYTES // 12)
     progress("reading the cloud")
     xyz = sm.read_pcd_xyz(cloud_path)
     track = sm.read_track_csv(track_bytes)
@@ -217,6 +237,15 @@ def process_survey(store: MapStore, request: SurveyRequest, cloud_path: Path, tr
     (floor_dir / ARTIFACT_FILES["preview"]).write_bytes(sm.png_bytes(image))
     (floor_dir / ARTIFACT_FILES["cloud"]).write_bytes(cloud_bytes)
     (floor_dir / ARTIFACT_FILES["track"]).write_bytes(sm.track_csv_bytes(level["track"]))
+    info = level["info"]
+    if moved is not None:
+        if info["rotated"]:
+            moved = rotate_moved(moved, info["rotation"], info["angle_deg"])
+        (floor_dir / ARTIFACT_FILES["moved"]).write_bytes(moved_bytes(moved))
+    if moved_points is not None:
+        if info["rotated"]:
+            moved_points = moved_points @ np.asarray(info["rotation"]).T
+        (floor_dir / ARTIFACT_FILES["moved_cloud"]).write_bytes(pcd_bytes(moved_points))
     origin = [round(grid["origin"][0], 4), round(grid["origin"][1], 4)]
     survey_doc = {
         "generated_by": "roverhub-backend maps/survey.py",
@@ -277,12 +306,12 @@ def process_survey(store: MapStore, request: SurveyRequest, cloud_path: Path, tr
     version = store.current_version(saved.map_id)
 
     quality = run_quality(store, saved.map_id, progress)
-    info = level["info"]
     return {"map_id": saved.map_id, "version": version, "floor": request.floor_index,
             "points": points, "levelled": info["rotated"], "levelled_deg": round(info["angle_deg"], 3),
             "track_frame": info["track_frame"],
             "tilt_after_deg": round(info["cloud_plane_after"]["tilt_deg"], 3) if info["cloud_plane_after"] else None,
             "size_cells": [cols, rows], "free_cells": free, "occupied_cells": occupied,
+            "moved_blobs": None if moved is None else len(moved["blobs"]),
             "quality": quality}
 
 

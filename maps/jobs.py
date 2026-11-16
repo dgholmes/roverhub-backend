@@ -1,4 +1,5 @@
-"""Background jobs for the map pipeline: processing a survey, checking quality.
+"""Background jobs for the map pipeline: processing a survey, checking quality,
+and the map editor's cloud edits.
 
 Levelling a 3-million-point cloud and building its grids takes seconds to
 minutes and hundreds of MB of memory, so it cannot run on a request. A job is
@@ -40,7 +41,7 @@ from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger("roverhub.maps.jobs")
 
-JOB_KINDS = ("survey", "quality")
+JOB_KINDS = ("survey", "quality", "cloud_edit")  # cloud_edit: maps/cloud_edit.py
 JOB_STATES = ("queued", "running", "succeeded", "failed")
 JOB_ID_RE = re.compile(r"mjob-[0-9a-f]{16}")
 MAX_KEPT = 200

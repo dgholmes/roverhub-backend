@@ -9,6 +9,10 @@ A survey is packed into a *bundle* directory by tools/map_prep/pack_map.py:
     floor<N>/cloud.bin  float32 x,y,z triples, if a cloud was packed
     floor<N>/planning.pgm  the planning grid Nav2 plans on, if one was made
                         (tools/map_prep/planning_grid.py); optional
+    floor<N>/moved.json the "probably moved" layer (tools/map_prep/
+                        transient_filter.py): spots the map editor reviews;
+                        optional, checked by maps/cloud_edit.py parse_moved
+    floor<N>/moved.pcd  the points of that layer, for the 3D view; optional
 
 `save_bundle` takes such a directory and keeps it under `<root>/<map_id>/` as
 
@@ -32,7 +36,14 @@ they had, since those were made in that survey's frame.
 
 A floor's planning grid can also be set or removed on a stored map
 (`set_planning`, `delete_planning`): it is usually made after the survey, from
-the survey, on the machine that runs Nav2.
+the survey, on the machine that runs Nav2. Those two edit the live bundle in
+place and leave the status alone; they are the command line's
+(maps/set_planning.py) and DELETE .../planning's. The map editor's saves -- a
+brushed planning grid (`edit_planning`, PUT .../planning), the moved layer
+(`set_moved`) and cloud edits (maps/cloud_edit.py) -- go through `edit_floor`
+instead: each is a NEW VERSION (the bundle it replaces is kept, restorable),
+the map drops to draft with its zones kept, as on a re-upload, and the router
+queues the quality check.
 
 Every floor carries a content hash (`MapFloor.content_hash`, tracker 1-5-01):
 sha256 over its grid's and planning grid's pixels and placement and the map's
@@ -93,7 +104,8 @@ MAP_FILE = "map.json"
 # kind (as it appears in a URL) -> file name inside floor<N>/. The whole of what
 # a caller may ask for.
 ARTIFACT_FILES = {"grid": "grid.pgm", "preview": "grid.png", "cloud": "cloud.bin",
-                  "planning": "planning.pgm", "track": "track.csv", "survey": "survey.json"}
+                  "planning": "planning.pgm", "track": "track.csv", "survey": "survey.json",
+                  "moved": "moved.json", "moved_cloud": "moved.pcd"}
 _REQUIRED = ("grid", "preview")
 PLANNING_FILE = ARTIFACT_FILES["planning"]
 
@@ -149,6 +161,9 @@ MAX_VERSIONS = 10
 _VERSION_DIR_RE = re.compile(r"v([1-9][0-9]{0,8})")
 # A track is a few dozen bytes per pose at ~10 Hz: 8 MiB is hours of walking.
 MAX_TRACK_BYTES = 8 * 1024 * 1024
+# The moved layer is a few hundred bytes per blob; 4 MiB is thousands of them.
+# Its points (moved.pcd) are a cloud, and are held to MAX_CLOUD_BYTES like one.
+MAX_MOVED_BYTES = 4 * 1024 * 1024
 
 
 class BundleError(ValueError):
@@ -270,6 +285,35 @@ def with_content_hashes(directory: Path, site_map: SiteMap,
     return site_map.model_copy(update={"floors": [
         f.model_copy(update={"content_hash": floor_content_hash(directory, site_map, f, log)})
         for f in site_map.floors]})
+
+
+def check_moved_file(kind: str, data: bytes, where: str) -> None:
+    """Refuse a moved.json or moved.pcd that is too big or does not parse.
+    Raises BundleError naming `where`."""
+    from .cloud_edit import parse_moved, read_pcd_bytes
+
+    limit = MAX_MOVED_BYTES if kind == "moved" else MAX_CLOUD_BYTES
+    if len(data) > limit:
+        raise BundleError("%s exceeds %d bytes" % (where, limit))
+    try:
+        if kind == "moved":
+            parse_moved(data)
+        else:
+            read_pcd_bytes(data, MAX_CLOUD_BYTES // 12)
+    except BundleError as exc:
+        raise BundleError("%s: %s" % (where, exc)) from None
+
+
+def _replace_file(path: Path, data: Optional[bytes]) -> None:
+    """In a scratch bundle whose files are hard links to the live ones: put
+    `data` at `path` (None: remove it) WITHOUT writing through the link, which
+    would change the live bundle's file too."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    if data is not None:
+        path.write_bytes(data)
 
 
 class MapNotFound(LookupError):
@@ -503,6 +547,8 @@ class MapStore:
                     if kind in ("track", "survey") and artifact.stat().st_size > MAX_TRACK_BYTES:
                         raise BundleError("floor %d's %s exceeds %d bytes"
                                           % (floor.index, file_name, MAX_TRACK_BYTES))
+                    if kind in ("moved", "moved_cloud"):
+                        check_moved_file(kind, artifact.read_bytes(), "floor %d's %s" % (floor.index, file_name))
                     if kind == "planning":
                         # Counted from the file, never taken from the manifest:
                         # only the clearance is the bundle's to say.
@@ -673,7 +719,8 @@ class MapStore:
                         "resolution_m": f.resolution_m, "origin_xy_m": list(f.origin_xy_m),
                         "free_cells": f.free_cells, "occupied_cells": f.occupied_cells,
                         "unknown_cells": f.unknown_cells, "has_planning": f.planning is not None,
-                        "has_track": (path / ("floor%d" % f.index) / ARTIFACT_FILES["track"]).is_file()}
+                        "has_track": (path / ("floor%d" % f.index) / ARTIFACT_FILES["track"]).is_file(),
+                        "has_moved": (path / ("floor%d" % f.index) / ARTIFACT_FILES["moved"]).is_file()}
                        for f in site_map.floors],
             "quality": None if quality is None else {
                 "passed": quality.get("passed"), "computed_at": quality.get("computed_at"),
@@ -739,6 +786,134 @@ class MapStore:
                 shutil.rmtree(scratch, ignore_errors=True)
                 raise
         return restored
+
+    # --- the map editor: a floor edited as a new version ------------------
+
+    def edit_floor(self, map_id: str, floor_index: int, change, source: str,
+                   detail: Optional[dict] = None, expect_version: Optional[int] = None) -> Tuple[SiteMap, int]:
+        """Store one floor's edit as a NEW VERSION: (the new map, its version).
+
+        `change(current_map, floor, floor_dir, write)` runs under the lock on a
+        scratch copy of the live bundle (hard links), writes what it changes
+        with `write(kind, bytes or None)` -- never by writing into floor_dir,
+        whose files are links to the live ones -- and returns the floor's
+        field updates (e.g. {"planning": PlanningGrid}). Its exceptions abort
+        the edit with nothing stored.
+
+        The live bundle is kept as a version, exactly as a re-upload keeps it;
+        the map keeps its zones and creation date and drops to draft. It has
+        no quality report until one runs (as after a restore). `expect_version`
+        given: BundleError if the live version is another one by now -- an
+        edit worked out from a stale read must not land on a newer bundle.
+        Raises MapNotFound / FloorNotFound."""
+        directory = self._dir(map_id)
+        if directory is None:
+            raise MapNotFound(map_id)
+        if not isinstance(floor_index, int) or isinstance(floor_index, bool) or floor_index < 0:
+            raise FloorNotFound("map %s has no floor %r" % (map_id, floor_index))
+        with self._lock:
+            current = self.get(map_id)
+            if current is None:
+                raise MapNotFound(map_id)
+            floor = next((f for f in current.floors if f.index == floor_index), None)
+            if floor is None:
+                raise FloorNotFound("map %s has no floor %d" % (map_id, floor_index))
+            live = self._current_version(directory)
+            if expect_version is not None and live != expect_version:
+                raise BundleError("the map changed while this edit was being made (version %d, now %d); "
+                                  "reload it and save again" % (expect_version, live))
+            scratch = Path(tempfile.mkdtemp(dir=self.root, prefix=_SCRATCH_PREFIX))
+            try:
+                for other in current.floors:
+                    source_dir = directory / ("floor%d" % other.index)
+                    target_dir = scratch / ("floor%d" % other.index)
+                    target_dir.mkdir()
+                    for file_name in ARTIFACT_FILES.values():
+                        if (source_dir / file_name).is_file():
+                            _link_or_copy(source_dir / file_name, target_dir / file_name)
+                floor_dir = scratch / ("floor%d" % floor_index)
+
+                def write(kind: str, data: Optional[bytes]) -> None:
+                    _replace_file(floor_dir / ARTIFACT_FILES[kind], data)
+
+                updates = change(current, floor, floor_dir, write) or {}
+                edited = current.model_copy(update={
+                    "status": "draft", "updated_at": _now(),
+                    "floors": [f.model_copy(update=updates) if f.index == floor_index else f
+                               for f in current.floors]})
+                edited = with_content_hashes(scratch, edited)
+                (scratch / MAP_FILE).write_text(edited.model_dump_json(indent=2), encoding="utf-8")
+                number = self._carry_versions(directory, scratch)
+                self._write_version_file(scratch, {"version": number, "source": source,
+                                                   "created_at": _now(), **(detail or {})})
+                self._swap_in(directory, scratch)
+            except BaseException:
+                shutil.rmtree(scratch, ignore_errors=True)
+                raise
+        return edited, number
+
+    def edit_planning(self, map_id: str, floor_index: int, pgm: bytes,
+                      clearance_m: float = DEFAULT_CLEARANCE_M,
+                      detail: Optional[dict] = None) -> Tuple[SiteMap, int]:
+        """set_planning as a new version (edit_floor): the map editor's brush,
+        PUT .../planning. Raises as set_planning does."""
+        if len(pgm) > MAX_PLANNING_BYTES:
+            raise BundleError("the planning grid exceeds %d bytes" % MAX_PLANNING_BYTES)
+
+        def change(current: SiteMap, floor: MapFloor, floor_dir: Path, write) -> dict:
+            planning = planning_grid_for(floor, pgm, clearance_m)
+            write("planning", pgm)
+            return {"planning": planning}
+
+        return self.edit_floor(map_id, floor_index, change, source="planning",
+                               detail={"floor": floor_index, "clearance_m": clearance_m, **(detail or {})})
+
+    def set_moved(self, map_id: str, floor_index: int, data: bytes,
+                  detail: Optional[dict] = None) -> Tuple[SiteMap, int, dict]:
+        """Replace a floor's moved layer, as a new version: (map, version,
+        {"blobs", "dropped", "added", "moved_cloud_points_removed"}).
+
+        The usual call is "Keep": the same layer with some blobs taken off the
+        list. The points of a blob no longer listed are taken out of moved.pcd
+        too, so the amber 3D layer shows what the list shows. The cloud and the
+        grids are not touched. Raises BundleError for a layer that does not
+        parse, MapNotFound / FloorNotFound."""
+        from .cloud_edit import blob_box, in_boxes, moved_bytes, parse_moved, pcd_bytes, read_pcd_bytes
+
+        if len(data) > MAX_MOVED_BYTES:
+            raise BundleError("the moved layer exceeds %d bytes" % MAX_MOVED_BYTES)
+        doc = parse_moved(data)
+        outcome: dict = {}
+
+        def change(current: SiteMap, floor: MapFloor, floor_dir: Path, write) -> dict:
+            old_path = floor_dir / ARTIFACT_FILES["moved"]
+            old_ids: set = set()
+            dropped: list = []
+            if old_path.is_file():
+                try:
+                    old = parse_moved(old_path.read_bytes())
+                except BundleError:
+                    old = {"blobs": []}
+                new_ids = {b["id"] for b in doc["blobs"]}
+                dropped = [b for b in old["blobs"] if b["id"] not in new_ids]
+                old_ids = {b["id"] for b in old["blobs"]}
+            removed = 0
+            cloud_path = floor_dir / ARTIFACT_FILES["moved_cloud"]
+            if dropped and cloud_path.is_file():
+                points = read_pcd_bytes(cloud_path.read_bytes(), MAX_CLOUD_BYTES // 12)
+                gone, _ = in_boxes(points, [blob_box(b) for b in dropped])
+                removed = int(gone.sum())
+                if removed:
+                    write("moved_cloud", pcd_bytes(points[~gone]))
+            write("moved", moved_bytes(doc))
+            outcome.update({"blobs": len(doc["blobs"]), "dropped": [b["id"] for b in dropped],
+                            "added": sorted({b["id"] for b in doc["blobs"]} - old_ids),
+                            "moved_cloud_points_removed": removed})
+            return {}
+
+        saved, number = self.edit_floor(map_id, floor_index, change, source="moved",
+                                        detail={"floor": floor_index, **(detail or {})})
+        return saved, number, outcome
 
     # --- the quality report (maps/quality.py computes it) ------------------
 

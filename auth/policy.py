@@ -177,11 +177,17 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("POST", "/maps"): Rule(capabilities=("configure",)),
     ("PUT", "/maps/{map_id}/zones"): Rule(capabilities=("editZones",)),
     # A floor's planning grid (the map Nav2 plans on) is read like its survey
-    # grid, and set or removed like zones are drawn: both say where the robot
-    # may walk, and neither changes the map's status.
+    # grid. Removing one is like drawing zones: both say where the robot may
+    # walk. The map editor's saves -- the brushed planning grid, the "probably
+    # moved" layer and cloud edits (maps/cloud_edit.py) -- each make a new
+    # version and drop the map to draft, so a supervisor still signs it off
+    # (PUT status, `editZones`) before missions use it: the supervisor and the
+    # engineer who uploaded the survey may both clean it.
     ("GET", "/maps/{map_id}/floors/{index}/planning"): _READ,
-    ("PUT", "/maps/{map_id}/floors/{index}/planning"): Rule(capabilities=("editZones",)),
+    ("PUT", "/maps/{map_id}/floors/{index}/planning"): Rule(capabilities=("editZones", "configure")),
     ("DELETE", "/maps/{map_id}/floors/{index}/planning"): Rule(capabilities=("editZones",)),
+    ("PUT", "/maps/{map_id}/floors/{index}/moved"): Rule(capabilities=("editZones", "configure")),
+    ("POST", "/maps/{map_id}/floors/{index}/cloud-edits"): Rule(capabilities=("editZones", "configure")),
     ("PUT", "/maps/{map_id}/status"): Rule(capabilities=("editZones",)),
     ("DELETE", "/maps/{map_id}"): Rule(capabilities=("configure",)),
     # The survey pipeline (maps/survey.py, maps/jobs.py). A survey upload and a
