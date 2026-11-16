@@ -878,7 +878,9 @@ class MapStore:
         too, so the amber 3D layer shows what the list shows. The cloud and the
         grids are not touched. Raises BundleError for a layer that does not
         parse, MapNotFound / FloorNotFound."""
-        from .cloud_edit import blob_box, in_boxes, moved_bytes, parse_moved, pcd_bytes, read_pcd_bytes
+        from .cloud_edit import blob_points_mask, moved_bytes, parse_moved, pcd_bytes, read_pcd_bytes
+
+        import numpy as np
 
         if len(data) > MAX_MOVED_BYTES:
             raise BundleError("the moved layer exceeds %d bytes" % MAX_MOVED_BYTES)
@@ -901,7 +903,9 @@ class MapStore:
             cloud_path = floor_dir / ARTIFACT_FILES["moved_cloud"]
             if dropped and cloud_path.is_file():
                 points = read_pcd_bytes(cloud_path.read_bytes(), MAX_CLOUD_BYTES // 12)
-                gone, _ = in_boxes(points, [blob_box(b) for b in dropped])
+                gone = np.zeros(len(points), dtype=bool)
+                for blob in dropped:
+                    gone |= blob_points_mask(points, blob)
                 removed = int(gone.sum())
                 if removed:
                     write("moved_cloud", pcd_bytes(points[~gone]))

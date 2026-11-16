@@ -91,7 +91,7 @@ def moved_doc():
                  "polygon": [[1.4, 0.4], [1.5, 0.4], [1.5, 0.5], [1.4, 0.5]]},
                 {"id": "b002", "centroid": [0.35, 0.35], "bbox": [0.3, 0.3, 0.4, 0.4], "z_range": [0.1, 0.6],
                  "area_m2": 0.01, "points": len(LEG), "hits": 9, "pass_through": 7,
-                 "polygon": [[0.3, 0.3], [0.4, 0.3], [0.4, 0.4]]},
+                 "polygon": [[0.3, 0.3], [0.4, 0.3], [0.4, 0.4], [0.3, 0.4]]},
                 {"id": "b003", "centroid": [0.6, 1.6], "bbox": [0.55, 1.55, 0.65, 1.65], "z_range": [0.3, 0.9],
                  "area_m2": 0.01, "points": 0, "hits": 3, "pass_through": 9, "polygon": []},
             ]}
@@ -362,6 +362,75 @@ def test_resolving_a_moved_blob_removes_its_points_and_its_entry(client, router)
     assert len(ce.read_pcd_bytes(floor_files(router, "moved_cloud"), 10**6)) == len(PERSON)
     leg = cell_mask(0.30, 0.30, 0.40, 0.40)
     assert (planning_now(router)[leg] == 254).all()
+
+
+def _router_with(tmp_path, audit, **bundle):
+    router = build_maps_router(str(tmp_path / "maps"), audit=audit, start_jobs=False)
+    router.store.save_bundle(make_room_bundle(tmp_path / "b", **bundle))
+    app = FastAPI()
+    app.include_router(router)
+    return router, TestClient(app)
+
+
+def test_remove_takes_only_the_blobs_moved_points_and_their_neighbours(tmp_path, audit):
+    # A blob's bbox x z_range can hold still things too. Here moved.pcd says
+    # only the leg's bottom moved (z < 0.3): its points within one voxel
+    # (0.1 m) go, the rest of the leg -- still, in the same box -- stays.
+    moved_part = LEG[LEG[:, 2] < 0.3] - [0, 0, 0.01]     # off the 2.5 cm lattice: no ties at one voxel
+    router, client = _router_with(tmp_path, audit, moved_cloud_bytes=ce.pcd_bytes(moved_part))
+    job = edit(client, router, {"resolve_moved": ["b002"]})
+    assert job["status"] == "succeeded", job["error"]
+    left = cloud_now(router)
+    leg_left = left[(left[:, 0] > 0.3) & (left[:, 0] < 0.4) & (left[:, 1] > 0.3) & (left[:, 1] < 0.4)
+                    & (left[:, 2] > 0.05)]
+    top = moved_part[:, 2].max()
+    # A neighbour of a moved point that moved.pcd did not list is removed ...
+    assert not (np.abs(leg_left[:, 2] - (top + STEP)) < 1e-4).any()
+    # ... a still point farther than a voxel from every moved point survives.
+    assert (leg_left[:, 2] > top + 0.1 + 1e-6).all() and len(leg_left) > 0
+    assert (np.abs(leg_left[:, 2] - LEG[:, 2].max()) < 1e-4).any()
+    assert job["result"]["points_removed"] == len(LEG) - len(leg_left)
+    assert job["result"]["planning"]["parameters"]["moved_match_m"] == 0.1
+    # The still remainder is still an obstacle.
+    leg = cell_mask(0.31, 0.31, 0.39, 0.39)
+    assert (planning_now(router)[leg] == 0).all()
+    assert job["result"]["planning"]["kept_returns_cells"] == int(leg.sum())
+
+
+def test_remove_matches_within_the_layers_own_voxel(tmp_path, audit):
+    doc = moved_doc()
+    doc["params"]["voxel_m"] = 0.05
+    moved_part = LEG[LEG[:, 2] < 0.3] - [0, 0, 0.01]     # off the 2.5 cm lattice: no ties at one voxel
+    router, client = _router_with(tmp_path, audit, moved_bytes=json.dumps(doc).encode(),
+                                  moved_cloud_bytes=ce.pcd_bytes(moved_part))
+    job = edit(client, router, {"resolve_moved": ["b002"]})
+    left = cloud_now(router)
+    assert job["result"]["planning"]["parameters"]["moved_match_m"] == 0.05
+    assert job["result"]["points_removed"] == int((LEG[:, 2] < moved_part[:, 2].max() + 0.05).sum())
+    assert len(left) == len(CLOUD) - job["result"]["points_removed"]
+
+
+def test_a_blobs_points_are_inside_its_polygon(tmp_path, audit):
+    # A triangle over the leg: moved.pcd's points outside it are not the blob's.
+    doc = moved_doc()
+    doc["blobs"][1]["polygon"] = [[0.3, 0.3], [0.4, 0.3], [0.4, 0.4]]
+    router, client = _router_with(tmp_path, audit, moved_bytes=json.dumps(doc).encode())
+    job = edit(client, router, {"resolve_moved": ["b002"]})
+    xy = LEG[:, :2] - [0.3, 0.3]
+    inside = xy[:, 0] >= xy[:, 1]                       # on or below the diagonal
+    assert job["result"]["moved_cloud_points_removed"] == int(inside.sum())
+    # The rest stay on the amber layer (the floor cloud's points beside them go
+    # anyway: they are within a voxel of the blob's own).
+    assert len(ce.read_pcd_bytes(floor_files(router, "moved_cloud"), 10**6)) == len(PERSON) + int((~inside).sum())
+
+
+def test_remove_needs_the_moved_points(tmp_path, audit):
+    router, client = _router_with(tmp_path, audit, moved_cloud=False)
+    response = client.post("/maps/%s/floors/0/cloud-edits" % MAP, json={"resolve_moved": ["b002"]})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "this floor has no moved points; use a 3D delete box instead"
+    # Keep and delete boxes do not need them.
+    assert edit(client, router, {"keep_moved": ["b002"], "delete_boxes": [CHAIR_BOX]})["status"] == "succeeded"
 
 
 def test_keep_through_cloud_edits_changes_no_cloud_and_no_grid(client, router):
@@ -717,3 +786,54 @@ def test_with_sign_in_on_only_a_supervisor_or_engineer_edits(auth_on, app_map):
     backend.maps_router.jobs.wait(accepted.json()["job_id"], timeout=30)
     # Everyone at the site reads the layer.
     assert client.get(moved_url, headers=vic).status_code == 200
+
+
+# --- the localisation grid (grid.pgm, the slice AMCL matches) -------------------
+
+
+def grid_now(router):
+    data = floor_files(router, "grid")
+    return np.frombuffer(data[len(b"P5\n40 40\n255\n"):], dtype=np.uint8).reshape(H, W)
+
+
+def test_a_removed_passer_by_leaves_the_localisation_grid_and_a_wall_beside_it_stays(client, router):
+    before_grid = grid_now(router)
+    before = router.store.get(MAP).floors[0]
+    wall_slab = {"min": [1.84, 0.35, 1.2], "max": [1.96, 0.55, 1.4]}   # the wall goes on up to 1.5 m
+    job = edit(client, router, {"resolve_moved": ["b001"], "delete_boxes": [wall_slab]})
+    assert job["status"] == "succeeded", job["error"]
+    loc = job["result"]["localisation"]
+    person = cell_mask(1.41, 0.41, 1.49, 0.49)
+    wall = cell_mask(1.86, 0.36, 1.94, 0.54)
+    after = grid_now(router)
+    assert (before_grid[person] == 0).all() and (after[person] == 254).all()
+    assert (after[wall] == 0).all()
+    assert loc["rerasterised"] and loc["reason"] is None
+    assert loc["freed_cells"] == int(person.sum()) and loc["kept_returns_cells"] >= int(wall.sum())
+    assert loc["parameters"]["obstacle_band_m"] == [1.2, 2.0] and loc["parameters"]["source"].startswith("default")
+    changed = after != before_grid
+    assert np.array_equal(changed, person)                              # nothing else moved
+    floor = router.store.get(MAP).floors[0]
+    assert (floor.free_cells, floor.occupied_cells, floor.unknown_cells) == count_cells(after.tobytes())
+    # The grid is in the content hash: the device needs the new files.
+    assert floor.content_hash == job["result"]["content_hash"] != before.content_hash
+    assert floor_files(router, "preview") != floor_files(router, "preview", version=1)   # the png follows
+
+
+def test_nothing_changes_in_the_localisation_grid_without_structure_band_points(client, router):
+    before = grid_now(router)
+    job = edit(client, router, {"delete_boxes": [CHAIR_BOX]})          # the chair stops at 0.8 m
+    loc = job["result"]["localisation"]
+    assert loc["freed_cells"] == 0
+    assert loc["kept_no_evidence_cells"] == int(cell_mask(0.81, 0.81, 1.19, 1.19).sum())
+    assert np.array_equal(grid_now(router), before)
+    assert floor_files(router, "preview") == floor_files(router, "preview", version=1)
+    # The planning grid still lost the chair.
+    assert job["result"]["planning"]["freed_cells"] > 0
+
+
+def test_the_localisation_band_comes_from_survey_json_when_there_is_one():
+    assert ce.localisation_band({"grid": {"obstacle_band_m": [0.15, 1.9]}}) == \
+        ((0.15, 1.9), "survey.json grid.obstacle_band_m")
+    assert ce.localisation_band(None)[0] == (1.2, 2.0)
+    assert ce.localisation_band({"grid": {"obstacle_band_m": [2, 1]}})[0] == (1.2, 2.0)

@@ -7,10 +7,18 @@ The other two edit the floor's CLOUD, and are this module:
   - delete boxes, drawn in the 3D map scene: every cloud point inside an
     axis-aligned box (map frame) goes;
   - "Remove" on the review list of the moved layer (moved.json, written by
-    tools/map_prep/transient_filter.py): the blob's points go -- its bbox x
-    its z_range, padded by BLOB_PAD_M because the file's numbers are rounded
-    to the millimetre -- and the blob leaves the list. "Keep" only takes the
-    blob off the list (PUT .../moved, or `keep_moved` here).
+    tools/map_prep/transient_filter.py): the blob's MOVED points go, and the
+    blob leaves the list. A blob's bbox x z_range is not its points: blobs
+    are 8-connected islands of moved voxel columns cut into tiles of at most
+    1 m, so the box holds still things too (a desk beside the passer-by). So
+    the blob's points are moved.pcd's points inside its box (padded by
+    BLOB_PAD_M, the file rounds to the millimetre) and inside its polygon
+    when it has one, and the floor cloud loses only its points inside that
+    box that lie within one voxel (the layer's params.voxel_m, else 0.10 m)
+    of one of them. Without moved.pcd there is nothing to match, and Remove
+    is refused: a 3D delete box is the way then. "Keep" only takes the blob
+    off the list (PUT .../moved, or `keep_moved` here); its points leave
+    moved.pcd, never the cloud.
 
 A cloud edit runs as a background job (maps/jobs.py, kind "cloud_edit"): a
 floor's cloud is up to 8 MiB (~700k points) and its grid tens of millions of
@@ -52,6 +60,21 @@ already had can become walkable. Because the stored cloud is a sample, a
 cell's remaining evidence counts with one point (`min_hits_effective` 1),
 not planning_grid.py's --min-hits 3: one sampled return stands for many.
 
+THE LOCALISATION GRID (grid.pgm, the structure slice AMCL matches against)
+holds the same people: the moving-object run on the office survey removed
+8,175 points in its 1.2-2.0 m band. Its cells under the edited footprints are
+updated by the narrower rule `free_removed`: an occupied cell becomes free
+only where the edit took points in the grid's obstacle band out of it and
+none are left in that band. No zone or connectivity test (AMCL does not plan),
+no "box covers the cell" shortcut, never a new obstacle, unknown untouched.
+The band is the floor's survey.json `grid.obstacle_band_m` (a survey the
+server processed), else 1.2-2.0 m, the slice planning_grid.py's header says
+the localisation map is cut at; heights are above the constant floor_z_m, as
+pcd_to_floorgrid.py measures them. The grid is in the map's content hash, so
+a cloud edit that frees a grid cell changes the hash: the device must get the
+new files before it runs on the map again. The preview (grid.png) and the
+floor's free/occupied/unknown counts follow the new grid.
+
 The band comes from the floor's survey.json `planning.parameters`
 (planning_grid.py's stats `parameters` block: low_band_m) when it is there;
 nothing writes that yet, so the defaults below are planning_grid.py's own
@@ -87,6 +110,9 @@ BLOB_PAD_M = 0.01
 DEFAULT_LOW_BAND_M = (0.05, 0.9)
 DEFAULT_MIN_HITS = 3
 DEFAULT_STRUCTURE_BAND_M = (1.2, 2.0)
+# The localisation grid's obstacle band when survey.json does not record it:
+# planning_grid.py's header (pcd_to_floorgrid.py --obstacle-band 1.2,2.0).
+DEFAULT_LOCALISATION_BAND_M = (1.2, 2.0)
 PARAMETERS_DEFAULT_SOURCE = "defaults (tools/map_prep/planning_grid.py --low-band 0.05,0.9 --min-hits 3)"
 
 # planning_grid.py ZONE_RULES. A kind this table does not know excludes.
@@ -193,6 +219,59 @@ def parse_moved(data: bytes) -> dict:
 
 def moved_bytes(doc: dict) -> bytes:
     return (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+
+
+DEFAULT_VOXEL_M = 0.10      # transient_filter.py --voxel
+# Brute-force distance check in chunks of at most this many point pairs.
+_PAIRS_PER_CHUNK = 4_000_000
+
+
+def layer_voxel(doc: Optional[dict]) -> float:
+    """The layer's voxel size (params.voxel_m), else transient_filter.py's default."""
+    value = ((doc or {}).get("params") or {}).get("voxel_m")
+    return float(value) if _finite(value) and 0 < value <= 1.0 else DEFAULT_VOXEL_M
+
+
+def blob_points_mask(points: "np.ndarray", blob: dict) -> "np.ndarray":
+    """Which of `points` (moved.pcd) are this blob's: inside its padded
+    bbox x z_range, and inside its polygon when it has one."""
+    (x0, y0, z0), (x1, y1, z1) = blob_box(blob)
+    mask = ((points[:, 0] >= x0) & (points[:, 0] <= x1) & (points[:, 1] >= y0) & (points[:, 1] <= y1)
+            & (points[:, 2] >= z0) & (points[:, 2] <= z1))
+    polygon = blob.get("polygon") or []
+    if len(polygon) >= 3 and mask.any():
+        idx = np.flatnonzero(mask)
+        inside = inside_polygon(points[idx, 0], points[idx, 1], polygon)
+        # A point on the hull's edge counts: the hull is drawn through column corners.
+        near_edge = ~inside & _near_polygon_edge(points[idx, :2], polygon, BLOB_PAD_M)
+        mask[idx[~(inside | near_edge)]] = False
+    return mask
+
+
+def _near_polygon_edge(xy: "np.ndarray", polygon, tolerance: float) -> "np.ndarray":
+    poly = np.asarray(polygon, dtype=np.float64)
+    near = np.zeros(len(xy), dtype=bool)
+    for a, b in zip(poly, np.roll(poly, -1, axis=0), strict=True):
+        ab = b - a
+        length = float(ab @ ab)
+        t = np.zeros(len(xy)) if length == 0 else np.clip(((xy - a) @ ab) / length, 0.0, 1.0)
+        closest = a + t[:, None] * ab
+        near |= np.hypot(*(xy - closest).T) <= tolerance
+    return near
+
+
+def near_any(points: "np.ndarray", targets: "np.ndarray", radius: float) -> "np.ndarray":
+    """Which of `points` lie within `radius` (3D) of one of `targets`."""
+    near = np.zeros(len(points), dtype=bool)
+    if len(points) == 0 or len(targets) == 0:
+        return near
+    r2 = radius * radius
+    step = max(1, _PAIRS_PER_CHUNK // len(targets))
+    for start in range(0, len(points), step):
+        chunk = points[start:start + step]
+        d2 = ((chunk[:, None, :] - targets[None, :, :]) ** 2).sum(axis=2)
+        near[start:start + step] = (d2 <= r2).any(axis=1)
+    return near
 
 
 def blob_box(blob: dict, pad: float = BLOB_PAD_M) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
@@ -520,6 +599,37 @@ def planning_parameters(survey_doc: Optional[dict]) -> Tuple[Tuple[float, float]
     return DEFAULT_LOW_BAND_M, DEFAULT_STRUCTURE_BAND_M, PARAMETERS_DEFAULT_SOURCE
 
 
+def localisation_band(survey_doc: Optional[dict]) -> Tuple[Tuple[float, float], str]:
+    """(the localisation grid's obstacle band above the floor, where it came from)."""
+    grid = survey_doc.get("grid") if isinstance(survey_doc, dict) else None
+    band = grid.get("obstacle_band_m") if isinstance(grid, dict) else None
+    if isinstance(band, list) and len(band) == 2 and all(_finite(v) for v in band) and band[0] < band[1]:
+        return (float(band[0]), float(band[1])), "survey.json grid.obstacle_band_m"
+    return DEFAULT_LOCALISATION_BAND_M, "default (the 1.2-2.0 m structure slice, planning_grid.py)"
+
+
+def free_removed(pixels: "np.ndarray", frame: Frame, remaining: "np.ndarray", removed: "np.ndarray",
+                 floor_z: float, band: Tuple[float, float],
+                 footprints: Sequence[Tuple[float, float, float, float]]) -> Tuple["np.ndarray", Dict]:
+    """The localisation grid after a cloud edit (module docstring): under the
+    footprints, an occupied cell is freed where the edit removed a point in
+    `band` from it and none is left there. `pixels` is not changed."""
+    out = pixels.copy()
+    footprint = np.zeros(frame.shape, dtype=bool)
+    for xmin, ymin, xmax, ymax in footprints:
+        cells = frame.rect_cells(xmin, ymin, xmax, ymax)
+        if cells is not None:
+            footprint[cells[0]:cells[1] + 1, cells[2]:cells[3] + 1] = True
+    occupied = footprint & (pixels < _OCCUPIED_BELOW)
+    left = band_hits(frame, remaining, floor_z, None, band) > 0
+    lost = band_hits(frame, removed, floor_z, None, band) > 0
+    freed = occupied & ~left & lost
+    out[freed] = PGM_FREE
+    return out, {"footprint_cells": int(footprint.sum()), "occupied_cells_in_footprint": int(occupied.sum()),
+                 "freed_cells": int(freed.sum()), "kept_returns_cells": int((occupied & left).sum()),
+                 "kept_no_evidence_cells": int((occupied & ~left & ~lost).sum())}
+
+
 def rerasterise(pixels: "np.ndarray", frame: Frame, remaining: "np.ndarray", removed: "np.ndarray",
                 floor_z: float, plane: Optional[Dict], band: Tuple[float, float],
                 footprints: Sequence[Tuple[float, float, float, float]], covering_boxes: Sequence[Box],
@@ -616,11 +726,15 @@ def rerasterise(pixels: "np.ndarray", frame: Frame, remaining: "np.ndarray", rem
 # the job
 # --------------------------------------------------------------------------
 
-def check_against_floor(edit: CloudEdit, has_cloud: bool, moved: Optional[dict]) -> None:
+def check_against_floor(edit: CloudEdit, has_cloud: bool, moved: Optional[dict],
+                        has_moved_cloud: bool = False) -> None:
     """Refuse an edit the floor cannot take: deleting from a floor with no
-    cloud, or naming a blob its moved layer does not have."""
+    cloud, removing blobs with no moved points to match, or naming a blob its
+    moved layer does not have."""
     if (edit.delete_boxes or edit.resolve_moved) and not has_cloud:
         raise BundleError("this floor has no cloud to edit")
+    if edit.resolve_moved and not has_moved_cloud:
+        raise BundleError("this floor has no moved points; use a 3D delete box instead")
     named = edit.resolve_moved + edit.keep_moved
     if named:
         if moved is None:
@@ -637,11 +751,12 @@ def run_cloud_edit(store, map_id: str, floor_index: int, edit: CloudEdit,
     Returns the job result. Raises BundleError (shown to the editor) when the
     edit cannot be made, or the map changed while it was being made."""
     from . import survey_math as sm
-    from .store import MAX_CLOUD_BYTES, MapNotFound, parse_pgm, planning_grid_for
+    from .store import MAX_CLOUD_BYTES, MapNotFound, count_cells, parse_pgm, planning_grid_for
 
     progress("reading the floor")
     try:
-        site_map, version, files = store.snapshot(map_id, ("cloud", "planning", "moved", "moved_cloud", "survey"))
+        site_map, version, files = store.snapshot(
+            map_id, ("grid", "cloud", "planning", "moved", "moved_cloud", "survey"))
     except MapNotFound:
         raise BundleError("map %s was deleted before the edit could be made" % map_id) from None
     floor = next((f for f in site_map.floors if f.index == floor_index), None)
@@ -649,7 +764,7 @@ def run_cloud_edit(store, map_id: str, floor_index: int, edit: CloudEdit,
         raise BundleError("map %s has no floor %d any more" % (map_id, floor_index))
     have = files[floor_index]
     moved = parse_moved(have["moved"]) if have["moved"] is not None else None
-    check_against_floor(edit, have["cloud"] is not None, moved)
+    check_against_floor(edit, have["cloud"] is not None, moved, have["moved_cloud"] is not None)
 
     cloud = np.zeros((0, 3))
     if have["cloud"] is not None:
@@ -662,24 +777,39 @@ def run_cloud_edit(store, map_id: str, floor_index: int, edit: CloudEdit,
 
     blobs = {blob["id"]: blob for blob in (moved["blobs"] if moved else [])}
     blob_boxes = [blob_box(blobs[blob_id]) for blob_id in edit.resolve_moved]
-    kept_boxes = [blob_box(blobs[blob_id]) for blob_id in edit.keep_moved]
     cut = list(edit.delete_boxes) + blob_boxes
 
     progress("removing points")
-    remove, per_box = in_boxes(cloud, cut)
-    remaining = cloud[~remove]
-    removed = cloud[remove]
+    remove, per_box = in_boxes(cloud, edit.delete_boxes)
+    voxel = layer_voxel(moved)
     moved_removed = 0
     new_moved_cloud = None
-    if moved_cloud is not None and (cut or kept_boxes):
-        # The amber layer shows what is still listed: points the edit took
-        # out of the map, and the points of blobs taken off the list either way.
-        gone, _ = in_boxes(moved_cloud, cut + kept_boxes)
-        lost_moved, _ = in_boxes(moved_cloud, cut)
-        removed = np.vstack([removed, moved_cloud[lost_moved]])
+    lost_moved = gone = None
+    if moved_cloud is not None:
+        # Moved points the edit takes out of the map (evidence), and the ones
+        # that leave the amber layer: those plus the points of kept blobs.
+        lost_moved, _ = in_boxes(moved_cloud, edit.delete_boxes)
+        for blob_id in edit.resolve_moved:
+            blob = blobs[blob_id]
+            mine = blob_points_mask(moved_cloud, blob)
+            lost_moved |= mine
+            # The floor cloud's points that ARE the blob's moved points: in its
+            # box, and within one voxel of one of them. Still points in the box
+            # farther than that stay.
+            (x0, y0, z0), (x1, y1, z1) = blob_box(blob)
+            in_box = np.flatnonzero((cloud[:, 0] >= x0) & (cloud[:, 0] <= x1) & (cloud[:, 1] >= y0)
+                                    & (cloud[:, 1] <= y1) & (cloud[:, 2] >= z0) & (cloud[:, 2] <= z1))
+            remove[in_box[near_any(cloud[in_box], moved_cloud[mine], voxel)]] = True
+        gone = lost_moved.copy()
+        for blob_id in edit.keep_moved:
+            gone |= blob_points_mask(moved_cloud, blobs[blob_id])
         moved_removed = int(gone.sum())
         if moved_removed:
             new_moved_cloud = pcd_bytes(moved_cloud[~gone])
+    remaining = cloud[~remove]
+    removed = cloud[remove]
+    if lost_moved is not None:
+        removed = np.vstack([removed, moved_cloud[lost_moved]])
 
     plane = sm.fit_floor_plane(cloud) if len(cloud) >= 3 else None
     survey_doc = None
@@ -695,6 +825,7 @@ def run_cloud_edit(store, map_id: str, floor_index: int, edit: CloudEdit,
         "parameters": {"low_band_m": list(low_band), "structure_band_m": list(structure_band),
                        "evidence_band_m": list(band), "min_hits": DEFAULT_MIN_HITS, "min_hits_effective": 1,
                        "heights_from": "floor plane" if plane is not None else "floor_z_m",
+                       "moved_match_m": voxel,
                        "source": source,
                        "note": "the stored cloud is a sample of the survey, so one remaining return in the "
                                "evidence band keeps a cell as it was, and a cell is freed only where the edit "
@@ -720,6 +851,34 @@ def run_cloud_edit(store, map_id: str, floor_index: int, edit: CloudEdit,
         if stats["freed_cells"]:
             new_planning = b"P5\n%d %d\n255\n" % (width, height) + image.tobytes()
 
+    loc_band, loc_source = localisation_band(survey_doc)
+    localisation: Dict = {"rerasterised": False, "reason": None, "freed_cells": 0, "kept_no_evidence_cells": 0,
+                          "parameters": {"obstacle_band_m": list(loc_band), "heights_from": "floor_z_m",
+                                         "min_hits_effective": 1, "source": loc_source}}
+    new_grid = new_preview = None
+    grid_counts: Dict = {}
+    if have["grid"] is None:
+        localisation["reason"] = "this floor has no localisation grid"
+    elif not cut:
+        localisation["reason"] = "nothing was deleted (only blobs kept)"
+    else:
+        progress("updating the localisation grid")
+        width, height, raw = parse_pgm(have["grid"])
+        if (width, height) != tuple(floor.size_cells):
+            raise BundleError("the floor's grid is not the floor's size")
+        grid_pixels = np.frombuffer(raw, dtype=np.uint8).reshape(height, width)
+        frame = Frame(floor.resolution_m, (floor.origin_xy_m[0], floor.origin_xy_m[1]), width, height)
+        grid_image, grid_stats = free_removed(grid_pixels, frame, remaining, removed, floor.floor_z_m, loc_band,
+                                              [(lo[0], lo[1], hi[0], hi[1]) for lo, hi in cut])
+        localisation.update(grid_stats)
+        localisation["rerasterised"] = True
+        if grid_stats["freed_cells"]:
+            new_grid = sm.pgm_bytes(grid_image)
+            new_preview = sm.png_bytes(grid_image)
+            free, occupied, unknown = count_cells(grid_image.tobytes())
+            grid_counts = {"free_cells": free, "occupied_cells": occupied, "unknown_cells": unknown}
+            localisation.update(grid_counts)
+
     new_moved = None
     if moved is not None and (edit.resolve_moved or edit.keep_moved):
         dropped = set(edit.resolve_moved) | set(edit.keep_moved)
@@ -735,15 +894,19 @@ def run_cloud_edit(store, map_id: str, floor_index: int, edit: CloudEdit,
             write("moved", new_moved)
         if new_moved_cloud is not None:
             write("moved_cloud", new_moved_cloud)
+        updates: Dict = dict(grid_counts)
+        if new_grid is not None:
+            write("grid", new_grid)
+            write("preview", new_preview)
         if new_planning is not None:
-            planning = planning_grid_for(current_floor, new_planning, clearance)
+            updates["planning"] = planning_grid_for(current_floor, new_planning, clearance)
             write("planning", new_planning)
-            return {"planning": planning}
-        return {}
+        return updates
 
     record = {"floor": floor_index, "boxes": len(edit.delete_boxes), "resolved_moved": len(edit.resolve_moved),
               "kept_moved": len(edit.keep_moved), "points_removed": int(remove.sum()),
-              "cells_freed": planning_result.get("freed_cells", 0), "reason": edit.reason, **(detail or {})}
+              "cells_freed": planning_result.get("freed_cells", 0),
+              "grid_cells_freed": localisation["freed_cells"], "reason": edit.reason, **(detail or {})}
     try:
         saved, number = store.edit_floor(map_id, floor_index, change, source="cloud_edit",
                                          detail=record, expect_version=version)
@@ -765,5 +928,7 @@ def run_cloud_edit(store, map_id: str, floor_index: int, edit: CloudEdit,
         len(moved["blobs"]) - len(edit.resolve_moved) - len(edit.keep_moved),
         "moved_cloud_points_removed": moved_removed,
         "planning": planning_result,
+        "localisation": localisation,
+        "content_hash": saved_floor.content_hash,
         "reason": edit.reason,
     }

@@ -45,8 +45,10 @@
                                                    version (draft) and queues the quality
                                                    check (result.quality_job_id). 400 for a
                                                    bad box (min > max, not finite, over
-                                                   500), an unknown blob, or a floor with no
-                                                   cloud; 404; 413 over 1 MiB
+                                                   500), an unknown blob, a floor with no
+                                                   cloud, or resolve_moved on a floor with no
+                                                   moved.pcd (its points are what is matched);
+                                                   404; 413 over 1 MiB
 - PUT    /maps/{map_id}/zones                   -> SiteMap; body {"zones": [MapZone, ...]}
                                                    replaces the map's zones; 404 if unknown,
                                                    400 if a zone cannot be stored
@@ -479,7 +481,8 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
             # job checks again against what it reads.
             moved_path = store.artifact_path(map_id, index, "moved")
             moved = parse_moved(moved_path.read_bytes()) if moved_path is not None else None
-            check_against_floor(edit, store.artifact_path(map_id, index, "cloud") is not None, moved)
+            check_against_floor(edit, store.artifact_path(map_id, index, "cloud") is not None, moved,
+                                store.artifact_path(map_id, index, "moved_cloud") is not None)
 
         try:
             await run_in_threadpool(check)
@@ -503,7 +506,8 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                     "boxes": len(edit.delete_boxes), "resolved_moved": len(edit.resolve_moved),
                     "kept_moved": len(edit.keep_moved), "points_removed": result["points_removed"],
                     "moved_cloud_points_removed": result["moved_cloud_points_removed"],
-                    "cells_freed": planning.get("freed_cells", 0), "reason": edit.reason},
+                    "cells_freed": planning.get("freed_cells", 0),
+                    "grid_cells_freed": result["localisation"]["freed_cells"], "reason": edit.reason},
                    site_id=site_map.site_id, actor=requested_by)
             return result
 
