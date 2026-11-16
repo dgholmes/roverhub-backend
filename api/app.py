@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
+from auth.broker_check import check_broker_at_startup, override_from_env
 from auth.deps import Auth, principal_of
 from auth.mqtt_hooks import build_mqtt_hooks_router
 from auth.router import build_auth_router
@@ -95,8 +96,9 @@ def _on_ack(command):
             logger.exception("could not apply the ack for command %s to its run", command.command_id)
 
 
+_broker_url = os.environ.get("CLOUD_MQTT_URL", "mqtt://localhost:1883")
 mqtt_client = BackendMqttClient(
-    os.environ.get("CLOUD_MQTT_URL", "mqtt://localhost:1883"), registry, real_mqtt_client_factory,
+    _broker_url, registry, real_mqtt_client_factory,
     on_ack=_on_ack, on_state=_on_state,
     # Every message history stores, queued on paho's thread; and every command
     # this backend sends, for the audit log (realtime/mqtt_client.py).
@@ -407,7 +409,16 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _on_startup() -> None:
-    # First: before MQTT, so what it snapshots is the previous process's, and
+    # Before anything else, so a refusal has no side effects: with sign-in on,
+    # a broker that admits anonymous clients would let anyone on the network
+    # command the robots, so the backend does not start (auth/broker_check.py).
+    # Raises AnonymousBrokerError; uvicorn then exits. A short paho dial, so on
+    # a worker thread.
+    app.state.broker_anonymous_at_start = None
+    app.state.broker_anonymous_at_start = await asyncio.to_thread(
+        check_broker_at_startup, auth_enabled=auth.enabled, broker_url=_broker_url,
+        allow_anonymous=override_from_env(os.environ))
+    # Then, before MQTT, so what it snapshots is the previous process's, and
     # before the scheduler's first tick, so a robot that process wedged is not
     # skipped as robot_busy once more. File I/O, so on a worker thread.
     try:
@@ -466,6 +477,10 @@ def healthz():
     and plain liveness probes are unaffected; `status` is "degraded" while
     the broker link is down, and `broker` says since when and how often."""
     broker = mqtt_client.link_status()
+    # Whether the broker admitted a client with no username when this process
+    # started (auth/broker_check.py): true/false, or null when not checked
+    # (sign-in off) or the broker did not answer.
+    broker["anonymous_accepted_at_start"] = getattr(app.state, "broker_anonymous_at_start", None)
     # server_time_ms: edge bridges stamp their messages from this clock rather
     # than their own, which can boot minutes wrong (robot_bridge/clock.py).
     return {"status": "ok" if broker["connected"] else "degraded", "server_time_ms": int(time.time() * 1000),
