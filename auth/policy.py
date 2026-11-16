@@ -132,6 +132,11 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     # the floor: someone who can act on a robot at all.
     ("POST", "/robots/{robot_id}/commands"): Rule(capabilities=("estop", "drive", "getUp")),
     ("GET", "/robots/{robot_id}/commands/{command_id}"): _READ,
+    # Asking a robot for its own log (schema 0.0.22) is viewing, not acting on
+    # it: the same as reading its telemetry, at the robot's site. The answer
+    # arrives on the broker's .../logs topic, which the ACL opens to the same
+    # people (auth/mqtt_hooks.py). It moves nothing, so a viewer may ask.
+    ("POST", "/robots/{robot_id}/logs/request"): _READ,
 
     # Audio for Speak: made by an operator, fetched by the bridge.
     ("POST", "/robots/{robot_id}/audio-clips"): Rule(capabilities=("drive",)),

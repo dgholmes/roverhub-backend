@@ -35,10 +35,15 @@ ACC_READ, ACC_WRITE, ACC_READWRITE, ACC_SUBSCRIBE = 1, 2, 3, 4
 # perception service, which signs in with the same device key as the bridge.
 # scan is the bridge's lidar-in-the-map feed (connection_manager.publish_scan);
 # without it here a signed-in broker refused it and the live scan went dark.
+# logs is the robot's own journal, edge -> browser; logs/request is the
+# backend asking for it (schema 0.0.22, shared/schemas/logs.py).
 _ROBOT_TOPICS = {"telemetry", "state", "heartbeat", "lower_state", "commands", "ack", "run", "scan",
-                 "incidents", "perception/status"}
-# What a bridge receives rather than sends.
-_BRIDGE_READS = {"commands"}
+                 "incidents", "perception/status", "logs", "logs/request"}
+# What a bridge receives rather than sends. Only the backend (superuser) writes
+# these, and browsers may not even read them: commands go through REST, where
+# roles are checked per command, and a log request through
+# POST /robots/{id}/logs/request.
+_BRIDGE_READS = {"commands", "logs/request"}
 
 
 class AuthRequest(BaseModel):
@@ -126,7 +131,7 @@ def _browser_allowed(auth: Auth, user_id: str, topic: str, acc: int) -> bool:
         # Registrations say which robots exist and at which site. Seeing the
         # list is the same as GET /robots, which any signed-in user may call.
         return len(parts) == 4 and _segment_matches(parts[2], "x") and parts[3] == "register"
-    if _robot_suffix(parts) not in _ROBOT_TOPICS - {"commands"}:
+    if _robot_suffix(parts) not in _ROBOT_TOPICS - _BRIDGE_READS:
         return False
     site = parts[1]
     if site in ("+", "#"):

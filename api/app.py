@@ -182,7 +182,13 @@ app.include_router(build_auth_router(auth, on_login=history.audit.login, audit=h
 # registered at (auth/mqtt_hooks.py).
 app.include_router(build_mqtt_hooks_router(auth, site_of=lambda robot_id: _site_for(robot_id)))
 app.include_router(build_router(command_store, mqtt_client, registry=registry))
-app.include_router(build_robots_router(registry, audit=history.audit.record))
+# POST /robots/{id}/logs/request asks a robot for its journal; the answer goes
+# robot -> browser through the broker (shared/schemas/logs.py). Late-bound,
+# like the command routes' publish, so a test can stand in for the broker.
+app.include_router(build_robots_router(
+    registry, audit=history.audit.record,
+    publish_log_request=lambda robot_id, request: mqtt_client.publish_log_request(robot_id, request),
+))
 app.include_router(build_media_router(clips_dir=os.environ.get("AUDIO_CLIPS_DIR", DEFAULT_AUDIO_CLIPS_DIR)))
 # Camera snapshots travel the other way from audio clips -- edge to cloud. Unlike
 # clips they are kept as a small media library (JPEG + JSON sidecar, listed by

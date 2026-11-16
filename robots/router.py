@@ -6,14 +6,18 @@ would have to exist (auth, a durable store) before it could.
 """
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Callable, Optional
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Callable, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
 from auth.deps import site_visible
 
+from realtime.mqtt_client import CommandPublishError, UnknownRobotError
 from robots.registry import RobotRecord, RobotRegistry
+from shared.schemas.logs import MAX_LOG_HISTORY_HOURS, LogRequest, LogSource
 
 
 def _iso(value: Optional[datetime]) -> Optional[str]:
@@ -44,9 +48,20 @@ def robot_json(record: RobotRecord) -> dict:
     }
 
 
-def build_robots_router(registry: RobotRegistry, audit: Optional[Callable[..., None]] = None) -> APIRouter:
+class LogRequestBody(BaseModel):
+    """What the console asks for: the robot's log over the last `since_hours`
+    (more than 0, at most 24), from `sources` (default both)."""
+    since_hours: float = Field(gt=0, le=MAX_LOG_HISTORY_HOURS)
+    sources: List[LogSource] = Field(default_factory=lambda: ["bridge", "nav"], min_length=1)
+
+
+def build_robots_router(registry: RobotRegistry, audit: Optional[Callable[..., None]] = None,
+                        publish_log_request: Optional[Callable[[str, LogRequest], None]] = None,
+                        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> APIRouter:
     """`audit` (history/audit.py AuditRecorder.record) is told every accept,
-    reject and forget."""
+    reject and forget. `publish_log_request(robot_id, LogRequest)` sends a log
+    request to the robot's bridge (realtime/mqtt_client.py); without it the
+    log route answers 503."""
     router = APIRouter()
 
     def _audit(action: str, record: RobotRecord, detail: Optional[dict] = None) -> None:
@@ -98,5 +113,36 @@ def build_robots_router(registry: RobotRegistry, audit: Optional[Callable[..., N
         if record is not None:
             _audit("robot.forget", record, {"bridge_id": record.bridge_id})
         return {"robot_id": robot_id, "forgotten": True}
+
+    @router.post("/robots/{robot_id}/logs/request")
+    def request_logs(robot_id: str, body: LogRequestBody):
+        """Ask the robot for its own log since `since_hours` ago (schema 0.0.22,
+        shared/schemas/logs.py). The answer is not returned here: the bridge
+        publishes it on roverhub/{site}/{robot}/logs as LogBatches carrying the
+        returned request_id, which the console reads from the broker. Nothing
+        is stored in the cloud, so a robot that is offline has no log to show:
+        409, rather than a request that nobody will answer."""
+        record = registry.get(robot_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="robot not found")
+        if not record.online:
+            raise HTTPException(status_code=409, detail=f"{robot_id} is offline, so its log can't be read")
+        if publish_log_request is None:
+            raise HTTPException(status_code=503, detail="this backend cannot reach the robots' broker")
+        since = (clock() - timedelta(hours=body.since_hours)).astimezone(timezone.utc)
+        request = LogRequest(
+            request_id=secrets.token_hex(6),
+            # +00:00 rather than Z: the bridge's Python 3.10 fromisoformat
+            # does not read a Z suffix.
+            since=since.isoformat(timespec="milliseconds"),
+            sources=list(dict.fromkeys(body.sources)),
+        )
+        try:
+            publish_log_request(robot_id, request)
+        except UnknownRobotError as exc:
+            raise HTTPException(status_code=404, detail="robot not found") from exc
+        except CommandPublishError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"request_id": request.request_id, "since": request.since}
 
     return router

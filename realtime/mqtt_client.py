@@ -188,13 +188,38 @@ class BackendMqttClient:
                 command.command_id, command.type, robot_id, topic, rc,
             )
             error = f"could not publish command to the broker (rc={rc}); the robot was not sent this command"
-            self._forget_unsent(getattr(info, "mid", None), command)
+            self._forget_unsent(getattr(info, "mid", None), f"command {command.command_id} ({command.type})")
             self._published(robot_id, command, record.site_id, error)
             raise CommandPublishError(error)
         self._published(robot_id, command, record.site_id, None)
 
-    def _forget_unsent(self, mid, command) -> None:
-        """Take a command just reported as NOT sent out of paho's queue.
+    def publish_log_request(self, robot_id: str, request) -> None:
+        """Ask a robot's bridge for its journal since `request.since` (a
+        LogRequest, shared/schemas/logs.py) on roverhub/{site}/{robot}/logs/request,
+        QoS 1, not retained -- the same way a command is sent. The answer comes
+        back on .../logs, which the browser reads straight from the broker; the
+        backend neither subscribes to it nor keeps it.
+
+        Raises UnknownRobotError for a robot the registry does not know and
+        CommandPublishError when paho could not take the message, which it then
+        drops from its queue: the caller was told it failed, so a late delivery
+        would only produce an answer nobody is waiting for."""
+        record = self._registry.get(robot_id)
+        if record is None:
+            raise UnknownRobotError("robot not found")
+        topic = f"roverhub/{record.site_id}/{robot_id}/logs/request"
+        info = self._client.publish(topic, request.model_dump_json(), qos=1)
+        rc = getattr(info, "rc", MQTT_ERR_SUCCESS)
+        if rc != MQTT_ERR_SUCCESS:
+            logger.error("could not publish log request %s for robot %s to %s: paho rc=%s",
+                         request.request_id, robot_id, topic, rc)
+            self._forget_unsent(getattr(info, "mid", None), f"log request {request.request_id}")
+            raise CommandPublishError(
+                f"could not send the log request to the broker (rc={rc}); the robot was not asked")
+
+    def _forget_unsent(self, mid, what: str) -> None:
+        """Take a message just reported as NOT sent out of paho's queue.
+        `what` names it in the log ("command <id> (<type>)").
 
         paho 1.6 does not drop a QoS 1 publish it could not send: on
         MQTT_ERR_NO_CONN it keeps the message and sends it when the link comes
@@ -212,12 +237,12 @@ class BackendMqttClient:
             with lock:
                 dropped = queue.pop(mid, None)
         except Exception:
-            logger.exception("could not drop unsent command %s from the MQTT queue; it may still be "
-                             "delivered when the broker link returns", command.command_id)
+            logger.exception("could not drop unsent %s from the MQTT queue; it may still be "
+                             "delivered when the broker link returns", what)
             return
         if dropped is not None:
-            logger.info("dropped unsent command %s (%s) from the MQTT queue, so it is not delivered "
-                        "late when the broker link returns", command.command_id, command.type)
+            logger.info("dropped unsent %s from the MQTT queue, so it is not delivered "
+                        "late when the broker link returns", what)
 
     def _published(self, robot_id, command, site_id, error) -> None:
         if self._on_published is None:
@@ -300,6 +325,8 @@ class BackendMqttClient:
         # Perception's (docs/02-system-architecture.md): stored by history/.
         client.subscribe("roverhub/+/+/incidents", qos=1)
         client.subscribe("roverhub/+/+/perception/status", qos=1)
+        # Not .../logs (schema 0.0.22): the robot's log goes edge -> browser
+        # through the broker, and nothing of it is stored in the cloud.
 
     def _on_disconnect(self, client, userdata, rc) -> None:
         with self._link_lock:
