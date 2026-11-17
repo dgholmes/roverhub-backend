@@ -42,9 +42,11 @@ ACC_READ, ACC_WRITE, ACC_READWRITE, ACC_SUBSCRIBE = 1, 2, 3, 4
 # 0.0.23, shared/schemas/survey.py and sensors.py): the device writes its own,
 # people read them at their sites. A retained message is a publish like any
 # other here; the broker checks its delivery (ACC_READ) per reader as usual.
+# nav/path is the route Nav2 is planning, edge -> browser (schema 0.0.24,
+# shared/schemas/nav_path.py), read like scan.
 _ROBOT_TOPICS = {"telemetry", "state", "heartbeat", "lower_state", "commands", "ack", "run", "scan",
                  "incidents", "perception/status", "logs", "logs/request",
-                 "survey/status", "survey/map", "sensors/lidar_mount"}
+                 "survey/status", "survey/map", "sensors/lidar_mount", "nav/path"}
 # What a bridge receives rather than sends. Only the backend (superuser) writes
 # these, and browsers may not even read them: commands go through REST, where
 # roles are checked per command, and a log request through
