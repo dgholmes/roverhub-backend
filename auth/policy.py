@@ -150,6 +150,9 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("POST", "/mqtt/acl"): Rule(public=True),
 
     ("GET", "/users"): Rule(org_admin=True),
+    # Display names for ids, for histories (2026-11-18): names only, so anyone
+    # signed in may ask. Edge devices may not (Rule.signed_in is people only).
+    ("GET", "/users/names"): Rule(signed_in=True),
     ("POST", "/users"): Rule(org_admin=True),
     ("PATCH", "/users/{user_id}"): Rule(org_admin=True),
     ("DELETE", "/users/{user_id}"): Rule(org_admin=True),

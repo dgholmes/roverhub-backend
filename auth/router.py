@@ -14,6 +14,9 @@ from .users import ALL_SITES, OrgRole, PasswordTooShort, SiteRole
 
 logger = logging.getLogger("roverhub.auth")
 
+# GET /users/names answers at most this many ids at once (2026-11-18).
+MAX_NAME_IDS = 50
+
 
 class LoginRequest(BaseModel):
     username: str = Field(max_length=64)
@@ -231,6 +234,30 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         _audit("user.password_change", principal.user)
         return Response(status_code=204)
+
+    # --- names, for anyone signed in ----------------------------------------
+
+    @router.get("/users/names")
+    def user_names(request: Request, ids: str = ""):
+        """Display names for user ids, so a history can say who instead of an
+        id (2026-11-18: the lidar mount's history). `ids` is comma-separated,
+        at most MAX_NAME_IDS. Names only -- the display name, or the username
+        when there is none; no roles, no flags. Unknown ids are left out; a
+        disabled user's name is still given, since what they did is still in
+        the history. With sign-in off only the dev user has a name."""
+        wanted = list(dict.fromkeys(i.strip() for i in ids.split(",") if i.strip()))
+        if len(wanted) > MAX_NAME_IDS:
+            raise HTTPException(status_code=400, detail=f"at most {MAX_NAME_IDS} ids at once")
+        principal = principal_of(request)
+        if not auth.enabled or principal is None or principal.kind == "dev":
+            dev = _dev_user()
+            return {"names": {DEV_USER_ID: dev["display_name"]} if DEV_USER_ID in wanted else {}}
+        names: Dict[str, str] = {}
+        for user_id in wanted:
+            user = auth.users.get(user_id)
+            if user is not None:
+                names[user_id] = user.display_name.strip() or user.username
+        return {"names": names}
 
     # --- user management (org owner / admin) -------------------------------
 
