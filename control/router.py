@@ -14,7 +14,7 @@ from realtime.mqtt_client import CommandPublishError, UnknownRobotError
 from realtime.mqtt_client import _parse_version
 from shared.schemas.commands import (
     WIRED_COMMAND_TYPES, Command, CommandRequest, CommandStageEvent, NavGotoParams,
-    ResetPositionParams, ResumeParams, command_ttl_s,
+    ResetPositionParams, ResumeParams, SyncMapParams, command_ttl_s,
 )
 from shared.schemas.sensors import SetCalibrationModeParams, SetLidarMountParams
 from shared.schemas.survey import FindMovingParams, StartSurveyParams, StopSurveyParams
@@ -41,6 +41,10 @@ _SITE_SETUP_NOUN = {
 # STOP_SURVEY is a stop: never refused on a version guess (an old bridge has no
 # survey to stop, and says so itself).
 _NEEDS_SURVEY_SCHEMA = frozenset(_SITE_SETUP_PARAMS) - {"STOP_SURVEY"}
+
+# "Send to robot" (schema 0.0.26): SYNC_MAP makes the robot's map files the
+# floor's current version. A bridge older than that refuses the type as unknown.
+SYNC_MAP_SCHEMA_VERSION = "0.0.26"
 
 
 def _bad_fields(exc: ValidationError) -> str:
@@ -85,6 +89,47 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
         if command_type == "FIND_MOVING" and not any(f.index == parsed.floor_index for f in site_map.floors):
             raise HTTPException(status_code=404, detail=f"map {map_id} has no floor {parsed.floor_index}")
 
+    def _check_sync_map(robot_id: str, params) -> None:
+        """422 / 409 / 404 for a SYNC_MAP the robot would refuse anyway, said
+        here in plain words before anything is sent. The robot checks all of
+        it again: the hash of the files it builds is the last word."""
+        try:
+            parsed = SyncMapParams.model_validate(params or {})
+        except ValidationError as exc:
+            raise HTTPException(status_code=422,
+                                detail=f"SYNC_MAP params are not a map to send ({_bad_fields(exc)})") from exc
+        robot = registry.get(robot_id) if registry is not None else None
+        if robot is not None:
+            version = _parse_version(robot.schema_version)
+            if version is None or version < _parse_version(SYNC_MAP_SCHEMA_VERSION):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"update the edge device: it runs schema {robot.schema_version or 'unknown'}, "
+                            f"sending it a map needs {SYNC_MAP_SCHEMA_VERSION}"))
+            if robot.nav_map_id is not None and robot.nav_map_id != parsed.map_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{robot_id} is set up for map {robot.nav_map_id}, not {parsed.map_id}")
+        if map_lookup is None:
+            return
+        site_map = map_lookup(parsed.map_id)
+        robot_site = robot.site_id if robot is not None else None
+        if site_map is None or (robot_site is not None and site_map.site_id != robot_site):
+            raise HTTPException(status_code=404, detail=f"map {parsed.map_id} not found at this robot's site")
+        floor = next((f for f in site_map.floors if f.index == parsed.floor_index), None)
+        if floor is None:
+            raise HTTPException(status_code=404, detail=f"map {parsed.map_id} has no floor {parsed.floor_index}")
+        if floor.content_hash is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"map {parsed.map_id} floor {parsed.floor_index} has no content hash, so the robot "
+                       "could not check what it receives")
+        if floor.content_hash != parsed.map_hash:
+            raise HTTPException(
+                status_code=409,
+                detail=f"map {parsed.map_id} floor {parsed.floor_index} is now version "
+                       f"{floor.content_hash[:12]}, not {parsed.map_hash[:12]} -- reload the map and send it again")
+
     @router.post("/robots/{robot_id}/commands")
     def issue_command(robot_id: str, request: CommandRequest, http: Request):
         if request.type not in WIRED_COMMAND_TYPES:
@@ -128,6 +173,8 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
                     detail=f"RESET_POSITION params are not a usable pose ({_bad_fields(exc)})") from exc
         elif request.type in _SITE_SETUP_PARAMS:
             _check_site_setup(robot_id, request.type, request.params)
+        elif request.type == "SYNC_MAP":
+            _check_sync_map(robot_id, request.params)
         elif request.type == "RESUME":
             # The run_id is what stops a late Retry restarting some other paused run.
             try:

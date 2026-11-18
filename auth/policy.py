@@ -88,6 +88,11 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     # the engineer's (shared/schemas/sensors.py).
     "SET_LIDAR_MOUNT": ("configure",),
     "SET_CALIBRATION_MODE": ("configure",),
+    # "Send to robot" (schema 0.0.26): replacing the map files a robot plans,
+    # localises and enforces its zones on is robot configuration, as copying
+    # them by hand was -- the engineer's. Drawing the zones stays `editZones`;
+    # this only carries what was drawn (and signed off) to the robot.
+    "SYNC_MAP": ("configure",),
 }
 
 
