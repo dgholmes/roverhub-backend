@@ -38,6 +38,10 @@ class NewUser(BaseModel):
     audit_access: bool = False
 
 
+class EngineerTools(BaseModel):
+    on: bool
+
+
 class UserChanges(BaseModel):
     display_name: Optional[str] = None
     org_role: Optional[OrgRole] = None
@@ -77,9 +81,23 @@ class LoginThrottle:
 
 
 def _dev_user() -> dict:
+    # Sign-in off: the dev user already holds every right, so the console shows
+    # no engineer-tools switch (2026-11-18).
     return {"user_id": DEV_USER_ID, "username": DEV_USER_ID, "display_name": "Developer",
             "org_role": "owner", "site_roles": {ALL_SITES: "supervisor"}, "audit_access": True,
-            "disabled": False}
+            "disabled": False, "engineer_tools": False, "can_use_engineer_tools": False}
+
+
+def _can_use_engineer_tools(user) -> bool:
+    return user.org_role in ("owner", "admin")
+
+
+def _session_user(user, engineer_tools: bool) -> dict:
+    """`user.public()` plus this session's engineer-tools state, for the console
+    (2026-11-18). Only on the caller's own account -- login, refresh, /auth/me,
+    the switch itself; the user list has no session to describe."""
+    return {**user.public(), "engineer_tools": engineer_tools and _can_use_engineer_tools(user),
+            "can_use_engineer_tools": _can_use_engineer_tools(user)}
 
 
 def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
@@ -105,11 +123,13 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
         response.set_cookie(SESSION_COOKIE, token, max_age=max_age, httponly=True,
                             samesite="lax", secure=auth.secure_cookie, path="/")
 
-    def _session(response: Response, user) -> dict:
-        token, expires_at = auth.issuer.issue(user.user_id, user.token_version)
+    def _session(response: Response, user, engineer_tools: bool = False) -> dict:
+        # Never issue the claim to someone who may not hold it, whatever asked.
+        engineer_tools = engineer_tools and _can_use_engineer_tools(user)
+        token, expires_at = auth.issuer.issue(user.user_id, user.token_version, engineer_tools=engineer_tools)
         _set_cookie(response, token, max(0, expires_at - int(time.time())))
         return {"access_token": token, "token_type": "bearer", "expires_at": expires_at,
-                "user": user.public()}
+                "user": _session_user(user, engineer_tools)}
 
     def _report(name: str, ok: bool, user_id: Optional[str]) -> None:
         if on_login is None:
@@ -158,7 +178,27 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
         principal = principal_of(request)
         if principal is None or principal.kind != "user":
             raise HTTPException(status_code=403, detail="only a signed-in person can refresh a session")
-        return _session(response, principal.user)
+        # Engineer tools last until signed out, so a console left open keeps
+        # them -- but only while the user is still an org owner or admin.
+        return _session(response, principal.user, engineer_tools=principal.engineer_tools_active)
+
+    @router.post("/auth/engineer-tools")
+    def engineer_tools(body: EngineerTools, request: Request, response: Response):
+        """Turn this session's engineer tools on or off (2026-11-18): the
+        engineer's capabilities on top of the caller's own role, at the sites
+        where they hold one. For org owners and admins only -- they are
+        supervisor everywhere, and lidar calibration and surveys are the
+        engineer's (`configure`). A new token carries the switch; login always
+        starts with it off. Audited both ways."""
+        if not auth.enabled:
+            raise HTTPException(status_code=404, detail="sign-in is off on this server")
+        principal = principal_of(request)
+        if principal is None or principal.kind != "user" or not principal.is_org_admin:
+            raise HTTPException(status_code=403,
+                                detail="only an organisation owner or admin can use engineer tools")
+        session = _session(response, principal.user, engineer_tools=body.on)
+        _audit("auth.engineer_tools", principal.user, {"on": body.on})
+        return session
 
     @router.post("/auth/logout", status_code=204)
     def logout():
@@ -176,7 +216,7 @@ def build_auth_router(auth: Auth, throttle: Optional[LoginThrottle] = None,
             return {"auth_enabled": False, "user": _dev_user()}
         if principal.kind == "device":
             raise HTTPException(status_code=403, detail="device keys have no user")
-        return {"auth_enabled": True, "user": principal.user.public()}
+        return {"auth_enabled": True, "user": _session_user(principal.user, principal.engineer_tools_active)}
 
     @router.post("/auth/password", status_code=204)
     def change_own_password(body: PasswordChange, request: Request):

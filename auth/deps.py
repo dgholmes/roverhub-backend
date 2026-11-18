@@ -23,7 +23,7 @@ from typing import Callable, Dict, FrozenSet, Iterable, Optional, Tuple
 from fastapi import HTTPException, Request
 
 from .policy import ROUTES, CAPABILITIES, Rule, role_can
-from .tokens import DEFAULT_TOKEN_TTL_S, TokenIssuer, load_secret
+from .tokens import DEFAULT_TOKEN_TTL_S, TokenClaims, TokenIssuer, load_secret
 from .users import ALL_SITES, User, UserStore, DEFAULT_USERS_FILE
 
 logger = logging.getLogger("roverhub.auth")
@@ -59,6 +59,24 @@ class Principal:
     # A device: the site its robot registered at, when the registry knows it
     # (Auth.device_site_of). What `device_own_site` routes hold it to.
     device_site: Optional[str] = None
+    # A user: this session's engineer-tools switch (2026-11-18). Org owners are
+    # supervisor on every site, and site roles are one per site, so without it
+    # nobody could calibrate the lidar or start a survey (`configure`). The
+    # token's `eng` claim says the switch is on; it counts only while the user
+    # is still an org owner or admin, read from the user store on this request
+    # (Auth.identify), and `engineer_tools_active` checks that again.
+    engineer_tools: bool = False
+
+    @property
+    def engineer_tools_active(self) -> bool:
+        return self.kind == "user" and self.engineer_tools and self.is_org_admin
+
+    def _role_can(self, role: Optional[str], capability: str) -> bool:
+        # The switch adds the engineer's capabilities to a role the caller
+        # already holds there; it never reaches a site where they hold none.
+        if role is None:
+            return False
+        return role_can(role, capability) or (self.engineer_tools_active and role_can("engineer", capability))
 
     def can(self, capability: str, site_id: Optional[str]) -> bool:
         if self.kind == "dev":
@@ -66,9 +84,9 @@ class Principal:
         if self.user is None:
             return False
         if site_id is not None:
-            return role_can(self.user.site_role(site_id), capability)
+            return self._role_can(self.user.site_role(site_id), capability)
         # Site unknown from the path: any site where they hold it.
-        return any(role_can(r, capability) for r in self.user.site_roles.values())
+        return any(self._role_can(r, capability) for r in self.user.site_roles.values())
 
     @property
     def is_org_admin(self) -> bool:
@@ -244,14 +262,18 @@ class Auth:
             logger.exception("could not look up the site of device %s", robot_id)
             return None
 
-    def user_for_token(self, token: str) -> Optional[User]:
+    def session_for_token(self, token: str) -> Optional[Tuple[User, TokenClaims]]:
         claims = self.issuer.verify(token)
         if claims is None:
             return None
         user = self.users.get(claims.user_id)
         if user is None or user.disabled or user.token_version != claims.version:
             return None
-        return user
+        return user, claims
+
+    def user_for_token(self, token: str) -> Optional[User]:
+        session = self.session_for_token(token)
+        return session[0] if session else None
 
     def identify(self, request: Request) -> Optional[Principal]:
         if not self.enabled:
@@ -267,8 +289,14 @@ class Auth:
         device = self.device_for_key(token) if "." not in token else None
         if device is not None:
             return Principal(kind="device", id=device, device_site=self._device_site(device))
-        user = self.user_for_token(token)
-        return Principal(kind="user", id=user.user_id, user=user) if user else None
+        session = self.session_for_token(token)
+        if session is None:
+            return None
+        user, claims = session
+        # The user was read from the store just now, so a demotion since the
+        # token was issued already shows here.
+        return Principal(kind="user", id=user.user_id, user=user,
+                         engineer_tools=claims.engineer_tools and user.org_role in ("owner", "admin"))
 
     # --- the guard ----------------------------------------------------------
 
@@ -410,7 +438,10 @@ def audit_scope(principal: Optional[Principal]) -> AuditScope:
         return AuditScope(all_sites=False, sites=frozenset(), org_rows=False)
 
     def qualifies(role) -> bool:
-        return role is not None and (user.audit_access or any(role_can(role, c) for c in _AUDIT_CAPABILITIES))
+        # principal._role_can: with engineer tools on, `configure` counts at the
+        # sites where they hold a role, as it does on the /audit guard.
+        return role is not None and (user.audit_access
+                                     or any(principal._role_can(role, c) for c in _AUDIT_CAPABILITIES))
 
     named = {s: r for s, r in user.site_roles.items() if s != ALL_SITES}
     org_rows = principal.is_org_admin or user.audit_access

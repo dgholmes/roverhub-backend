@@ -3,6 +3,12 @@
 A token names the user and the user's `token_version`. Changing a password,
 disabling the user or signing out everywhere bumps that version, which ends
 every token issued before it -- so tokens can be revoked without a deny list.
+
+A token may also carry `eng`, the engineer-tools switch an org owner or admin
+turns on for one session (2026-11-18, POST /auth/engineer-tools). The claim
+only says the switch is on; whether it still counts is decided per request
+against the user's current org role (auth/deps.py), so a demotion ends it at
+once rather than at the token's expiry.
 """
 from __future__ import annotations
 
@@ -27,6 +33,7 @@ class TokenClaims:
     user_id: str
     version: int
     expires_at: int
+    engineer_tools: bool = False
 
 
 def load_secret(path: str) -> str:
@@ -55,13 +62,14 @@ class TokenIssuer:
         self._ttl_s = ttl_s
         self._clock = clock
 
-    def issue(self, user_id: str, version: int) -> tuple[str, int]:
+    def issue(self, user_id: str, version: int, engineer_tools: bool = False) -> tuple[str, int]:
         now = int(self._clock())
         expires_at = now + self._ttl_s
-        token = jwt.encode(
-            {"sub": user_id, "ver": version, "iat": now, "exp": expires_at, "iss": _ISSUER},
-            self._secret, algorithm=_ALGORITHM,
-        )
+        payload = {"sub": user_id, "ver": version, "iat": now, "exp": expires_at, "iss": _ISSUER}
+        if engineer_tools:
+            # Absent means off, so every token issued before 2026-11-18 reads as off.
+            payload["eng"] = True
+        token = jwt.encode(payload, self._secret, algorithm=_ALGORITHM)
         return token, expires_at
 
     def verify(self, token: str) -> Optional[TokenClaims]:
@@ -75,4 +83,6 @@ class TokenIssuer:
             return None
         if claims["exp"] < self._clock():
             return None
-        return TokenClaims(user_id=str(claims["sub"]), version=int(claims["ver"]), expires_at=int(claims["exp"]))
+        return TokenClaims(user_id=str(claims["sub"]), version=int(claims["ver"]), expires_at=int(claims["exp"]),
+                           # Only a real JSON true: a signed token is ours, but be exact anyway.
+                           engineer_tools=claims.get("eng") is True)

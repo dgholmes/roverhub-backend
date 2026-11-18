@@ -138,6 +138,11 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("GET", "/auth/me"): Rule(signed_in=True),
     ("POST", "/auth/refresh"): Rule(signed_in=True),
     ("POST", "/auth/password"): Rule(signed_in=True),
+    # The engineer-tools switch (2026-11-18): any signed-in person reaches the
+    # handler, which refuses everyone but org owners and admins with its own
+    # message (auth/router.py). While on, Principal.can adds the `engineer`
+    # role's capabilities at the sites where the caller holds a role.
+    ("POST", "/auth/engineer-tools"): Rule(signed_in=True),
     # The broker's own checks. They take credentials in the body and answer
     # yes or no, so they are public in the same way /auth/login is.
     ("POST", "/mqtt/auth"): Rule(public=True),
