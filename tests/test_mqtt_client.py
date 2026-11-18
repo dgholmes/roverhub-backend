@@ -482,7 +482,26 @@ def test_state_message_stores_nav_goal():
 
     client.handle_message("roverhub/site-dev/robot-dev-01/state", _state_payload(nav_goal=_NAV_GOAL))
 
-    assert registry.get("robot-dev-01").nav_goal == _NAV_GOAL
+    # Stored as the schema dumps it: `stuck` (0.0.27) is None for a goal that
+    # never got stuck, and from a bridge older than 0.0.27.
+    assert registry.get("robot-dev-01").nav_goal == {**_NAV_GOAL, "stuck": None}
+
+
+def test_state_message_keeps_a_stuck_walks_options():
+    registry = RobotRegistry()
+    registry.upsert_from_registration("robot-dev-01", "site-dev", "quad")
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    option = {"option_id": "A", "points": [[1.0, 2.0], [3.0, 2.0]], "length_m": 2.0, "est_s": 4.0,
+              "end": [3.0, 2.0]}
+    stuck = {"reason": "no_progress", "since": "2026-11-18T00:00:00Z", "decide_by": "2026-11-18T00:01:00Z",
+             "failed_route": [[1.0, 2.0], [2.0, 2.0]], "stuck_at": [1.7, 2.0], "routes": [option],
+             "nearest": None, "back": None}
+    goal = {**_NAV_GOAL, "state": "stuck", "reason": "no_progress", "stuck": stuck}
+
+    client.handle_message("roverhub/site-dev/robot-dev-01/state", _state_payload(nav_goal=goal))
+
+    kept = registry.get("robot-dev-01").nav_goal
+    assert kept["state"] == "stuck" and kept["stuck"]["routes"][0]["option_id"] == "A"
 
 
 def test_state_message_without_nav_goal_gives_none():

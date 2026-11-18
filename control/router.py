@@ -13,8 +13,8 @@ from control.commands import CommandStore
 from realtime.mqtt_client import CommandPublishError, UnknownRobotError
 from realtime.mqtt_client import _parse_version
 from shared.schemas.commands import (
-    WIRED_COMMAND_TYPES, Command, CommandRequest, CommandStageEvent, NavGotoParams,
-    ResetPositionParams, ResumeParams, SyncMapParams, command_ttl_s,
+    WIRED_COMMAND_TYPES, Command, CommandRequest, CommandStageEvent, NavGotoParams, NavResolveParams,
+    ResetPositionParams, ResumeParams, SetNavStuckPolicyParams, SyncMapParams, command_ttl_s,
 )
 from shared.schemas.sensors import SetCalibrationModeParams, SetLidarMountParams
 from shared.schemas.survey import FindMovingParams, StartSurveyParams, StopSurveyParams
@@ -45,6 +45,15 @@ _NEEDS_SURVEY_SCHEMA = frozenset(_SITE_SETUP_PARAMS) - {"STOP_SURVEY"}
 # "Send to robot" (schema 0.0.26): SYNC_MAP makes the robot's map files the
 # floor's current version. A bridge older than that refuses the type as unknown.
 SYNC_MAP_SCHEMA_VERSION = "0.0.26"
+
+
+# A stuck walk (schema 0.0.27): NAV_RESOLVE answers it, SET_NAV_STUCK_POLICY
+# is the robot's setting. A bridge older than that refuses both as unknown.
+NAV_STUCK_SCHEMA_VERSION = "0.0.27"
+_NAV_STUCK_PARAMS = {
+    "NAV_RESOLVE": (NavResolveParams, "an answer to a stuck walk"),
+    "SET_NAV_STUCK_POLICY": (SetNavStuckPolicyParams, "a stuck policy (ask, auto or stop)"),
+}
 
 
 def _bad_fields(exc: ValidationError) -> str:
@@ -130,6 +139,25 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
                 detail=f"map {parsed.map_id} floor {parsed.floor_index} is now version "
                        f"{floor.content_hash[:12]}, not {parsed.map_hash[:12]} -- reload the map and send it again")
 
+    def _check_nav_stuck(robot_id: str, command_type: str, params) -> None:
+        """422 / 409 for a NAV_RESOLVE or SET_NAV_STUCK_POLICY the robot would
+        refuse anyway. Whether the walk is stuck, and the option offered, are
+        the robot's to judge."""
+        model, noun = _NAV_STUCK_PARAMS[command_type]
+        try:
+            model.model_validate(params or {})
+        except ValidationError as exc:
+            raise HTTPException(status_code=422,
+                                detail=f"{command_type} params are not {noun} ({_bad_fields(exc)})") from exc
+        robot = registry.get(robot_id) if registry is not None else None
+        if robot is not None:
+            version = _parse_version(robot.schema_version)
+            if version is None or version < _parse_version(NAV_STUCK_SCHEMA_VERSION):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"update the edge device: it runs schema {robot.schema_version or 'unknown'}, "
+                            f"stuck walks need {NAV_STUCK_SCHEMA_VERSION}"))
+
     @router.post("/robots/{robot_id}/commands")
     def issue_command(robot_id: str, request: CommandRequest, http: Request):
         if request.type not in WIRED_COMMAND_TYPES:
@@ -175,6 +203,8 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
             _check_site_setup(robot_id, request.type, request.params)
         elif request.type == "SYNC_MAP":
             _check_sync_map(robot_id, request.params)
+        elif request.type in _NAV_STUCK_PARAMS:
+            _check_nav_stuck(robot_id, request.type, request.params)
         elif request.type == "RESUME":
             # The run_id is what stops a late Retry restarting some other paused run.
             try:

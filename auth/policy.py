@@ -93,6 +93,13 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     # them by hand was -- the engineer's. Drawing the zones stays `editZones`;
     # this only carries what was drawn (and signed off) to the robot.
     "SYNC_MAP": ("configure",),
+    # A stuck walk (schema 0.0.27). NAV_RESOLVE answers it -- walk a route
+    # the robot offers, retry, or cancel -- and is not listed: like NAV_GOTO,
+    # whose walk it continues, it takes the `drive` default. What the robot
+    # does when nobody answers is a robot setting, stored on the robot and
+    # followed by every walk and mission there: the engineer's, like the
+    # lidar's mount.
+    "SET_NAV_STUCK_POLICY": ("configure",),
 }
 
 
