@@ -147,6 +147,7 @@ class SurveyStore:
                 take_count=len(takes),
                 first_bad_s=original.first_bad_s if original is not None else None,
                 has_legs=original.has_legs if original is not None else False,
+                legs_m=original.legs_m if original is not None else None,
             ))
         out.sort(key=lambda s: (s.started_at, s.survey_id), reverse=True)
         return out

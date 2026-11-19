@@ -33,6 +33,7 @@ def test_put_list_get_and_files(tmp_path):
     assert c.put("/surveys/s1/takes/original/files/paths.json", content=b'{"take":[]}').status_code == 200
     items = c.get("/surveys").json()["items"]
     assert items[0]["take_count"] == 1 and items[0]["first_bad_s"] == 980.0
+    assert items[0]["legs_m"] == 205.0
     assert c.get("/surveys/s1").json()["takes"][0]["take_id"] == "original"
     assert c.get("/surveys/s1/takes/original/files/paths.json").content == b'{"take":[]}'
 
@@ -68,6 +69,7 @@ def test_summary_without_an_original_take(tmp_path):
     c.put("/surveys/s1/takes/manual-e", json=take("s1", "manual-e", first_bad_s=12.0))
     item = c.get("/surveys").json()["items"][0]
     assert item["take_count"] == 1 and item["first_bad_s"] is None and item["has_legs"] is False
+    assert item["legs_m"] is None
 
 
 def test_takes_sorted_original_first_then_by_created_at(tmp_path):
