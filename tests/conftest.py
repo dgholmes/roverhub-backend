@@ -16,7 +16,13 @@ os.environ["AUTH_ALLOW_UNKEYED_BRIDGES"] = "false"
 
 _DATA = tempfile.mkdtemp(prefix="roverhub-backend-tests-")
 atexit.register(shutil.rmtree, _DATA, ignore_errors=True)
-for _name in ("RUNS_DIR", "TASKS_DIR", "MISSIONS_DIR", "MAPS_DIR", "SNAPSHOTS_DIR", "AUDIO_CLIPS_DIR"):
+# TTS_CACHE_DIR belongs here with the rest: control/tts.py resolves its default
+# at import time, so pointing it at the throwaway folder has to happen before
+# anything imports it. The per-test fixture below narrows it further.
+for _name in (
+    "RUNS_DIR", "TASKS_DIR", "MISSIONS_DIR", "MAPS_DIR", "SNAPSHOTS_DIR",
+    "AUDIO_CLIPS_DIR", "TTS_CACHE_DIR",
+):
     os.environ[_name] = os.path.join(_DATA, _name.lower())
 os.environ["USERS_FILE"] = os.path.join(_DATA, "users.json")
 # The app's history store (history/). SQLite in the throwaway folder, never the
@@ -59,3 +65,15 @@ def history_store(history_db):
     store.migrate()
     yield store
     store.close()
+
+
+@pytest.fixture(autouse=True)
+def isolated_tts_cache(tmp_path, monkeypatch):
+    """Gives every test its own synthesis cache directory.
+
+    The module-level TTS_CACHE_DIR above already keeps the suite out of the
+    working tree's data/tts-cache. This narrows it per test, so one test's
+    cached audio can never answer another's request -- a test asserting that a
+    synthesiser was called would otherwise pass on a hit left by an earlier one.
+    """
+    monkeypatch.setenv("TTS_CACHE_DIR", str(tmp_path / "tts-cache"))
