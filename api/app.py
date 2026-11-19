@@ -35,6 +35,8 @@ from runs.reaper import RunReaper
 from runs.reconcile import make_state_hook
 from runs.router import build_runs_router
 from runs.store import DEFAULT_RUNS_DIR
+from surveys.router import build_surveys_router
+from surveys.store import DEFAULT_SURVEYS_DIR
 from tasks.router import build_tasks_router
 from tasks.scheduler import EXECUTOR_KINDS, SchedulerLoop, has_spoken_steps
 from tasks.store import DEFAULT_TASKS_DIR, TaskStore
@@ -142,6 +144,10 @@ def _resolve_site(params):
         if "run_id" in params:
             run = runs_router.store.get(params["run_id"])
             return (run.site_id, run.robot_id) if run else (None, None)
+        if "survey_id" in params:
+            # A survey is its robot's: a device key reaches only its own.
+            survey = surveys_router.store.get(params["survey_id"])
+            return (survey.site_id, survey.robot_id) if survey else (None, None)
         if "task_id" in params:
             task = _reconcile_task_store.get_task(params["task_id"])
             return (task.site_id, task.robot_id) if task else (None, None)
@@ -249,6 +255,10 @@ _copier = bucket_from_env(runs_router.store)
 # Every start and end of a run is a write of its record: the audit log's hook.
 runs_router.store.observer = history.audit.run_changed
 app.include_router(runs_router)
+# Survey replay: a survey's record, its FAST-LIO2 takes and their files, kept
+# one folder per survey and uploaded by the robot's survey pipeline. See surveys/.
+surveys_router = build_surveys_router(os.environ.get("SURVEYS_DIR", DEFAULT_SURVEYS_DIR))
+app.include_router(surveys_router)
 # Incidents, a robot's history, the audit log (history/router.py). Evidence is
 # linked by the snapshot library's own records of which incident an upload named.
 app.include_router(build_history_router(

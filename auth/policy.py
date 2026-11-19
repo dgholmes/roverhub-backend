@@ -277,6 +277,22 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("GET", "/runs/{run_id}/files/{rel:path}"): _READ,
     ("GET", "/runs/{run_id}/zip"): _READ,
 
+    # Survey replay (surveys/, schema 0.0.28). The robot's survey pipeline
+    # writes a survey's record, its takes and their files with its own device
+    # key, at the site its robot registered at and for its own robot only (the
+    # path's survey names the robot; a new one's body is checked by the
+    # handler). People read them as they read runs. The same writes by a person
+    # are edge tooling, the engineer's. Deleting a re-run take is too, and a
+    # device never deletes one; the original take cannot be deleted at all.
+    ("GET", "/surveys"): _READ,
+    ("GET", "/surveys/{survey_id}"): _READ,
+    ("PUT", "/surveys/{survey_id}"): Rule(capabilities=("edgeTools",), device_own_site=True),
+    ("PUT", "/surveys/{survey_id}/takes/{take_id}"): Rule(capabilities=("edgeTools",), device_own_site=True),
+    ("DELETE", "/surveys/{survey_id}/takes/{take_id}"): Rule(capabilities=("edgeTools",)),
+    ("PUT", "/surveys/{survey_id}/takes/{take_id}/files/{name}"): Rule(capabilities=("edgeTools",),
+                                                                       device_own_site=True),
+    ("GET", "/surveys/{survey_id}/takes/{take_id}/files/{name}"): _READ,
+
     # History (history/router.py). Everyone who can see a site may read its
     # incidents and a robot's history. Answering an incident -- acknowledge,
     # resolve -- is for the people who act on robots there: the same floor as
