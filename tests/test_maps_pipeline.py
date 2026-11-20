@@ -181,9 +181,17 @@ def test_a_level_cloud_is_not_rotated():
     assert not out["info"]["rotated"]
 
 
+def test_a_steep_mount_like_rover_jetsons_is_levelled():
+    # rover-jetson's lidar has been pitched 19.8 deg since 2026-11-18; the old 15 deg
+    # cap refused every survey after the remount.
+    out = level_survey(room_cloud(pitch_deg=19.8), room_track(pitch_deg=19.8))
+    assert out["info"]["rotated"] and out["info"]["track_frame"] == "raw"
+    assert out["info"]["cloud_plane_after"]["tilt_deg"] < 0.1
+
+
 def test_a_floor_steeper_than_a_mount_pitch_is_refused():
     with pytest.raises(sm.SurveyError, match="tilted"):
-        level_survey(room_cloud(pitch_deg=20.0), room_track(pitch_deg=20.0))
+        level_survey(room_cloud(pitch_deg=50.0), room_track(pitch_deg=50.0))
 
 
 # --- the survey pipeline -----------------------------------------------------
