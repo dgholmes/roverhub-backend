@@ -238,6 +238,26 @@ def test_set_site_unknown_site_404(listed):
     assert listed["sent"] == []
 
 
+def test_set_site_unknown_and_known_targets_look_the_same_without_rights(auth_on, listed):
+    # eve configures the robot's site and holds nothing at either target.
+    client = TestClient(backend.app)
+    headers = _bearer(client, "eve")
+    unknown = _command(client, "SET_SITE", {"site_id": "site-nowhere"}, headers=headers)
+    known = _command(client, "SET_SITE", {"site_id": OTHER_SITE}, headers=headers)
+    assert unknown.status_code == known.status_code == 403
+    # The detail echoes only the id the caller sent.
+    assert unknown.json()["detail"].replace("site-nowhere", "X") == known.json()["detail"].replace(OTHER_SITE, "X")
+    assert listed["sent"] == []
+
+
+@pytest.mark.parametrize("type_", MAP_READY)
+def test_a_device_key_cannot_send_any_of_the_six(auth_on, listed, type_):
+    response = _command(TestClient(backend.app), type_, _params(type_, listed), headers=site_setup.DEVICE_A)
+    assert response.status_code == 403
+    assert response.json()["detail"] == "edge devices may not call this"
+    assert listed["sent"] == []
+
+
 def test_a_site_with_only_a_map_is_known(listed):
     # OTHER_SITE keeps a map; with rover-b forgotten nothing else names it.
     backend.registry.forget("rover-b")

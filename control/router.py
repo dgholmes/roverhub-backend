@@ -292,9 +292,11 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
         # checked here, so a move needs `configure` at both.
         if robot is not None and robot.site_id == parsed.site_id:
             raise HTTPException(status_code=409, detail=f"{robot_id} is already at site {parsed.site_id}")
+        # Rights first: a caller who may not configure the target hears the
+        # same 403 whether or not it exists, so site ids cannot be probed.
+        require_site_capability(http, parsed.site_id, command_capabilities("SET_SITE"))
         if site_known is not None and not site_known(parsed.site_id):
             raise HTTPException(status_code=404, detail=f"site {parsed.site_id} not found")
-        require_site_capability(http, parsed.site_id, command_capabilities("SET_SITE"))
 
     @router.post("/robots/{robot_id}/commands")
     def issue_command(robot_id: str, request: CommandRequest, http: Request):
