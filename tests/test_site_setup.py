@@ -224,7 +224,7 @@ def test_a_resurvey_names_a_map_at_the_robots_site(world):
     client = TestClient(backend.app)
     start = _params("START_SURVEY")
     assert _command(client, "START_SURVEY", start).status_code == 200  # a new map: no map_id
-    assert _command(client, "START_SURVEY", {**start, "map_id": world["here"], "floor_index": 2}).status_code == 200
+    assert _command(client, "START_SURVEY", {**start, "map_id": world["here"], "floor_index": 1}).status_code == 200
     assert _command(client, "START_SURVEY", {**start, "map_id": world["there"]}).status_code == 404
     assert _command(client, "START_SURVEY", {**start, "map_id": "map-nowhere"}).status_code == 404
 

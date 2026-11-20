@@ -87,6 +87,13 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
                     detail=(f"update the edge device: it runs schema {robot.schema_version or 'unknown'}, "
                             f"surveys and lidar calibration need {SURVEY_SCHEMA_VERSION}"))
         map_id = getattr(parsed, "map_id", None)
+        # A floor the map could never take is refused now, not by the SiteMap
+        # validator after the whole survey has been recorded and processed.
+        if command_type == "START_SURVEY" and map_id is None and parsed.floor_index != 0:
+            raise HTTPException(
+                status_code=422,
+                detail=(f"a new map starts at floor 0, not floor {parsed.floor_index}; "
+                        "give the floor a name instead of a number"))
         if map_id is None or map_lookup is None:
             return
         site_map = map_lookup(map_id)
@@ -95,6 +102,15 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
         # upload to it, and this caller's role here says nothing about there.
         if site_map is None or (robot_site is not None and site_map.site_id != robot_site):
             raise HTTPException(status_code=404, detail=f"map {map_id} not found at this robot's site")
+        # A re-survey redoes one of the map's floors or adds the next one up;
+        # floors run 0..n-1 with no gaps.
+        if command_type == "START_SURVEY" and parsed.floor_index > len(site_map.floors):
+            count = len(site_map.floors)
+            raise HTTPException(
+                status_code=422,
+                detail=(f"map {map_id} has {count} floor{'' if count == 1 else 's'}, so a survey of it "
+                        f"can be floors 0–{count}: one of them again, or the next one up. "
+                        f"Floor {parsed.floor_index} would leave a gap"))
         if command_type == "FIND_MOVING" and not any(f.index == parsed.floor_index for f in site_map.floors):
             raise HTTPException(status_code=404, detail=f"map {map_id} has no floor {parsed.floor_index}")
 

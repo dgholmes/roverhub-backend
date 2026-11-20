@@ -80,6 +80,8 @@ LEVEL_TRACK_DEG = 1.0
 TRACK_FRAMES = ("auto", "raw", "level")
 # StartSurveyParams.survey_id's bounds (shared/schemas/survey.py).
 MAX_SURVEY_ID_CHARS = 64
+# StartSurveyParams.floor_label's bound.
+MAX_FLOOR_LABEL_CHARS = 40
 WEB_CLOUD_POINTS = 200_000
 
 
@@ -99,6 +101,9 @@ class SurveyRequest:
     # holding it, through restores and versions (schema 0.0.23).
     survey_id: Optional[str] = None
     robot_id: Optional[str] = None
+    # The floor's name, e.g. "2F" (StartSurveyParams.floor_label, 0.0.29),
+    # stored as its label. None keeps the label a re-surveyed floor already has.
+    floor_label: Optional[str] = None
 
     def check(self) -> None:
         from .survey_math import SurveyError
@@ -118,6 +123,9 @@ class SurveyRequest:
         if self.survey_id is not None and not (
                 isinstance(self.survey_id, str) and 1 <= len(self.survey_id) <= MAX_SURVEY_ID_CHARS):
             raise SurveyError("survey_id must be 1 to %d characters" % MAX_SURVEY_ID_CHARS)
+        if self.floor_label is not None and not (
+                isinstance(self.floor_label, str) and len(self.floor_label) <= MAX_FLOOR_LABEL_CHARS):
+            raise SurveyError("floor_label must be at most %d characters" % MAX_FLOOR_LABEL_CHARS)
 
 
 def slug(text: str) -> str:
@@ -294,9 +302,13 @@ def process_survey(store: MapStore, request: SurveyRequest, cloud_path: Path, tr
     # The map's other floors come along unchanged (their own planning grids too).
     existing = store.get(request.map_id)
     created_at = _now()
+    if request.floor_label is not None:
+        floors[0]["label"] = request.floor_label
     if existing is not None:
         for other in existing.floors:
             if other.index == request.floor_index:
+                if request.floor_label is None and other.label is not None:
+                    floors[0]["label"] = other.label
                 continue
             source = store.root / request.map_id / ("floor%d" % other.index)
             target = bundle / ("floor%d" % other.index)

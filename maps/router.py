@@ -78,7 +78,11 @@ The survey pipeline, quality and versions (tracker 1-5-02, -04, -05, -06):
                                                    `survey_id` (1-64 chars: the console survey
                                                    that made it) and `robot_id` (a robot at
                                                    `site_id`; a device key's own robot always
-                                                   wins). Both go into the job's detail and
+                                                   wins), and `floor_label` (at most 40 chars,
+                                                   e.g. "2F": the floor's label; not sent, a
+                                                   re-surveyed floor keeps its own).
+                                                   `survey_id` and `robot_id` go into the
+                                                   job's detail and
                                                    the floor's survey.json ("survey": {...}),
                                                    null when not sent. The job
                                                    levels it, grids it, stores it as a draft
@@ -199,7 +203,8 @@ MEDIA_TYPES = {"grid": "image/x-portable-graymap", "preview": "image/png",
 # .pcd is 88 MB for 2.76 M points with normals; 1 GiB is a building ten times
 # that, and survey_math.MAX_POINTS refuses more points than the server holds.
 MAX_SURVEY_BYTES = 1024 * 1024 * 1024
-SURVEY_FIELDS = ("site_id", "name", "map_id", "floor", "resolution_m", "track_frame", "survey_id", "robot_id")
+SURVEY_FIELDS = ("site_id", "name", "map_id", "floor", "resolution_m", "track_frame", "survey_id", "robot_id",
+                 "floor_label")
 # File parts of a survey upload. `moved` / `moved_cloud` (optional) are the
 # "probably moved" layer, in the uploaded cloud's frame (maps/survey.py).
 SURVEY_FILES = ("cloud", "track", "moved", "moved_cloud")
@@ -738,7 +743,7 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
         name = fields.get("name", "").strip()
         survey_id = fields.get("survey_id")
         survey = SurveyRequest(
-            survey_id=survey_id,
+            survey_id=survey_id, floor_label=fields.get("floor_label", "").strip() or None,
             map_id=fields.get("map_id", "").strip() or "map-" + slug(name),
             site_id=fields.get("site_id", "").strip(), name=name,
             floor_index=number("floor", 0, int), resolution_m=number("resolution_m", 0.05, float),
