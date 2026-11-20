@@ -19,9 +19,10 @@ server). A background job (maps/jobs.py) runs `process_survey`:
      survey is refused with both numbers rather than guessed;
   4. build the floor's occupancy grid exactly as pcd_to_floorgrid.py does with
      its defaults (one floor, auto ground, default bands), from the points
-     within trim.TRIM_MARGIN_M of the walked track only, and no wider than the
-     track's bounds plus that margin (0.0.29: far stray returns stretched the
-     2026-11-20 survey's canvas to 58 m; maps/trim.py);
+     within trim.AUTO_TRIM_MARGIN_M (30 m) of the walked track only, and no
+     wider than the track's bounds plus that margin (0.0.29: stray returns
+     40-58 m out stretched the 2026-11-20 survey's canvas to 58 m, while a
+     mall atrium's walls 15-30 m out must stay; maps/trim.py);
   5. pack the floor as tools/map_prep/pack_map.py would, carry the map's other
      floors over unchanged, and store it with MapStore.save_bundle -- always a
      draft, the replaced bundle kept as a version, zones kept;
@@ -64,7 +65,7 @@ from .store import (
     ARTIFACT_FILES, BUNDLE_FILE, MAX_CLOUD_BYTES, MAX_FLOOR_LABEL_CHARS, MAX_MOVED_BYTES, BundleError, MapStore,
     _link_or_copy, count_cells, valid_map_id,
 )
-from .trim import TRIM_MARGIN_M, near_track, track_bounds
+from .trim import AUTO_TRIM_MARGIN_M, near_track, track_bounds
 
 # Under this the cloud is already level and is left alone: about the floor
 # fit's own precision, and 5 cm of height across a 30 m building.
@@ -246,20 +247,21 @@ def process_survey(store: MapStore, request: SurveyRequest, cloud_path: Path, tr
     del xyz
 
     progress("building the grid")
-    # Only what lies near the walked path makes the floor (maps/trim.py): a
-    # few far returns -- through a window, along a corridor only looked down
-    # -- stretched the 2026-11-20 15:08 survey's canvas to 58 m for an 11 m
-    # office. The robot's recording keeps them.
+    # Only what lies within AUTO_TRIM_MARGIN_M of the walked path makes the
+    # floor (maps/trim.py): a few returns 40-58 m out -- through a window,
+    # along a corridor only looked down -- stretched the 2026-11-20 15:08
+    # survey's canvas to 58 m for an 11 m office. 30 m keeps an atrium's far
+    # walls. The robot's recording keeps everything.
     track_xy = level["track"][:, 1:3]
-    near = near_track(level["cloud"][:, :2], track_xy, TRIM_MARGIN_M)
+    near = near_track(level["cloud"][:, :2], track_xy, AUTO_TRIM_MARGIN_M)
     beyond_margin = int(len(near) - int(near.sum()))
     if beyond_margin:
         level["cloud"] = level["cloud"][near]
     del near
     if not len(level["cloud"]):
-        raise sm.SurveyError("no part of the cloud lies within %.0f m of the walked track" % TRIM_MARGIN_M)
+        raise sm.SurveyError("no part of the cloud lies within %.0f m of the walked track" % AUTO_TRIM_MARGIN_M)
     grid = sm.floor_grid(level["cloud"], resolution=request.resolution_m,
-                         within=track_bounds(track_xy, TRIM_MARGIN_M))
+                         within=track_bounds(track_xy, AUTO_TRIM_MARGIN_M))
     image = grid["image"]
     rows, cols = image.shape
     free, occupied, unknown = count_cells(image.tobytes())
@@ -296,7 +298,7 @@ def process_survey(store: MapStore, request: SurveyRequest, cloud_path: Path, tr
                  "ceiling_z_m": grid["ceiling_z"], "obstacle_band_m": list(grid["obstacle_band"]),
                  "ground_band_m": list(grid["ground_band"]), "min_hits": grid["min_hits"],
                  "min_ground_hits": grid["min_ground_hits"],
-                 "trim_margin_m": TRIM_MARGIN_M, "points_beyond_margin": beyond_margin,
+                 "trim_margin_m": AUTO_TRIM_MARGIN_M, "points_beyond_margin": beyond_margin,
                  "method": "tools/map_prep/pcd_to_floorgrid.py defaults (observed ground, no ray casting)"},
         "cloud_sample_points": cloud_points,
         # Which console survey and robot made it; nulls for an upload by hand.

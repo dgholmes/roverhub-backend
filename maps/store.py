@@ -1054,9 +1054,11 @@ class MapStore:
         ValueError for a status that is not one, or for activating a map with no
         floors -- there would be nothing for a mission to plan on.
 
-        `zones_reviewed` with `active` records that someone looked at the
-        zones as they froze it -- possibly deciding none are needed (0.0.29):
-        now, and `zones_reviewed_by` (the signed-in user, from the router)."""
+        `zones_reviewed` records that the person freezing a map with NO zones
+        decided none are needed (0.0.29): now, and `zones_reviewed_by` (the
+        signed-in user, from the router). Stamped only on that move, draft ->
+        active with no zones: a re-sent `active` keeps the first answer, and a
+        map with zones has nothing to confirm."""
         if status not in get_args(MapStatus):
             raise ValueError("%r is not a map status" % (status,))
 
@@ -1064,7 +1066,7 @@ class MapStore:
             if status == "active" and not current.floors:
                 raise ValueError("a map with no floors cannot be activated")
             fields: dict = {"status": status}
-            if zones_reviewed and status == "active":
+            if zones_reviewed and status == "active" and current.status != "active" and not current.zones:
                 fields.update(zones_reviewed_at=_now(), zones_reviewed_by=zones_reviewed_by)
             return fields
 

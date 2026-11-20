@@ -1,9 +1,10 @@
 """Map ready checklist (schema 0.0.29), the backend's part of spec §4.5, §4.8
 and §4.9:
 
-- a new floor's extent comes from the points near the walked track, so a few
-  far stray returns no longer stretch the canvas (the 2026-11-20 15:08 survey's
-  was 58 m wide for an 11 m office);
+- a new floor's extent comes from the points within AUTO_TRIM_MARGIN_M (30 m)
+  of the walked track, so far stray returns (40-58 m out on the 2026-11-20
+  15:08 survey, whose canvas was 58 m wide for an 11 m office) no longer
+  stretch the canvas, while a mall atrium's walls 15-30 m out are kept;
 - POST /maps/{id}/floors/{n}/trim re-crops a stored floor to the walked area
   plus TRIM_MARGIN_M, as a new draft version, and refuses to cut a zone;
 - PATCH /maps/{id} renames the map and its floors' labels, outside the
@@ -27,7 +28,7 @@ from maps import survey_math as sm  # noqa: E402
 from maps.router import build_maps_router  # noqa: E402
 from maps.store import MapStore  # noqa: E402
 from maps.survey import SurveyRequest, process_survey  # noqa: E402
-from maps.trim import TRIM_MARGIN_M, trim_floor  # noqa: E402
+from maps.trim import AUTO_TRIM_MARGIN_M, TRIM_MARGIN_M, trim_floor  # noqa: E402
 from shared.schemas.maps import MapZone  # noqa: E402
 from tests.test_maps_pipeline import _pitch, room_cloud, room_track, track_bytes, write_pcd  # noqa: E402
 from tests.test_site_setup import _app_as  # noqa: E402
@@ -40,14 +41,18 @@ SUPERVISOR = Principal(kind="user", id="sue")
 # --- §4.5 automatic: a new floor ignores far strays ---------------------------
 
 
-def test_trim_margin_is_ten_metres():
+def test_the_trim_button_takes_ten_metres_and_a_new_survey_thirty():
+    # Thirty at survey time: Mid-360 returns useful for localisation reach
+    # about 30 m, and a shopping-mall atrium's walls stand 15-30 m from the
+    # walked path. Ten for the Trim button, which a person presses.
     assert TRIM_MARGIN_M == 10.0
+    assert AUTO_TRIM_MARGIN_M == 30.0
 
 
 def _far_patch(x=50.0, points=2000, seed=3):
-    """Returns 40 m past the room's far wall (x = 10): through a window, off a
-    car park. Dense enough to survive the converter's 0.1 % sparse-cell drop,
-    which 50 lone points would not."""
+    """Returns 40 m past the room's far wall (x = 10), over 41 m from the
+    track: through a window, off a car park. Dense enough to survive the
+    converter's 0.1 % sparse-cell drop, which 50 lone points would not."""
     rng = np.random.default_rng(seed)
     xyz = np.column_stack([rng.uniform(x - 0.5, x + 0.5, points), rng.uniform(3.0, 4.0, points),
                            rng.uniform(-0.5, 2.0, points)])
@@ -64,14 +69,38 @@ def test_far_outliers_do_not_stretch_a_new_floor(tmp_path):
     site_map = store.get("map-room")
     floor = site_map.floors[0]
     track = sm.read_track_csv(store.artifact_path("map-room", 0, "track").read_bytes())
-    lo = track[:, 1:3].min(axis=0) - TRIM_MARGIN_M - floor.resolution_m
-    hi = track[:, 1:3].max(axis=0) + TRIM_MARGIN_M + floor.resolution_m
+    lo = track[:, 1:3].min(axis=0) - AUTO_TRIM_MARGIN_M - floor.resolution_m
+    hi = track[:, 1:3].max(axis=0) + AUTO_TRIM_MARGIN_M + floor.resolution_m
     assert site_map.extent_min[0] >= lo[0] and site_map.extent_min[1] >= lo[1], site_map.extent_min
     assert site_map.extent_max[0] <= hi[0] and site_map.extent_max[1] <= hi[1], site_map.extent_max
     # The room itself (0..10 x 0..8) is all there.
     assert site_map.extent_min[0] <= 0.0 and site_map.extent_max[0] >= 10.0
     survey = json.loads(store.artifact_path("map-room", 0, "survey").read_text())
-    assert survey["grid"]["trim_margin_m"] == TRIM_MARGIN_M
+    assert survey["grid"]["trim_margin_m"] == AUTO_TRIM_MARGIN_M
+    assert survey["grid"]["points_beyond_margin"] >= 2000
+
+
+def test_far_walls_of_a_wide_space_are_kept(tmp_path):
+    # A 32 m hall walked only in its west end: the east wall (x = 32) stands
+    # over 23 m from the track -- past the Trim button's 10 m, inside 30.
+    store = MapStore(tmp_path / "maps")
+    cloud = write_pcd(tmp_path / "hall.pcd", room_cloud(width=32.0))
+    work = tmp_path / "work"
+    work.mkdir()
+    process_survey(store, SurveyRequest(map_id="map-hall", site_id=SITE, name="Hall"), cloud,
+                   track_bytes(room_track()), work)
+    site_map = store.get("map-hall")
+    floor = site_map.floors[0]
+    track = sm.read_track_csv(store.artifact_path("map-hall", 0, "track").read_bytes())
+    assert 32.0 - track[:, 1].max() > 20.0
+    assert site_map.extent_max[0] >= 32.0, site_map.extent_max
+    _, _, pixels = _pgm(store.artifact_path("map-hall", 0, "grid").read_bytes())
+    width, height = floor.size_cells
+    image = np.frombuffer(pixels, dtype=np.uint8).reshape(height, width)
+    col = int(round((32.0 - floor.origin_xy_m[0]) / floor.resolution_m))
+    assert (image[:, max(0, col - 2):col + 3] == 0).sum() > 50  # the east wall is drawn
+    survey = json.loads(store.artifact_path("map-hall", 0, "survey").read_text())
+    assert survey["grid"]["points_beyond_margin"] == 0
 
 
 # --- §4.5 the Trim button ------------------------------------------------------
@@ -317,6 +346,38 @@ def test_activate_with_no_zones_needs_zones_reviewed(tmp_path):
     router.store.save_zones("map-room", [MapZone(zone_id="z", map_id="map-room", kind="no_go", label="Glass",
                                                  polygon=[(1, 1), (2, 1), (2, 2)])])
     assert client.put("/maps/map-room/status", json={"status": "active"}).status_code == 200
+
+
+def test_a_resent_activate_does_not_restamp_the_zones_review(maps):
+    router, _ = maps
+    store = router.store
+    first = store.set_status(MAP, "active", zones_reviewed=True, zones_reviewed_by="sue")
+    assert first.zones_reviewed_by == "sue" and first.zones_reviewed_at is not None
+    again = store.set_status(MAP, "active", zones_reviewed=True, zones_reviewed_by="sam")
+    assert (again.zones_reviewed_at, again.zones_reviewed_by) == (first.zones_reviewed_at, "sue")
+    assert store.get(MAP).zones_reviewed_by == "sue"
+
+
+def test_activating_a_map_that_has_zones_does_not_stamp_a_review(maps):
+    router, _ = maps
+    store = router.store
+    store.save_zones(MAP, [_zone("z-in", "Stairwell", [(1, 1), (2, 1), (2, 2)])])
+    frozen = store.set_status(MAP, "active", zones_reviewed=True, zones_reviewed_by="sue")
+    assert frozen.status == "active"
+    assert frozen.zones_reviewed_at is None and frozen.zones_reviewed_by is None
+
+
+def test_rename_is_audited_with_the_caller(tmp_path):
+    from tests.test_site_setup import Audit
+
+    audit = Audit()
+    router = build_maps_router(str(tmp_path / "maps"), audit=audit, jobs_dir=str(tmp_path / "jobs"),
+                               start_jobs=False)
+    router.store.save_bundle(_stretched_bundle(tmp_path / "bundle"))
+    client = _app_as(router, Principal(kind="device", id="rover-a", device_site=SITE))
+    assert client.patch("/maps/%s" % MAP, json={"name": "Office 2"}).status_code == 200
+    (row,) = audit.of("map.rename")
+    assert row["detail"]["by_device"] == "rover-a" and row["robot_id"] == "rover-a"
 
 
 def test_the_new_routes_have_policy_rules_for_editzones():

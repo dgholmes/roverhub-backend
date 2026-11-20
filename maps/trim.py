@@ -12,11 +12,14 @@ five times the size they needed to be.
 Two halves:
 
 - automatic, for a NEW floor (maps/survey.py): only the points within
-  TRIM_MARGIN_M of the walked track (x, y) make the grid (`near_track`), and
-  its extent is held inside the track's bounding box plus the margin
-  (`track_bounds`). The robot's recording keeps the whole cloud.
+  AUTO_TRIM_MARGIN_M (30 m) of the walked track (x, y) make the grid
+  (`near_track`), and its extent is held inside the track's bounding box plus
+  that margin (`track_bounds`). Wide, because a survey must work on any site:
+  a mall atrium's real walls stand 15-30 m from the path, while the 15:08
+  strays sat 40-58 m out. The robot's recording keeps the whole cloud.
 - `trim_floor`, for a floor already stored (POST /maps/{id}/floors/{n}/trim):
-  the floor is cut down to the track's bounding box plus the margin, in whole
+  a person's decision, so the tighter TRIM_MARGIN_M (10 m): the floor is cut
+  down to the track's bounding box plus that margin, in whole
   cells of its own grid, as a NEW VERSION through MapStore.edit_floor -- the
   bundle it replaces is kept and restorable, the map drops to draft, and the
   router queues the quality check. Every per-floor file that has a place is
@@ -46,17 +49,23 @@ from .store import (
     ARTIFACT_FILES, MAX_CLOUD_BYTES, BundleError, MapNotFound, MapStore, count_cells, parse_pgm, planning_grid_for,
 )
 
-# How far past the walked track (x, y) a floor may reach. Ten metres is a
-# room's width beyond a doorway the robot stopped in -- what a survey can
-# see and a robot might later be sent to -- and a fifth of the 15:08 survey's
-# stray reach.
+# How far past the walked track (x, y) the Trim button leaves a floor. Ten
+# metres is a room's width beyond a doorway the robot stopped in -- what a
+# survey can see and a robot might later be sent to.
 TRIM_MARGIN_M = 10.0
+# The automatic cut at survey time (maps/survey.py) reaches three times as
+# far. A survey must work on any site: a shopping-mall atrium's walls stand
+# 15-30 m from the walked path, and Mid-360 returns are useful for
+# localisation out to about 30 m. The strays that stretched the 15:08 survey
+# sat 40-58 m out, so 30 m still drops them.
+AUTO_TRIM_MARGIN_M = 30.0
 # The near-track mask's cell. Coarse on purpose: it decides which returns are
 # near enough to keep, not where anything is drawn.
 NEAR_TRACK_CELL_M = 0.5
-# Track cells marked per numpy step, which bounds the scratch memory a long
-# survey's track takes (cells x offsets).
-_TRACK_CELLS_PER_CHUNK = 2000
+# Cells marked per numpy step (track cells x offsets), which bounds the
+# scratch memory: at 30 m and 0.5 m cells there are ~12,000 offsets, so a
+# step is a few hundred track cells, 32 MB of int64.
+_MARKS_PER_CHUNK = 4_000_000
 # Float slack when a bound is turned into whole cells: (-8 - -44) / 0.1 is
 # 359.99999999999994, which is cell 360.
 _EPS = 1e-6
@@ -116,8 +125,9 @@ def near_track(points_xy, track_xy, margin_m: float = TRIM_MARGIN_M,
     track_cells = np.unique(((track_xy[:, 1] - y0) / cell_m).astype(np.int64) * cols
                             + ((track_xy[:, 0] - x0) / cell_m).astype(np.int64))
     mask = np.zeros(rows * cols, dtype=bool)
-    for start in range(0, len(track_cells), _TRACK_CELLS_PER_CHUNK):
-        chunk = track_cells[start:start + _TRACK_CELLS_PER_CHUNK]
+    per_chunk = max(1, _MARKS_PER_CHUNK // len(offsets))
+    for start in range(0, len(track_cells), per_chunk):
+        chunk = track_cells[start:start + per_chunk]
         mask[(chunk[:, None] + offsets[None, :]).ravel()] = True
 
     keep = np.zeros(len(points_xy), dtype=bool)

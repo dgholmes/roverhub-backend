@@ -352,7 +352,7 @@ def floor_grid(xyz: "np.ndarray", resolution: float = 0.05, min_hits: int = 6,
 
     `within` (x_lo, y_lo, x_hi, y_hi) holds the grid inside a rectangle as
     well: maps/survey.py passes the walked track's bounds plus
-    trim.TRIM_MARGIN_M, so the extent is never more than that plus one cell."""
+    trim.AUTO_TRIM_MARGIN_M, so the extent is never more than that plus one cell."""
     bounds, _ = trim_bounds(xyz)
     if within is not None:
         bounds = (max(bounds[0], within[0]), max(bounds[1], within[1]),

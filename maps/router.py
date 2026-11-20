@@ -711,9 +711,11 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
     def put_status(map_id: str, body: _StatusBody, request: Request):
         _zones_gate(map_id, body)
         _quality_gate(map_id, body, request)
+        before = store.get(map_id)
         result = _curate(lambda: store.set_status(map_id, body.status, zones_reviewed=body.zones_reviewed,
                                                   zones_reviewed_by=_requested_by(request)))
-        if body.zones_reviewed and body.status == "active":
+        # Audited when the answer was stored (store.set_status says when).
+        if before is not None and result.zones_reviewed_at != before.zones_reviewed_at:
             _audit("map.zones.reviewed", result, map_id,
                    {"zones": len(result.zones), "reviewed_at": result.zones_reviewed_at})
         if on_status is not None:
@@ -753,7 +755,7 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
         return Response(saved.model_dump_json(), media_type="application/json", headers=headers)
 
     @router.patch("/maps/{map_id}")
-    def patch_map(map_id: str, body: _RenameBody):
+    def patch_map(map_id: str, body: _RenameBody, request: Request):
         labels = None if body.floors is None else {f.index: f.label for f in body.floors}
         try:
             saved = store.rename(map_id, name=body.name, labels=labels)
@@ -765,7 +767,8 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
             raise HTTPException(status_code=422, detail=str(exc)) from None
         _audit("map.rename", saved, map_id,
                {"name": saved.name if body.name is not None else None,
-                "floors": sorted(labels) if labels is not None else []})
+                "floors": sorted(labels) if labels is not None else []},
+               request=request)
         return saved
 
     # --- quality ------------------------------------------------------------
