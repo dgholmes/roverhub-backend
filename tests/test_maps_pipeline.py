@@ -487,7 +487,8 @@ def test_freezing_needs_a_current_passed_report_or_an_override(client, router, t
     response = _upload(client, tmp_path)
     assert response.status_code == 201
     job_id = response.headers["X-Quality-Job"]
-    freeze = {"status": "active"}
+    # No zones on this map: the freeze says none are needed (0.0.29, tests/test_map_ready_maps.py).
+    freeze = {"status": "active", "zones_reviewed": True}
 
     # Queued, not yet run: no report.
     refused = client.put("/maps/map-venue/status", json=freeze)
@@ -516,7 +517,7 @@ def test_freezing_needs_a_current_passed_report_or_an_override(client, router, t
 def test_a_passing_report_freezes_without_an_override(client, router, survey_files):
     _survey(client, survey_files)
     router.jobs.run_pending()
-    assert client.put("/maps/map-room/status", json={"status": "active"}).status_code == 200
+    assert client.put("/maps/map-room/status", json={"status": "active", "zones_reviewed": True}).status_code == 200
 
 
 def test_quality_jobs_for_one_map_are_not_queued_twice(client, router, tmp_path):
@@ -593,7 +594,7 @@ def test_only_a_supervisor_at_the_maps_site_may_override(auth_on, tmp_path):
                                                      "password": "correct horse 1"}).json()["access_token"]
             return {"Authorization": "Bearer " + token}
 
-        body = {"status": "active", "override_quality": True}
+        body = {"status": "active", "override_quality": True, "zones_reviewed": True}
         assert client.put("/maps/%s/status" % map_id, json=body, headers=bearer("eve")).status_code == 403
         assert client.put("/maps/%s/status" % map_id, json=body, headers=bearer("sam")).status_code == 403
         assert client.put("/maps/%s/status" % map_id, json=body, headers=bearer("sue")).status_code == 200

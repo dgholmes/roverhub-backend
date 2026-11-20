@@ -104,6 +104,13 @@ The survey pipeline, quality and versions (tracker 1-5-02, -04, -05, -06):
                                                 -> an archived version's file, as above
 - POST   /maps/{map_id}/versions/{v}/restore    -> SiteMap; version v becomes the live bundle
                                                    again (as a new version), zones kept, draft
+- POST   /maps/{map_id}/floors/{index}/trim     -> SiteMap; the floor cut to its walked track
+                                                   + trim.TRIM_MARGIN_M as a new version, draft;
+                                                   unchanged (no version) when already inside;
+                                                   409 for a zone it would cut or no track
+- PATCH  /maps/{map_id}                         -> SiteMap; {"name"?, "floors"?: [{"index",
+                                                   "label"}]}: names only, outside the content
+                                                   hash, so no new version and no drop to draft
 
 A quality job is also queued after every upload, restore, planning-grid
 change and map-editor save, so the console usually finds a fresh report waiting. PUT status
@@ -111,7 +118,10 @@ change and map-editor save, so the console usually finds a fresh report waiting.
 `quality_missing` / `quality_stale`) and passed (`quality_failed`, with
 `failed`); `{"status": "active", "override_quality": true, "reason": "..."}`
 freezes a failed one for a caller holding `override` at the map's site, and
-the audit log records who, why, and which checks failed.
+the audit log records who, why, and which checks failed. Before that, freezing
+a map with no zones is a 409 `zones_unreviewed` unless the body says
+`"zones_reviewed": true` (none are needed); the map then records when and by
+whom -- the signed-in user, never the body (0.0.29).
 
 POST takes the bundle tools/map_prep/pack_map.py writes as multipart form data,
 one file part per bundle file, **the part's field name being the file's path in
@@ -155,7 +165,7 @@ import shutil
 import tempfile
 from pathlib import Path
 import logging
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field, ValidationError
@@ -221,6 +231,21 @@ class _StatusBody(BaseModel):
     # map's site; `reason` goes to the audit log.
     override_quality: bool = False
     reason: Optional[str] = Field(default=None, max_length=500)
+    # 0.0.29: the person freezing a map with no zones says none are needed
+    # (the freeze dialog's "Activate anyway"). Without it that is a 409
+    # `zones_unreviewed`. Who said so is the signed-in user, never the body.
+    zones_reviewed: bool = False
+
+
+class _FloorLabel(BaseModel):
+    index: int
+    label: Optional[str] = None
+
+
+class _RenameBody(BaseModel):
+    """PATCH /maps/{id}: either or both. Bounds are the store's (MapStore.rename)."""
+    name: Optional[str] = None
+    floors: Optional[List[_FloorLabel]] = Field(default=None, max_length=1000)
 
 
 def _limit_for(name: str) -> int:
@@ -633,6 +658,23 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                {"zones": len(zones), "kinds": sorted({z.kind for z in zones})})
         return saved
 
+    def _zones_gate(map_id: str, body: _StatusBody) -> None:
+        """Freezing (draft -> active) a map with no zones needs the person to
+        say none are needed: the lidar cannot see stairs, drops or glass at
+        floor level, and a zone is the only thing that keeps a robot off them
+        (spec §4.8). Asked before the quality gate, so an override is never
+        audited for a freeze this refuses."""
+        current = store.get(map_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="map not found")
+        if body.status != "active" or current.status == "active" or not current.floors:
+            return
+        if not current.zones and not body.zones_reviewed:
+            raise HTTPException(status_code=409, detail={
+                "code": "zones_unreviewed",
+                "message": "no zones are drawn on this map. The lidar cannot see stairs, drops or glass at "
+                           "floor level; draw zones over them, or confirm none are needed (zones_reviewed)"})
+
     def _quality_gate(map_id: str, body: _StatusBody, request: Request) -> None:
         """Freezing (draft -> active) needs a current, passed quality report,
         or `override_quality` from a caller holding `override`. A map with no
@@ -667,14 +709,64 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
 
     @router.put("/maps/{map_id}/status")
     def put_status(map_id: str, body: _StatusBody, request: Request):
+        _zones_gate(map_id, body)
         _quality_gate(map_id, body, request)
-        result = _curate(lambda: store.set_status(map_id, body.status))
+        result = _curate(lambda: store.set_status(map_id, body.status, zones_reviewed=body.zones_reviewed,
+                                                  zones_reviewed_by=_requested_by(request)))
+        if body.zones_reviewed and body.status == "active":
+            _audit("map.zones.reviewed", result, map_id,
+                   {"zones": len(result.zones), "reviewed_at": result.zones_reviewed_at})
         if on_status is not None:
             try:
                 on_status(store.get(map_id))
             except Exception:
                 logger.exception("the map status observer failed for %s", map_id)
         return result
+
+    # --- the map ready checklist (0.0.29): trim and rename ------------------
+
+    @router.post("/maps/{map_id}/floors/{index}/trim")
+    def post_trim(map_id: str, index: int, request: Request):
+        from .trim import TRIM_MARGIN_M, TrimRefused, trim_floor
+
+        version = store.current_version(map_id) if store.get(map_id) is not None else None
+        try:
+            saved = trim_floor(store, map_id, index)
+        except (FloorNotFound, MapNotFound) as exc:
+            detail = str(exc) if isinstance(exc, FloorNotFound) else "map not found"
+            raise HTTPException(status_code=404, detail=detail) from None
+        except TrimRefused as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        except BundleError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        now = store.current_version(map_id)
+        headers = {"X-Map-Version": str(now)}
+        if now != version:
+            floor = next(f for f in saved.floors if f.index == index)
+            _audit("map.trim", saved, map_id,
+                   {"floor": index, "version": now, "margin_m": TRIM_MARGIN_M,
+                    "size_cells": list(floor.size_cells), "origin_xy_m": list(floor.origin_xy_m)},
+                   request=request)
+            job_id = _edited(saved, now, request)
+            if job_id:
+                headers["X-Quality-Job"] = job_id
+        return Response(saved.model_dump_json(), media_type="application/json", headers=headers)
+
+    @router.patch("/maps/{map_id}")
+    def patch_map(map_id: str, body: _RenameBody):
+        labels = None if body.floors is None else {f.index: f.label for f in body.floors}
+        try:
+            saved = store.rename(map_id, name=body.name, labels=labels)
+        except FloorNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        except MapNotFound:
+            raise HTTPException(status_code=404, detail="map not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        _audit("map.rename", saved, map_id,
+               {"name": saved.name if body.name is not None else None,
+                "floors": sorted(labels) if labels is not None else []})
+        return saved
 
     # --- quality ------------------------------------------------------------
 

@@ -342,13 +342,23 @@ def trim_bounds(xyz: "np.ndarray", cell_m: float = 1.0, drop_percent: float = 0.
 
 def floor_grid(xyz: "np.ndarray", resolution: float = 0.05, min_hits: int = 6,
                min_ground_hits: int = 2, ground_band: Tuple[float, float] = (-0.18, 0.18),
-               max_cells: int = 64_000_000) -> Dict:
+               max_cells: int = 64_000_000,
+               within: Optional[Tuple[float, float, float, float]] = None) -> Dict:
     """One floor's occupancy grid from a LEVEL cloud, as pcd_to_floorgrid.py
     main() makes it with its defaults (--floors auto, the default obstacle band,
     --min-hits 6, --min-ground-hits 2, --trim-drop 0.1). Returns the image
     (rows, cols) uint8 with row 0 at max y, its origin, the floor and ceiling
-    heights, the bands used, and the trimmed cloud of this floor."""
+    heights, the bands used, and the trimmed cloud of this floor.
+
+    `within` (x_lo, y_lo, x_hi, y_hi) holds the grid inside a rectangle as
+    well: maps/survey.py passes the walked track's bounds plus
+    trim.TRIM_MARGIN_M, so the extent is never more than that plus one cell."""
     bounds, _ = trim_bounds(xyz)
+    if within is not None:
+        bounds = (max(bounds[0], within[0]), max(bounds[1], within[1]),
+                  min(bounds[2], within[2]), min(bounds[3], within[3]))
+        if bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
+            raise SurveyError("no part of the cloud lies near the walked track")
     x_min, y_min, x_max, y_max = bounds
     xyz = xyz[(xyz[:, 0] >= x_min) & (xyz[:, 0] <= x_max)
               & (xyz[:, 1] >= y_min) & (xyz[:, 1] <= y_max)]

@@ -260,6 +260,13 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
                                                          device_own_site=True),
     ("POST", "/maps/{map_id}/floors/{index}/cloud-edits"): Rule(capabilities=("editZones", "configure")),
     ("PUT", "/maps/{map_id}/status"): Rule(capabilities=("editZones",)),
+    # The map ready checklist (0.0.29). Trimming a floor to the walked area is
+    # a map-editor save (a new version, back to draft) that decides where the
+    # floor ends, and naming the map and its floors is curating it: both the
+    # supervisor's, like zones. Who confirmed "no zones needed" when freezing
+    # is PUT status above (maps/router.py `_zones_gate`).
+    ("POST", "/maps/{map_id}/floors/{index}/trim"): Rule(capabilities=("editZones",)),
+    ("PATCH", "/maps/{map_id}"): Rule(capabilities=("editZones",)),
     ("DELETE", "/maps/{map_id}"): Rule(capabilities=("configure",)),
     # The survey pipeline (maps/survey.py, maps/jobs.py). A survey upload and a
     # version restore replace the map's bundle, as an upload does, so they are

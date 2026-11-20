@@ -262,7 +262,8 @@ def test_put_status_freezes_a_map(client, router):
     # takes a report and an override.
     job = client.post("/maps/map-venue/quality").json()
     assert router.jobs.wait(job["job_id"])["status"] == "succeeded"
-    response = client.put("/maps/map-venue/status", json={"status": "active", "override_quality": True})
+    response = client.put("/maps/map-venue/status", json={"status": "active", "override_quality": True,
+                                                          "zones_reviewed": True})
     assert response.status_code == 200
     assert response.json()["status"] == "active"
     assert router.store.get("map-venue").status == "active"

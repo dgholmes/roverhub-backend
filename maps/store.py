@@ -97,6 +97,11 @@ MAX_CLOUD_BYTES = 8 * 1024 * 1024
 # or make every map read slow.
 MAX_ZONES = 256
 MAX_VERTICES_PER_ZONE = 1000
+# A map's name and a floor's label as PATCH /maps/{id} takes them: the survey
+# form's own bounds (shared/schemas/survey.py StartSurveyParams.name and
+# .floor_label, 0.0.29).
+MAX_MAP_NAME_CHARS = 80
+MAX_FLOOR_LABEL_CHARS = 40
 
 BUNDLE_FILE = "site_map.json"
 MAP_FILE = "map.json"
@@ -288,6 +293,15 @@ def with_content_hashes(directory: Path, site_map: SiteMap,
     return site_map.model_copy(update={"floors": [
         f.model_copy(update={"content_hash": floor_content_hash(directory, site_map, f, log)})
         for f in site_map.floors]})
+
+
+def floors_extent(floors: List[MapFloor]) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """(extent_min, extent_max): the rectangle every floor's grid lies in."""
+    x_lo = min(f.origin_xy_m[0] for f in floors)
+    y_lo = min(f.origin_xy_m[1] for f in floors)
+    x_hi = max(f.origin_xy_m[0] + f.size_cells[0] * f.resolution_m for f in floors)
+    y_hi = max(f.origin_xy_m[1] + f.size_cells[1] * f.resolution_m for f in floors)
+    return (round(x_lo, 6), round(y_lo, 6)), (round(x_hi, 6), round(y_hi, 6))
 
 
 def check_moved_file(kind: str, data: bytes, where: str) -> None:
@@ -840,10 +854,13 @@ class MapStore:
                     _replace_file(floor_dir / ARTIFACT_FILES[kind], data)
 
                 updates = change(current, floor, floor_dir, write) or {}
-                edited = current.model_copy(update={
-                    "status": "draft", "updated_at": _now(),
-                    "floors": [f.model_copy(update=updates) if f.index == floor_index else f
-                               for f in current.floors]})
+                floors = [f.model_copy(update=updates) if f.index == floor_index else f for f in current.floors]
+                map_updates = {"status": "draft", "updated_at": _now(), "floors": floors}
+                if "origin_xy_m" in updates or "size_cells" in updates:
+                    # A floor moved or changed size (a trim, maps/trim.py):
+                    # the map's extent is its floors' again.
+                    map_updates["extent_min"], map_updates["extent_max"] = floors_extent(floors)
+                edited = current.model_copy(update=map_updates)
                 edited = with_content_hashes(scratch, edited)
                 (scratch / MAP_FILE).write_text(edited.model_dump_json(indent=2), encoding="utf-8")
                 number = self._carry_versions(directory, scratch)
@@ -1031,17 +1048,60 @@ class MapStore:
                 raise ValueError("zone %r has a vertex that is not a finite number" % (z.zone_id,))
         return self._update(map_id, lambda current: {"zones": zones})
 
-    def set_status(self, map_id: str, status: MapStatus) -> SiteMap:
+    def set_status(self, map_id: str, status: MapStatus, zones_reviewed: bool = False,
+                   zones_reviewed_by: Optional[str] = None) -> SiteMap:
         """Set a map's status. Raises MapNotFound for an unknown map and
         ValueError for a status that is not one, or for activating a map with no
-        floors -- there would be nothing for a mission to plan on."""
+        floors -- there would be nothing for a mission to plan on.
+
+        `zones_reviewed` with `active` records that someone looked at the
+        zones as they froze it -- possibly deciding none are needed (0.0.29):
+        now, and `zones_reviewed_by` (the signed-in user, from the router)."""
         if status not in get_args(MapStatus):
             raise ValueError("%r is not a map status" % (status,))
 
         def change(current: SiteMap) -> dict:
             if status == "active" and not current.floors:
                 raise ValueError("a map with no floors cannot be activated")
-            return {"status": status}
+            fields: dict = {"status": status}
+            if zones_reviewed and status == "active":
+                fields.update(zones_reviewed_at=_now(), zones_reviewed_by=zones_reviewed_by)
+            return fields
+
+        return self._update(map_id, change)
+
+    def rename(self, map_id: str, name: Optional[str] = None,
+               labels: Optional[Dict[int, Optional[str]]] = None) -> SiteMap:
+        """Rename the map and/or set floor labels ({index: label or None}).
+        Not a new version and not a drop to draft: names and labels are outside
+        the content hash (shared/schemas/map_hash.py), so no robot's copy goes
+        out of date. Raises MapNotFound, FloorNotFound for a floor the map does
+        not have, ValueError for a blank name or a label over
+        MAX_FLOOR_LABEL_CHARS."""
+        if name is not None:
+            name = name.strip()
+            if not name:
+                raise ValueError("a map needs a name")
+            if len(name) > MAX_MAP_NAME_CHARS:
+                raise ValueError("a map name is at most %d characters" % MAX_MAP_NAME_CHARS)
+        cleaned: Dict[int, Optional[str]] = {}
+        for index, label in (labels or {}).items():
+            label = label.strip() if isinstance(label, str) else None
+            if label and len(label) > MAX_FLOOR_LABEL_CHARS:
+                raise ValueError("a floor label is at most %d characters" % MAX_FLOOR_LABEL_CHARS)
+            cleaned[index] = label or None
+
+        def change(current: SiteMap) -> dict:
+            have = {f.index for f in current.floors}
+            for index in cleaned:
+                if index not in have:
+                    raise FloorNotFound("map %s has no floor %d" % (map_id, index))
+            fields: dict = {"updated_at": _now(), "floors": [
+                f.model_copy(update={"label": cleaned[f.index]}) if f.index in cleaned else f
+                for f in current.floors]}
+            if name is not None:
+                fields["name"] = name
+            return fields
 
         return self._update(map_id, change)
 
