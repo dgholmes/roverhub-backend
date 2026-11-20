@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Literal, Optional
 
@@ -105,6 +105,14 @@ class RobotRecord:
     # off, from an older bridge, or when the device could not hash its files.
     # Compared with the floor's MapFloor.content_hash before a route starts.
     nav_map_hash: Optional[str] = None
+    # From the registration (schema 0.0.29): the survey recordings still on
+    # the device, newest first, as validated KeptRecording dicts; free disk
+    # where they are kept, in GB; whether the nav stack is localised now.
+    # Empty / None from an older bridge -- which says nothing about its disk
+    # or its localisation.
+    recordings: List[dict] = field(default_factory=list)
+    disk_free_gb: Optional[float] = None
+    nav_localised: Optional[bool] = None
 
 
 class RobotRegistry:
@@ -156,8 +164,12 @@ class RobotRegistry:
         host: Optional[dict] = None,
         nav_map_id: Optional[str] = None,
         nav_map_hash: Optional[str] = None,
+        recordings: Optional[List[dict]] = None,
+        disk_free_gb: Optional[float] = None,
+        nav_localised: Optional[bool] = None,
     ) -> None:
         now = self._clock()
+        recordings = list(recordings or [])
         with self._lock:
             existing = self._robots.get(robot_id)
             if existing is None:
@@ -167,6 +179,7 @@ class RobotRegistry:
                     name=robot_id, last_seen=now, online=True,
                     bridge_id=bridge_id, schema_version=schema_version,
                     first_seen=now, host=host, nav_map_id=nav_map_id, nav_map_hash=nav_map_hash,
+                    recordings=recordings, disk_free_gb=disk_free_gb, nav_localised=nav_localised,
                     acceptance=acceptance, acceptance_source=source,
                     acceptance_changed_at=now,
                 )
@@ -185,6 +198,10 @@ class RobotRegistry:
             # nav is off (or older than 0.0.16), which is on no map.
             existing.nav_map_id = nav_map_id
             existing.nav_map_hash = nav_map_hash
+            # Replaced too: the registration carries the whole list each time.
+            existing.recordings = recordings
+            existing.disk_free_gb = disk_free_gb
+            existing.nav_localised = nav_localised
 
     def mark_seen(self, robot_id: str) -> None:
         with self._lock:

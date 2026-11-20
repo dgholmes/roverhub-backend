@@ -45,6 +45,11 @@ def robot_json(record: RobotRecord) -> dict:
         "nav_goal": record.nav_goal,
         "nav_map_id": record.nav_map_id,
         "nav_map_hash": record.nav_map_hash,
+        # 0.0.29: the recordings on the device, its free disk, and whether its
+        # nav stack is localised (the map ready checklist).
+        "recordings": record.recordings,
+        "disk_free_gb": record.disk_free_gb,
+        "nav_localised": record.nav_localised,
     }
 
 

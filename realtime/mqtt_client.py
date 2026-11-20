@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import logging
+import math
 import threading
 import time
 from datetime import datetime, timezone
@@ -10,7 +11,9 @@ from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 from pydantic import ValidationError
 
-from shared.schemas.bridge_status import EdgeHostInfo, EdgeHostMetrics, NavGoalStatus
+from shared.schemas.bridge_status import (
+    MAX_KEPT_RECORDINGS, EdgeHostInfo, EdgeHostMetrics, KeptRecording, NavGoalStatus,
+)
 from shared.schemas.map_hash import is_map_hash
 from shared.schemas.version import SCHEMA_VERSION
 
@@ -502,7 +505,34 @@ class BackendMqttClient:
             nav_map_id=data.get("nav_map_id") if isinstance(data.get("nav_map_id"), str) else None,
             # 0.0.20. Anything but a well-formed hash reads as "not reported".
             nav_map_hash=data.get("nav_map_hash") if is_map_hash(data.get("nav_map_hash")) else None,
+            # 0.0.29. Display data like `host`: a bad item is dropped, never
+            # the registration.
+            recordings=self._recordings(data.get("recordings"), robot_id),
+            disk_free_gb=self._disk_free_gb(data.get("disk_free_gb")),
+            nav_localised=data.get("nav_localised") if isinstance(data.get("nav_localised"), bool) else None,
         )
+
+    def _recordings(self, value, robot_id: str) -> list:
+        """BridgeRegistration.recordings, each item validated as a
+        KeptRecording; an invalid one is logged and dropped, the rest kept,
+        and at most MAX_KEPT_RECORDINGS."""
+        if not isinstance(value, list):
+            if value is not None:
+                logger.warning("ignoring recordings from robot %s: not a list", robot_id)
+            return []
+        kept = []
+        for item in value:
+            parsed = self._validated(KeptRecording, item, robot_id, "recording")
+            if parsed is not None:
+                kept.append(parsed)
+        return kept[:MAX_KEPT_RECORDINGS]
+
+    @staticmethod
+    def _disk_free_gb(value) -> Optional[float]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        return value if math.isfinite(value) and value >= 0 else None
 
     @staticmethod
     def _validated(model, value, robot_id: str, label: str) -> Optional[dict]:

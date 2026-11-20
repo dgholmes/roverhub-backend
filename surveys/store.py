@@ -141,13 +141,19 @@ class SurveyStore:
             if robot_id and record.robot_id != robot_id:
                 continue
             takes = self.takes(name)
-            original = next((t for t in takes if t.take_id == ORIGINAL_TAKE), None)
+            # The take the map was made from is the one judged (0.0.29): the
+            # rebuild's when the device rebuilt the survey and that take is
+            # here, else the original.
+            by_id = {t.take_id: t for t in takes}
+            judged = by_id.get(record.map_take_id) if record.map_take_id else None
+            if judged is None:
+                judged = by_id.get(ORIGINAL_TAKE)
             out.append(SurveySummary(
                 **record.model_dump(),
                 take_count=len(takes),
-                first_bad_s=original.first_bad_s if original is not None else None,
-                has_legs=original.has_legs if original is not None else False,
-                legs_m=original.legs_m if original is not None else None,
+                first_bad_s=judged.first_bad_s if judged is not None else None,
+                has_legs=judged.has_legs if judged is not None else False,
+                legs_m=judged.legs_m if judged is not None else None,
             ))
         out.sort(key=lambda s: (s.started_at, s.survey_id), reverse=True)
         return out

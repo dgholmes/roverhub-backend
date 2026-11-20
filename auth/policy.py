@@ -100,6 +100,19 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     # followed by every walk and mission there: the engineer's, like the
     # lidar's mount.
     "SET_NAV_STUCK_POLICY": ("configure",),
+    # The map ready checklist (schema 0.0.29). Processing a survey again ends
+    # in a draft map, as START_SURVEY does; keeping or deleting a recording and
+    # skipping the moving-object search are the survey's; loading a map onto a
+    # robot on another map (or none) is SYNC_MAP's sibling; moving a robot to
+    # another site re-points everything it publishes. All robot configuration,
+    # the engineer's. SET_SITE needs `configure` at the site it moves to as
+    # well (control/router.py `_check_set_site`).
+    "REPROCESS_SURVEY": ("configure",),
+    "SET_SURVEY_KEEP": ("configure",),
+    "DELETE_SURVEY_RECORDING": ("configure",),
+    "SKIP_MOVING_SEARCH": ("configure",),
+    "USE_NAV_MAP": ("configure",),
+    "SET_SITE": ("configure",),
 }
 
 

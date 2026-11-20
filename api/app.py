@@ -192,10 +192,23 @@ app.include_router(build_auth_router(auth, on_login=history.audit.login, audit=h
 # The broker's checks. A device's writes are pinned to the site its robot
 # registered at (auth/mqtt_hooks.py).
 app.include_router(build_mqtt_hooks_router(auth, site_of=lambda robot_id: _site_for(robot_id)))
+def _site_known(site_id: str) -> bool:
+    """Whether a SET_SITE names a site this backend knows. There is no site
+    store (OD-8): a site exists here once a robot registers at it, a map is
+    kept for it, or someone has a role there (a '*' role names no site)."""
+    if any(r.site_id == site_id for r in registry.list_all()):
+        return True
+    if any(site_id in u.site_roles for u in auth.users.list()):
+        return True
+    # Last: reading every map is the slow one.
+    return any(m.site_id == site_id for m in maps_router.store.list())
+
+
 # A survey or FIND_MOVING command names a map, checked against the robot's
 # site before it is sent (the map store is built further down; late-bound).
 app.include_router(build_router(command_store, mqtt_client, registry=registry,
-                                map_lookup=lambda map_id: maps_router.store.get(map_id)))
+                                map_lookup=lambda map_id: maps_router.store.get(map_id),
+                                site_known=_site_known))
 # POST /robots/{id}/logs/request asks a robot for its journal; the answer goes
 # robot -> browser through the broker (shared/schemas/logs.py). Late-bound,
 # like the command routes' publish, so a test can stand in for the broker.
