@@ -65,9 +65,13 @@ from .store import (
 # Under this the cloud is already level and is left alone: about the floor
 # fit's own precision, and 5 cm of height across a 30 m building.
 LEVEL_BELOW_DEG = 0.1
-# A mount pitch is a few degrees. A floor plane steeper than this is a ramp,
-# a wall, or a fit gone wrong -- not something to rotate away.
-MAX_LEVEL_DEG = 15.0
+# The raw cloud is tilted by the lidar's mount (FAST-LIO2's frame is the IMU's
+# at start). The schema allows a mount pitch up to 45 deg (shared
+# sensors.LidarMount); rover-jetson's has been 19.8 deg since its 2026-11-18
+# remount, and the old 15 deg cap refused every survey after it. A floor
+# plane steeper than a mount can be is a ramp, a wall, or a fit gone wrong
+# (11-18's runaway survey fitted 70 deg) -- not something to rotate away.
+MAX_LEVEL_DEG = 45.0
 # The track's plane and the cloud's floor plane agree within this when the
 # track is in the cloud's (raw) frame.
 TRACK_AGREES_DEG = 1.0
@@ -147,8 +151,9 @@ def level_survey(xyz, track, track_frame: str = "auto") -> Dict:
                              "and the track cannot stand in for it")
     rotation, angle = sm.levelling_rotation(a, b)
     if angle > MAX_LEVEL_DEG:
-        raise sm.SurveyError("the floor is tilted %.1f deg; a lidar mount pitch is a few degrees, so "
-                             "this is a ramp, a wall or a bad fit, and it is not rotated away" % angle)
+        raise sm.SurveyError("the floor is tilted %.1f deg, more than a lidar mount can be (%.0f deg), so "
+                             "this is a ramp, a wall or a bad fit, and it is not rotated away"
+                             % (angle, MAX_LEVEL_DEG))
     rotate = angle >= LEVEL_BELOW_DEG
 
     decided = track_frame
