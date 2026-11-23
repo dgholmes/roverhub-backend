@@ -330,16 +330,19 @@ def test_a_reupload_keeps_the_old_bundle_and_restore_brings_it_back(tmp_path):
     store.save_bundle(make_bundle(tmp_path / "b1", name="First"))
     store.save_zones("map-venue", [MapZone(zone_id="z1", map_id="map-venue", kind="no_go", label="x",
                                            polygon=[(0, 0), (1, 0), (1, 1)])])
-    store.save_bundle(make_bundle(tmp_path / "b2", name="Second"))
+    # Two floors this time. Its name is the bundle's, but the map's stays: a
+    # map is renamed by PATCH /maps/{id}, never by its next survey.
+    store.save_bundle(make_bundle(tmp_path / "b2", name="Second", floors=2))
     versions = store.list_versions("map-venue")
-    assert [(v["version"], v["current"], v["name"]) for v in versions] == [(2, True, "Second"), (1, False, "First")]
+    assert [(v["version"], v["current"], v["name"]) for v in versions] == [(2, True, "First"), (1, False, "First")]
     assert store.version_artifact_path("map-venue", 1, 0, "grid") is not None
+    assert len(store.get("map-venue").floors) == 2
 
     store.set_status("map-venue", "active")
     restored = store.restore_version("map-venue", 1)
-    assert restored.name == "First" and restored.status == "draft"
+    assert len(restored.floors) == 1 and restored.status == "draft"  # version 1's floors
     assert [z.zone_id for z in restored.zones] == ["z1"]  # the zones carry over
-    assert store.get("map-venue").name == "First"
+    assert store.get("map-venue").name == "First" and len(store.get("map-venue").floors) == 1
     entries = store.list_versions("map-venue")
     assert [(v["version"], v["source"], v["restored_from"]) for v in entries] == [
         (3, "restore", 1), (2, "upload", None), (1, "upload", None)]

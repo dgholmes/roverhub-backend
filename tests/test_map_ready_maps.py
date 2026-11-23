@@ -263,11 +263,61 @@ def test_trim_refuses_a_floor_with_no_track_and_an_unknown_floor(maps):
 
 def test_trimming_a_floor_already_inside_the_margin_changes_nothing(maps):
     router, _ = maps
-    trim_floor(router.store, MAP, 0)
+    _, made = trim_floor(router.store, MAP, 0)
     version = router.store.current_version(MAP)
-    again = trim_floor(router.store, MAP, 0)
+    assert made == version  # the version the trim made, read under the store's lock
+    again, unchanged = trim_floor(router.store, MAP, 0)
+    assert unchanged is None  # no new version
     assert router.store.current_version(MAP) == version
     assert again.floors[0].size_cells == (240, 120)
+
+
+def test_the_trim_audit_names_the_version_the_trim_made(tmp_path):
+    # Not a second read of the live version outside the store's lock, which
+    # another edit landing in between would make wrong.
+    from tests.test_site_setup import Audit
+
+    audit = Audit()
+    router = build_maps_router(str(tmp_path / "maps"), audit=audit, jobs_dir=str(tmp_path / "jobs"),
+                               start_jobs=False)
+    store = router.store
+    store.save_bundle(_stretched_bundle(tmp_path / "bundle"))
+    made = store.current_version(MAP) + 1
+    store.current_version = lambda map_id: 99  # another edit, as far as any later read can tell
+    response = _app_as(router, SUPERVISOR).post("/maps/%s/floors/0/trim" % MAP)
+    assert response.status_code == 200, response.text
+    assert response.headers["X-Map-Version"] == str(made)
+    (row,) = audit.of("map.trim")
+    assert row["detail"]["version"] == made
+
+
+def test_trim_drops_a_planning_grid_whose_file_is_missing(maps):
+    # Its cell counts are the old size's: kept, they would no longer fill the
+    # trimmed floor and map.json would not validate.
+    router, client = maps
+    store = router.store
+    os.remove(store.artifact_path(MAP, 0, "planning"))
+    response = client.post("/maps/%s/floors/0/trim" % MAP)
+    assert response.status_code == 200, response.text
+    assert response.json()["floors"][0]["planning"] is None
+    stored = store.get(MAP)
+    assert stored is not None and stored.floors[0].planning is None
+    assert stored.floors[0].size_cells == (240, 120)
+
+
+def test_an_edit_that_would_not_validate_is_never_written(maps):
+    from maps.store import BundleError
+
+    router, _ = maps
+    store = router.store
+    version = store.current_version(MAP)
+    before = store.get(MAP)
+    with pytest.raises(BundleError):
+        # A new size with the old planning grid's counts: they no longer fill it.
+        store.edit_floor(MAP, 0, lambda current, floor, floor_dir, write: {"size_cells": (10, 10)},
+                         source="test")
+    assert store.current_version(MAP) == version
+    assert store.get(MAP) == before
 
 
 def _pgm(data):
@@ -311,6 +361,59 @@ def test_rename_refuses_a_blank_name_a_long_label_and_a_missing_floor(maps, body
     assert words in json.dumps(response.json()["detail"])
     assert router.store.get(MAP).name == "Office"
     assert client.patch("/maps/map-nope", json={"name": "x"}).status_code == 404
+
+
+def test_a_reupload_does_not_undo_a_rename(maps, tmp_path):
+    # Process again / Rebuild / a re-survey upload a bundle that carries the
+    # survey's own name and floor label; the map's, as renamed, stay.
+    router, client = maps
+    store = router.store
+    renamed = client.patch("/maps/%s" % MAP, json={"name": "Office, level 1",
+                                                   "floors": [{"index": 0, "label": "G"}]})
+    assert renamed.status_code == 200, renamed.text
+    saved = store.save_bundle(_stretched_bundle(tmp_path / "again"))  # says "Office", "1F"
+    assert saved.name == "Office, level 1" and saved.floors[0].label == "G"
+    assert store.get(MAP).name == "Office, level 1" and store.get(MAP).floors[0].label == "G"
+
+    # A label cleared by PATCH stays cleared.
+    assert client.patch("/maps/%s" % MAP, json={"floors": [{"index": 0, "label": ""}]}).status_code == 200
+    store.save_bundle(_stretched_bundle(tmp_path / "third"))
+    assert store.get(MAP).floors[0].label is None and store.get(MAP).name == "Office, level 1"
+
+
+def test_a_restore_does_not_undo_a_rename(maps, tmp_path):
+    router, client = maps
+    store = router.store
+    old = store.current_version(MAP)  # "Office", "1F"
+    store.save_bundle(_stretched_bundle(tmp_path / "again"))
+    assert client.patch("/maps/%s" % MAP, json={"name": "Office, level 1",
+                                                "floors": [{"index": 0, "label": "G"}]}).status_code == 200
+    restored = store.restore_version(MAP, old)
+    assert restored.name == "Office, level 1" and restored.floors[0].label == "G"
+    assert store.get(MAP).name == "Office, level 1" and store.get(MAP).floors[0].label == "G"
+
+
+def test_a_restore_keeps_the_current_zones_review_not_the_archived_one(maps, tmp_path):
+    # Row 6 must not turn green from an old version's review.
+    router, _ = maps
+    store = router.store
+    old = store.current_version(MAP)
+    store.set_status(MAP, "active", zones_reviewed=True, zones_reviewed_by="sue")
+    assert store.get(MAP).zones_reviewed_at is not None
+    store.save_bundle(_stretched_bundle(tmp_path / "again"))  # a new survey: not reviewed
+    unreviewed = store.current_version(MAP)
+    assert store.get(MAP).zones_reviewed_at is None
+    restored = store.restore_version(MAP, old)  # its map.json carries sue's review
+    assert restored.zones_reviewed_at is None and restored.zones_reviewed_by is None
+    assert store.get(MAP).zones_reviewed_at is None
+
+    # The current map's review stays through a restore of a version without one.
+    store.set_status(MAP, "active", zones_reviewed=True, zones_reviewed_by="sam")
+    reviewed = store.get(MAP)
+    restored = store.restore_version(MAP, unreviewed)
+    assert restored.zones_reviewed_at == reviewed.zones_reviewed_at
+    assert restored.zones_reviewed_by == "sam"
+    assert store.get(MAP).zones_reviewed_by == "sam"
 
 
 # --- §4.8 activate asks about zones --------------------------------------------

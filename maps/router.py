@@ -731,9 +731,12 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
     def post_trim(map_id: str, index: int, request: Request):
         from .trim import TRIM_MARGIN_M, TrimRefused, trim_floor
 
-        version = store.current_version(map_id) if store.get(map_id) is not None else None
         try:
-            saved = trim_floor(store, map_id, index)
+            # `made`: the version the trim stored, read under the store's lock
+            # (None: nothing to trim). A read here instead would name whatever
+            # version another edit landing in between made.
+            saved, made = trim_floor(store, map_id, index)
+            shown = made if made is not None else store.current_version(map_id)
         except (FloorNotFound, MapNotFound) as exc:
             detail = str(exc) if isinstance(exc, FloorNotFound) else "map not found"
             raise HTTPException(status_code=404, detail=detail) from None
@@ -741,15 +744,14 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
             raise HTTPException(status_code=409, detail=str(exc)) from None
         except BundleError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
-        now = store.current_version(map_id)
-        headers = {"X-Map-Version": str(now)}
-        if now != version:
+        headers = {"X-Map-Version": str(shown)}
+        if made is not None:
             floor = next(f for f in saved.floors if f.index == index)
             _audit("map.trim", saved, map_id,
-                   {"floor": index, "version": now, "margin_m": TRIM_MARGIN_M,
+                   {"floor": index, "version": made, "margin_m": TRIM_MARGIN_M,
                     "size_cells": list(floor.size_cells), "origin_xy_m": list(floor.origin_xy_m)},
                    request=request)
-            job_id = _edited(saved, now, request)
+            job_id = _edited(saved, made, request)
             if job_id:
                 headers["X-Quality-Job"] = job_id
         return Response(saved.model_dump_json(), media_type="application/json", headers=headers)

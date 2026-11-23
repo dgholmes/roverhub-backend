@@ -326,6 +326,15 @@ def test_a_bad_recording_is_dropped_and_the_rest_kept(world):
     assert robot["disk_free_gb"] is None and robot["nav_localised"] is None
 
 
+def test_an_over_long_recording_is_dropped_not_a_500(world):
+    # KeptRecording bounds survey_id and started_at at 64 (0.0.29).
+    _register(recordings=[_recording("s" * 65), _recording(started_at="t" * 65), _recording("survey-b")])
+    response = TestClient(backend.app).get("/robots")
+    assert response.status_code == 200
+    robot = next(r for r in response.json() if r["robot_id"] == "rover-a")
+    assert [r["survey_id"] for r in robot["recordings"]] == ["survey-b"]
+
+
 def test_a_new_registration_replaces_the_list(world):
     _register(recordings=[_recording()], disk_free_gb=3.0, nav_localised=False)
     _register(recordings=[])
@@ -357,11 +366,14 @@ def test_survey_summary_judges_the_map_take(tmp_path):
     store.put(_record("s-orig"))
     store.put_take(_take("s-orig", "original", first_bad_s=310.0, legs_m=90.0))
     store.put_take(_take("s-orig", "rerun-20261120T120000Z", first_bad_s=None, legs_m=120.0))
-    # named, but that take was never uploaded (or was deleted): the original's
+    # named, but that take was never uploaded (or was deleted): no verdict at
+    # all -- the original's would judge a map it did not make (row 2 grey)
     store.put(_record("s-missing", map_take_id="rerun-20261120T130000Z"))
     store.put_take(_take("s-missing", "original", first_bad_s=310.0, legs_m=90.0))
     by_id = {s.survey_id: s for s in store.list()}
     assert by_id["s-map"].first_bad_s is None and by_id["s-map"].legs_m == 120.0
     assert by_id["s-orig"].first_bad_s == 310.0 and by_id["s-orig"].legs_m == 90.0
-    assert by_id["s-missing"].first_bad_s == 310.0 and by_id["s-missing"].legs_m == 90.0
+    missing = by_id["s-missing"]
+    assert missing.has_legs is False and missing.first_bad_s is None and missing.legs_m is None
+    assert missing.take_count == 1
     assert by_id["s-map"].take_count == 2

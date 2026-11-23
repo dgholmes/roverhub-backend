@@ -142,12 +142,15 @@ class SurveyStore:
                 continue
             takes = self.takes(name)
             # The take the map was made from is the one judged (0.0.29): the
-            # rebuild's when the device rebuilt the survey and that take is
-            # here, else the original.
+            # rebuild's when the device rebuilt the survey, else the original.
+            # A named take that is not here (never uploaded, or deleted) gives
+            # no verdict at all, never the original's: that would judge a map
+            # the original did not make (the checklist's row 2 stays grey).
             by_id = {t.take_id: t for t in takes}
-            judged = by_id.get(record.map_take_id) if record.map_take_id else None
-            if judged is None:
+            if record.map_take_id is None:
                 judged = by_id.get(ORIGINAL_TAKE)
+            else:
+                judged = by_id.get(record.map_take_id)
             out.append(SurveySummary(
                 **record.model_dump(),
                 take_count=len(takes),

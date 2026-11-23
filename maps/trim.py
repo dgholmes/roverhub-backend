@@ -200,10 +200,12 @@ def _crop_pgm(data: bytes, floor: MapFloor, window, what: str):
     return np.ascontiguousarray(image[height - j1:height - j0, c0:c1])
 
 
-def trim_floor(store: MapStore, map_id: str, index: int, margin_m: float = TRIM_MARGIN_M) -> SiteMap:
+def trim_floor(store: MapStore, map_id: str, index: int,
+               margin_m: float = TRIM_MARGIN_M) -> Tuple[SiteMap, Optional[int]]:
     """Cut floor `index` of `map_id` down to its walked track's bounding box
-    plus `margin_m`, as a new draft version, and return the map. A floor
-    already inside that is returned unchanged, with no new version. Raises
+    plus `margin_m`, as a new draft version: (the map, the version it made,
+    as edit_floor read it under the store's lock). A floor already inside
+    that is returned unchanged with None: no new version. Raises
     TrimRefused (no track, a track off the floor, a zone it would cut),
     BundleError (a floor whose files do not agree), MapNotFound / FloorNotFound."""
     import numpy as np
@@ -247,10 +249,15 @@ def trim_floor(store: MapStore, map_id: str, index: int, margin_m: float = TRIM_
                          "free_cells": free, "occupied_cells": occupied, "unknown_cells": unknown}
 
         planning_path = floor_dir / ARTIFACT_FILES["planning"]
-        if floor.planning is not None and planning_path.is_file():
-            planning = sm.pgm_bytes(_crop_pgm(planning_path.read_bytes(), floor, window, "planning grid"))
-            updates["planning"] = planning_grid_for(trimmed, planning, floor.planning.clearance_m)
-            write("planning", planning)
+        if floor.planning is not None:
+            if planning_path.is_file():
+                planning = sm.pgm_bytes(_crop_pgm(planning_path.read_bytes(), floor, window, "planning grid"))
+                updates["planning"] = planning_grid_for(trimmed, planning, floor.planning.clearance_m)
+                write("planning", planning)
+            else:
+                # Described but not stored: its counts are the old size's and
+                # would no longer fill the floor. No planning grid, then.
+                updates["planning"] = None
 
         cloud_path = floor_dir / ARTIFACT_FILES["cloud"]
         points_dropped = 0
@@ -287,10 +294,9 @@ def trim_floor(store: MapStore, map_id: str, index: int, margin_m: float = TRIM_
         return updates
 
     try:
-        saved, _ = store.edit_floor(map_id, index, change, source="trim", detail=detail)
+        return store.edit_floor(map_id, index, change, source="trim", detail=detail)
     except _Unchanged:
         current = store.get(map_id)
         if current is None:  # deleted in between
             raise MapNotFound(map_id) from None
-        return current
-    return saved
+        return current, None

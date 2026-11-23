@@ -592,9 +592,18 @@ class MapStore:
                 # Nobody has.
                 site_map = site_map.model_copy(update={"status": "draft"})
                 if existing is not None:
+                    # Nor are the map's name and its floors' labels: a bundle
+                    # carries the survey's (Process again sends the survey's
+                    # original floor name), and PATCH /maps/{id} may have
+                    # renamed them since. A floor the map did not have takes
+                    # the bundle's label.
+                    labels = {f.index: f.label for f in existing.floors}
                     site_map = site_map.model_copy(update={
                         "created_at": existing.created_at,
                         "zones": existing.zones,
+                        "name": existing.name,
+                        "floors": [f.model_copy(update={"label": labels[f.index]}) if f.index in labels else f
+                                   for f in site_map.floors],
                     })
                 # From the files just copied and the zones just kept; whatever
                 # the bundle said is replaced.
@@ -760,7 +769,8 @@ class MapStore:
 
         Raises MapNotFound, or VersionNotFound when no such version is kept.
         The live bundle is archived first, as a re-upload archives it. The map
-        keeps its current zones and creation date and drops to draft; the
+        keeps its current zones, zones review, name, floor labels and creation
+        date and drops to draft; the
         restored floors keep their own planning grids (same frame). It has no
         quality report until one runs on it: a report names the version it
         was made for, so the archived one would only read as stale."""
@@ -790,8 +800,24 @@ class MapStore:
                     for file_name in ARTIFACT_FILES.values():
                         if (floor_source / file_name).is_file():
                             _link_or_copy(floor_source / file_name, floor_target / file_name)
+                # The map's name and floor labels are the current ones: a
+                # rename since is not undone by a restore. So is its zones
+                # review -- the archived one answered for another version --
+                # but a review covers only the zones it saw, so it stands
+                # only while the restored map carries those same zones.
+                zones = current.zones
+                labels = {f.index: f.label for f in current.floors}
+                if zones == current.zones:
+                    reviewed = {"zones_reviewed_at": current.zones_reviewed_at,
+                                "zones_reviewed_by": current.zones_reviewed_by}
+                else:
+                    reviewed = {"zones_reviewed_at": None, "zones_reviewed_by": None}
                 restored = archived.model_copy(update={
-                    "zones": current.zones, "status": "draft",
+                    "zones": zones, "status": "draft",
+                    "name": current.name,
+                    "floors": [f.model_copy(update={"label": labels[f.index]}) if f.index in labels else f
+                               for f in archived.floors],
+                    **reviewed,
                     "created_at": current.created_at, "updated_at": _now()})
                 restored = with_content_hashes(scratch, restored)
                 (scratch / MAP_FILE).write_text(restored.model_dump_json(indent=2), encoding="utf-8")
@@ -862,6 +888,14 @@ class MapStore:
                     map_updates["extent_min"], map_updates["extent_max"] = floors_extent(floors)
                 edited = current.model_copy(update=map_updates)
                 edited = with_content_hashes(scratch, edited)
+                # model_copy validates nothing: an update that no longer fits
+                # (a planning grid's counts against a new size) would write a
+                # map.json that never reads back, and the map would vanish.
+                try:
+                    edited = SiteMap.model_validate(edited.model_dump())
+                except ValidationError as exc:
+                    raise BundleError("floor %d's edit would not make a valid map: %s"
+                                      % (floor_index, "; ".join(e["msg"] for e in exc.errors()[:3]))) from None
                 (scratch / MAP_FILE).write_text(edited.model_dump_json(indent=2), encoding="utf-8")
                 number = self._carry_versions(directory, scratch)
                 self._write_version_file(scratch, {"version": number, "source": source,

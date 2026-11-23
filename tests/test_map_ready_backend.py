@@ -70,17 +70,35 @@ def _router(tmp_path):
 def test_floor_label_is_stored_on_the_new_floor(tmp_path, survey_files):
     router, client = _router(tmp_path)
     _upload(router, client, survey_files, floor_label="2F")
-    floors = client.get("/maps/map-room").json()["floors"]
-    assert floors[0]["label"] == "2F"
+    site_map = client.get("/maps/map-room").json()
+    assert site_map["floors"][0]["label"] == "2F"
+    assert site_map["name"] == "Room"  # a brand-new map takes the survey's name
 
 
-def test_a_resurvey_without_a_label_keeps_the_floors_label(tmp_path, survey_files):
+def test_a_resurvey_keeps_the_floors_label(tmp_path, survey_files):
+    # With or without a label of its own: Process again sends the survey's
+    # original floor name, and the map's label (perhaps renamed since) wins.
     router, client = _router(tmp_path)
     _upload(router, client, survey_files, floor_label="Ground")
     _upload(router, client, survey_files)
     assert client.get("/maps/map-room").json()["floors"][0]["label"] == "Ground"
     _upload(router, client, survey_files, floor_label="Lobby")
-    assert client.get("/maps/map-room").json()["floors"][0]["label"] == "Lobby"
+    assert client.get("/maps/map-room").json()["floors"][0]["label"] == "Ground"
+
+
+def test_a_resurvey_does_not_undo_a_rename(tmp_path, survey_files):
+    router, client = _router(tmp_path)
+    _upload(router, client, survey_files, floor_label="2F")
+    router.store.rename("map-room", name="Office, level 2", labels={0: "Level 2"})
+    _upload(router, client, survey_files, name="Room", floor_label="2F")  # as Process again sends it
+    site_map = client.get("/maps/map-room").json()
+    assert site_map["name"] == "Office, level 2"
+    assert site_map["floors"][0]["label"] == "Level 2"
+    # A floor the map did not have takes the survey's label; the map keeps its name.
+    _upload(router, client, survey_files, floor="1", floor_label="3F")
+    site_map = client.get("/maps/map-room").json()
+    assert [f["label"] for f in site_map["floors"]] == ["Level 2", "3F"]
+    assert site_map["name"] == "Office, level 2"
 
 
 def test_a_floor_label_over_40_characters_is_refused(tmp_path, survey_files):

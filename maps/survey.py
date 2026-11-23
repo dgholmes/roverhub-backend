@@ -318,6 +318,10 @@ def process_survey(store: MapStore, request: SurveyRequest, cloud_path: Path, tr
                   round(origin[1] + rows * request.resolution_m, 4)]
 
     # The map's other floors come along unchanged (their own planning grids too).
+    # `request.name` and `floor_label` name a NEW map and a NEW floor only: for a
+    # map or floor that exists, store.save_bundle keeps its name and label, as
+    # PATCH /maps/{id} left them (Process again sends the survey's original
+    # floor name, which a rename since must not lose).
     existing = store.get(request.map_id)
     created_at = _now()
     if request.floor_label is not None:
@@ -325,8 +329,6 @@ def process_survey(store: MapStore, request: SurveyRequest, cloud_path: Path, tr
     if existing is not None:
         for other in existing.floors:
             if other.index == request.floor_index:
-                if request.floor_label is None and other.label is not None:
-                    floors[0]["label"] = other.label
                 continue
             source = store.root / request.map_id / ("floor%d" % other.index)
             target = bundle / ("floor%d" % other.index)
