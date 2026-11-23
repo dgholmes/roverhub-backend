@@ -764,13 +764,14 @@ class MapStore:
         found = path / ("floor%d" % floor) / file_name
         return found if found.is_file() else None
 
-    def restore_version(self, map_id: str, version: int) -> SiteMap:
-        """Make archived `version` the live bundle again, under a new number.
+    def restore_version(self, map_id: str, version: int) -> Tuple[SiteMap, int]:
+        """Make archived `version` the live bundle again, under a new number:
+        (the restored map, that number, as read under the lock).
 
         Raises MapNotFound, or VersionNotFound when no such version is kept.
         The live bundle is archived first, as a re-upload archives it. The map
-        keeps its current zones, zones review, name, floor labels and creation
-        date and drops to draft; the
+        keeps its current zones, name, floor labels and creation date, drops
+        to draft, and has no zones review (as after a re-upload); the
         restored floors keep their own planning grids (same frame). It has no
         quality report until one runs on it: a report names the version it
         was made for, so the archived one would only read as stale."""
@@ -801,23 +802,18 @@ class MapStore:
                         if (floor_source / file_name).is_file():
                             _link_or_copy(floor_source / file_name, floor_target / file_name)
                 # The map's name and floor labels are the current ones: a
-                # rename since is not undone by a restore. So is its zones
-                # review -- the archived one answered for another version --
-                # but a review covers only the zones it saw, so it stands
-                # only while the restored map carries those same zones.
-                zones = current.zones
+                # rename since is not undone by a restore. Its zones review is
+                # nobody's, as after a re-upload: the restored bundle can sit
+                # in another frame and extent than either review saw (the
+                # current one's or the archived one's), and the checklist's
+                # zones row is never green from a guess.
                 labels = {f.index: f.label for f in current.floors}
-                if zones == current.zones:
-                    reviewed = {"zones_reviewed_at": current.zones_reviewed_at,
-                                "zones_reviewed_by": current.zones_reviewed_by}
-                else:
-                    reviewed = {"zones_reviewed_at": None, "zones_reviewed_by": None}
                 restored = archived.model_copy(update={
-                    "zones": zones, "status": "draft",
+                    "zones": current.zones, "status": "draft",
                     "name": current.name,
                     "floors": [f.model_copy(update={"label": labels[f.index]}) if f.index in labels else f
                                for f in archived.floors],
-                    **reviewed,
+                    "zones_reviewed_at": None, "zones_reviewed_by": None,
                     "created_at": current.created_at, "updated_at": _now()})
                 restored = with_content_hashes(scratch, restored)
                 (scratch / MAP_FILE).write_text(restored.model_dump_json(indent=2), encoding="utf-8")
@@ -828,7 +824,7 @@ class MapStore:
             except BaseException:
                 shutil.rmtree(scratch, ignore_errors=True)
                 raise
-        return restored
+        return restored, number
 
     # --- the map editor: a floor edited as a new version ------------------
 

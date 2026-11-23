@@ -811,15 +811,16 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
     @router.post("/maps/{map_id}/versions/{version}/restore")
     def restore_version(map_id: str, version: int, request: Request):
         try:
-            restored = store.restore_version(map_id, version)
+            # `made`: the restore's own version, read under the store's lock,
+            # not whatever version another edit landing since has made.
+            restored, made = store.restore_version(map_id, version)
         except VersionNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
         except MapNotFound:
             raise HTTPException(status_code=404, detail="map not found") from None
         except BundleError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
-        _audit("map.restore", restored, map_id,
-               {"restored_from": version, "version": store.current_version(map_id)})
+        _audit("map.restore", restored, map_id, {"restored_from": version, "version": made})
         _queue_quality_quietly(restored, request)
         return restored
 

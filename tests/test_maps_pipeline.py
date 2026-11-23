@@ -339,7 +339,8 @@ def test_a_reupload_keeps_the_old_bundle_and_restore_brings_it_back(tmp_path):
     assert len(store.get("map-venue").floors) == 2
 
     store.set_status("map-venue", "active")
-    restored = store.restore_version("map-venue", 1)
+    restored, number = store.restore_version("map-venue", 1)
+    assert number == 3 == store.current_version("map-venue")
     assert len(restored.floors) == 1 and restored.status == "draft"  # version 1's floors
     assert [z.zone_id for z in restored.zones] == ["z1"]  # the zones carry over
     assert store.get("map-venue").name == "First" and len(store.get("map-venue").floors) == 1

@@ -388,13 +388,15 @@ def test_a_restore_does_not_undo_a_rename(maps, tmp_path):
     store.save_bundle(_stretched_bundle(tmp_path / "again"))
     assert client.patch("/maps/%s" % MAP, json={"name": "Office, level 1",
                                                 "floors": [{"index": 0, "label": "G"}]}).status_code == 200
-    restored = store.restore_version(MAP, old)
+    restored, _ = store.restore_version(MAP, old)
     assert restored.name == "Office, level 1" and restored.floors[0].label == "G"
     assert store.get(MAP).name == "Office, level 1" and store.get(MAP).floors[0].label == "G"
 
 
-def test_a_restore_keeps_the_current_zones_review_not_the_archived_one(maps, tmp_path):
-    # Row 6 must not turn green from an old version's review.
+def test_a_restore_clears_the_zones_review(maps, tmp_path):
+    # Row 6 is never green from a guess: a restored bundle can sit in another
+    # frame and extent than the one the reviewer saw -- the current review and
+    # the archived one alike. As a re-upload, it needs a new review.
     router, _ = maps
     store = router.store
     old = store.current_version(MAP)
@@ -403,17 +405,40 @@ def test_a_restore_keeps_the_current_zones_review_not_the_archived_one(maps, tmp
     store.save_bundle(_stretched_bundle(tmp_path / "again"))  # a new survey: not reviewed
     unreviewed = store.current_version(MAP)
     assert store.get(MAP).zones_reviewed_at is None
-    restored = store.restore_version(MAP, old)  # its map.json carries sue's review
+    restored, _ = store.restore_version(MAP, old)  # its map.json carries sue's review
     assert restored.zones_reviewed_at is None and restored.zones_reviewed_by is None
     assert store.get(MAP).zones_reviewed_at is None
 
-    # The current map's review stays through a restore of a version without one.
+    # The current map's review does not survive a restore either.
     store.set_status(MAP, "active", zones_reviewed=True, zones_reviewed_by="sam")
-    reviewed = store.get(MAP)
-    restored = store.restore_version(MAP, unreviewed)
-    assert restored.zones_reviewed_at == reviewed.zones_reviewed_at
-    assert restored.zones_reviewed_by == "sam"
     assert store.get(MAP).zones_reviewed_by == "sam"
+    restored, _ = store.restore_version(MAP, unreviewed)
+    assert restored.zones_reviewed_at is None and restored.zones_reviewed_by is None
+    assert store.get(MAP).zones_reviewed_at is None and store.get(MAP).zones_reviewed_by is None
+
+
+def test_restore_returns_and_audits_the_version_it_made(tmp_path):
+    # Not a read of the live version after the store's lock is let go, which
+    # another edit landing in between would make wrong.
+    from tests.test_site_setup import Audit
+
+    audit = Audit()
+    router = build_maps_router(str(tmp_path / "maps"), audit=audit, jobs_dir=str(tmp_path / "jobs"),
+                               start_jobs=False)
+    store = router.store
+    store.save_bundle(_stretched_bundle(tmp_path / "bundle"))
+    old = store.current_version(MAP)
+    store.save_bundle(_stretched_bundle(tmp_path / "again"))
+    made = store.current_version(MAP) + 1
+    _, number = store.restore_version(MAP, old)
+    assert number == made == store.current_version(MAP)
+
+    store.current_version = lambda map_id: 99  # another edit, as far as any later read can tell
+    # Sign-in off: everyone may restore (configure); who is not under test here.
+    response = _app_as(router, None).post("/maps/%s/versions/%d/restore" % (MAP, old))
+    assert response.status_code == 200, response.text
+    (row,) = audit.of("map.restore")
+    assert row["detail"] == {"restored_from": old, "version": made + 1}
 
 
 # --- §4.8 activate asks about zones --------------------------------------------
