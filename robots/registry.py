@@ -113,6 +113,11 @@ class RobotRecord:
     recordings: List[dict] = field(default_factory=list)
     disk_free_gb: Optional[float] = None
     nav_localised: Optional[bool] = None
+    # From the registration (schema 0.0.30): the cameras whose stream the
+    # bridge already steadies on the device ("front", "back"). Empty from an
+    # older bridge or with its VIDEO_STABILISE switch off -- "not steadied
+    # here", so the console may steady it itself.
+    stabilised_cameras: List[str] = field(default_factory=list)
 
 
 class RobotRegistry:
@@ -167,9 +172,11 @@ class RobotRegistry:
         recordings: Optional[List[dict]] = None,
         disk_free_gb: Optional[float] = None,
         nav_localised: Optional[bool] = None,
+        stabilised_cameras: Optional[List[str]] = None,
     ) -> None:
         now = self._clock()
         recordings = list(recordings or [])
+        stabilised_cameras = list(stabilised_cameras or [])
         with self._lock:
             existing = self._robots.get(robot_id)
             if existing is None:
@@ -180,6 +187,7 @@ class RobotRegistry:
                     bridge_id=bridge_id, schema_version=schema_version,
                     first_seen=now, host=host, nav_map_id=nav_map_id, nav_map_hash=nav_map_hash,
                     recordings=recordings, disk_free_gb=disk_free_gb, nav_localised=nav_localised,
+                    stabilised_cameras=stabilised_cameras,
                     acceptance=acceptance, acceptance_source=source,
                     acceptance_changed_at=now,
                 )
@@ -202,6 +210,7 @@ class RobotRegistry:
             existing.recordings = recordings
             existing.disk_free_gb = disk_free_gb
             existing.nav_localised = nav_localised
+            existing.stabilised_cameras = stabilised_cameras
 
     def mark_seen(self, robot_id: str) -> None:
         with self._lock:

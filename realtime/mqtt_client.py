@@ -7,12 +7,13 @@ import math
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, get_args
 
 from pydantic import ValidationError
 
 from shared.schemas.bridge_status import (
     MAX_KEPT_RECORDINGS, EdgeHostInfo, EdgeHostMetrics, KeptRecording, NavGoalStatus,
+    StabilisedCamera,
 )
 from shared.schemas.map_hash import is_map_hash
 from shared.schemas.version import SCHEMA_VERSION
@@ -510,7 +511,17 @@ class BackendMqttClient:
             recordings=self._recordings(data.get("recordings"), robot_id),
             disk_free_gb=self._disk_free_gb(data.get("disk_free_gb")),
             nav_localised=data.get("nav_localised") if isinstance(data.get("nav_localised"), bool) else None,
+            # 0.0.30. Only the known camera names, each once; anything else
+            # is dropped, and absent (an older bridge) reads as none.
+            stabilised_cameras=self._stabilised_cameras(data.get("stabilised_cameras")),
         )
+
+    @staticmethod
+    def _stabilised_cameras(value) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        known = get_args(StabilisedCamera)
+        return [cam for cam in known if cam in value]
 
     def _recordings(self, value, robot_id: str) -> list:
         """BridgeRegistration.recordings, each item validated as a

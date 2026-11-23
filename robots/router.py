@@ -50,6 +50,8 @@ def robot_json(record: RobotRecord) -> dict:
         "recordings": record.recordings,
         "disk_free_gb": record.disk_free_gb,
         "nav_localised": record.nav_localised,
+        # 0.0.30: cameras the bridge already steadies, so the console doesn't.
+        "stabilised_cameras": record.stabilised_cameras,
     }
 
 

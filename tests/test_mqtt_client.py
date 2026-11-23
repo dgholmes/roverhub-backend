@@ -676,6 +676,27 @@ def test_registration_records_the_hash_of_the_map_files_the_bridge_runs_on():
         assert registry.get("rover-j").nav_map_hash is None
 
 
+def test_registration_records_the_cameras_the_bridge_steadies():
+    # Schema 0.0.30: the console must not steady these a second time.
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    base = {"robot_id": "rover-j", "site_id": "site-a", "robot_type": "quad", "schema_version": "0.0.30"}
+
+    client.handle_message("roverhub/admin/rover-j/register",
+                          json.dumps({**base, "stabilised_cameras": ["front", "back"]}).encode())
+    assert registry.get("rover-j").stabilised_cameras == ["front", "back"]
+
+    # Unknown names are dropped, the known ones kept, each once.
+    client.handle_message("roverhub/admin/rover-j/register",
+                          json.dumps({**base, "stabilised_cameras": ["top", "back", 3, None, "back"]}).encode())
+    assert registry.get("rover-j").stabilised_cameras == ["back"]
+
+    # Not a list, or not said (a 0.0.29 bridge): nothing steadied here.
+    for payload in ({**base, "stabilised_cameras": "front"}, {**base, "schema_version": "0.0.29"}):
+        client.handle_message("roverhub/admin/rover-j/register", json.dumps(payload).encode())
+        assert registry.get("rover-j").stabilised_cameras == []
+
+
 # --- the bridge's last will (edge connection_manager.py, 2026-11-11) ----------
 
 

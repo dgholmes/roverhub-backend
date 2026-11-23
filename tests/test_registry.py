@@ -287,3 +287,19 @@ def test_nav_map_hash_is_kept_from_registration_and_listed():
     assert robot_json(registry.get("rover-j"))["nav_map_hash"] == "b" * 64
     registry.upsert_from_registration("rover-j", "site-a", "quad", nav_map_id="map-office")
     assert registry.get("rover-j").nav_map_hash is None
+
+
+def test_stabilised_cameras_are_kept_from_registration_and_listed():
+    # Schema 0.0.30: cameras the bridge already steadies, so the console doesn't.
+    from robots.router import robot_json
+
+    registry = RobotRegistry()
+    registry.upsert_from_registration("rover-j", "site-a", "quad")
+    assert registry.get("rover-j").stabilised_cameras == []
+    assert robot_json(registry.get("rover-j"))["stabilised_cameras"] == []
+    registry.upsert_from_registration("rover-j", "site-a", "quad", stabilised_cameras=["front"])
+    assert registry.get("rover-j").stabilised_cameras == ["front"]
+    assert robot_json(registry.get("rover-j"))["stabilised_cameras"] == ["front"]
+    # Replaced, not kept: a registration without it is a bridge not steadying.
+    registry.upsert_from_registration("rover-j", "site-a", "quad")
+    assert registry.get("rover-j").stabilised_cameras == []
