@@ -141,6 +141,39 @@ def test_a_refused_request_opens_nothing(moving):
     assert _acl(client, "rover-a", _topic(OTHER_SITE, "state"), ACC_WRITE) == 403
 
 
+def test_perception_publishes_at_the_new_site_during_and_after_a_move(moving):
+    """Perception signs in to the broker as the robot, with the bridge's
+    device key (roverhub-edge perception/config.py: username robot_id unless
+    PERCEPTION_DEVICE_KEY is set), so its incidents and status ride the same
+    grant as the bridge: the move's while it is pending, the registration's
+    after."""
+    client = TestClient(backend.app)
+    suffixes = ("perception/status", "incidents")
+    for suffix in suffixes:
+        assert _acl(client, "rover-a", _topic(OTHER_SITE, suffix), ACC_WRITE) == 403
+    _move(client)
+    for suffix in suffixes:
+        assert _acl(client, "rover-a", _topic(OTHER_SITE, suffix), ACC_WRITE) == 200, suffix
+        # It notices the move up to ~5 s after the bridge: the old site still works meanwhile.
+        assert _acl(client, "rover-a", _topic(SITE, suffix), ACC_WRITE) == 200, suffix
+    _register(site=OTHER_SITE)
+    for suffix in suffixes:
+        assert _acl(client, "rover-a", _topic(OTHER_SITE, suffix), ACC_WRITE) == 200, suffix
+        assert _acl(client, "rover-a", _topic(SITE, suffix), ACC_WRITE) == 403, suffix
+
+
+def test_perceptions_own_identity_is_not_a_device_at_any_site(moving):
+    """A perception with its own key signs in as "<robot>.perception", which
+    this backend does not know (no DEVICE_KEYS entry, no rule): it publishes
+    nowhere, before or after a move. Not something a move changes."""
+    client = TestClient(backend.app)
+    _move(client)
+    for site in (SITE, OTHER_SITE):
+        assert _acl(client, "rover-a.perception", _topic(site, "perception/status"), ACC_WRITE) == 403
+    assert client.post("/mqtt/auth", json={"username": "rover-a.perception", "password": "key-a",
+                                           "clientid": "p"}).status_code == 403
+
+
 def test_reads_are_unchanged_by_a_move(moving):
     # Browsers read by their roles; a device subscribes to its commands.
     client = TestClient(backend.app)
