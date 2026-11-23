@@ -28,6 +28,7 @@ from missions.router import DEFAULT_MISSIONS_DIR, MissionStore, build_missions_r
 from realtime.mqtt_client import BackendMqttClient, real_mqtt_client_factory
 from robots.registry import RobotRegistry, offline_after_s_from_env
 from robots.router import build_robots_router
+from robots.site_moves import SiteMoves
 from runs.dispatch import RunDispatcher, make_run_ended_hook
 from runs.bucket import from_env as bucket_from_env
 from runs.orphans import OrphanSettler
@@ -89,6 +90,8 @@ def _on_ack(command):
     if command is None:
         return
     history.audit.command_acked(command)  # the final outcome, once; never raises
+    # A SET_SITE the bridge refused closes the site it was moving to.
+    site_moves.settle(command)
     # A START_MISSION the bridge refused fails its run (runs/dispatch.py). Kept
     # apart from apply_ack so a dispatcher error cannot lose the ack itself.
     if _run_dispatcher is not None:
@@ -191,7 +194,11 @@ app = FastAPI(title="RoverHub Backend (dev)",
 app.include_router(build_auth_router(auth, on_login=history.audit.login, audit=history.audit.record))
 # The broker's checks. A device's writes are pinned to the site its robot
 # registered at (auth/mqtt_hooks.py).
-app.include_router(build_mqtt_hooks_router(auth, site_of=lambda robot_id: _site_for(robot_id)))
+# Robots sent to another site (SET_SITE, 0.0.29): their key may write at the
+# new site too until they register there (robots/site_moves.py).
+site_moves = SiteMoves(site_of=lambda robot_id: _site_for(robot_id))
+app.include_router(build_mqtt_hooks_router(auth, site_of=lambda robot_id: _site_for(robot_id),
+                                           moving_to=site_moves.target))
 def _site_known(site_id: str) -> bool:
     """Whether a SET_SITE names a site this backend knows. There is no site
     store (OD-8): a site exists here once a robot registers at it, a map is
@@ -208,7 +215,7 @@ def _site_known(site_id: str) -> bool:
 # site before it is sent (the map store is built further down; late-bound).
 app.include_router(build_router(command_store, mqtt_client, registry=registry,
                                 map_lookup=lambda map_id: maps_router.store.get(map_id),
-                                site_known=_site_known))
+                                site_known=_site_known, site_moves=site_moves))
 # POST /robots/{id}/logs/request asks a robot for its journal; the answer goes
 # robot -> browser through the broker (shared/schemas/logs.py). Late-bound,
 # like the command routes' publish, so a test can stand in for the broker.

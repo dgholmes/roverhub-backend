@@ -7,7 +7,10 @@ Answer by status code: 200 allows, 403 denies.
 Who connects:
 - **this backend**: username `roverhub-backend`, BROKER_SERVICE_PASSWORD. Superuser.
 - **an edge bridge**: username = its robot_id, password = its device key. May
-  publish and read only its own robot's topics, plus its registration.
+  publish and read only its own robot's topics, plus its registration. Writes
+  only under the site its robot registered at -- and, while a SET_SITE moves
+  it, the site it is moving to. One organisation per backend, so a robot may
+  be moved to any site the backend knows (control/router.py checks who may).
 - **a browser**: username = the signed-in user's id, password = their session
   token. Read-only, and only the sites where they hold a role. Browsers never
   publish: commands go through REST, where roles are checked per command.
@@ -92,7 +95,8 @@ def _robot_suffix(parts: list) -> str:
 
 
 def _bridge_allowed(auth: Auth, robot_id: str, topic: str, acc: int,
-                    site_of: Optional[Callable[[str], Optional[str]]] = None) -> bool:
+                    site_of: Optional[Callable[[str], Optional[str]]] = None,
+                    moving_to: Optional[Callable[[str], Optional[str]]] = None) -> bool:
     parts = topic.split("/")
     if parts[:2] == ["roverhub", "admin"] and len(parts) == 4 and parts[3] == "register":
         # The registration topic is keyed by bridge id, which is not the robot
@@ -118,13 +122,22 @@ def _bridge_allowed(auth: Auth, robot_id: str, topic: str, acc: int,
         # (no registration since the backend started) is allowed, as before.
         # Subscriptions are not pinned: a bridge subscribes to its commands once
         # per connect, and a refusal cached by the broker would cut it off.
+        # A robot sent to another site (SET_SITE, 0.0.29) may write there
+        # too until it registers there: its first writes after the restart
+        # come before its registration (robots/site_moves.py).
         try:
             registered = site_of(robot_id) if site_of is not None else None
         except Exception:
             logger.exception("could not look up the site of %s for the broker", robot_id)
             registered = None
         if registered is not None and parts[1] != registered:
-            return False
+            try:
+                moving = moving_to(robot_id) if moving_to is not None else None
+            except Exception:
+                logger.exception("could not look up where %s is moving for the broker", robot_id)
+                moving = None
+            if parts[1] != moving:
+                return False
     return acc in (ACC_WRITE, ACC_READ, ACC_SUBSCRIBE, ACC_READWRITE)
 
 
@@ -149,9 +162,12 @@ def _browser_allowed(auth: Auth, user_id: str, topic: str, acc: int) -> bool:
     return user.site_role(site) is not None
 
 
-def build_mqtt_hooks_router(auth: Auth, site_of: Optional[Callable[[str], Optional[str]]] = None) -> APIRouter:
+def build_mqtt_hooks_router(auth: Auth, site_of: Optional[Callable[[str], Optional[str]]] = None,
+                            moving_to: Optional[Callable[[str], Optional[str]]] = None) -> APIRouter:
     """`site_of(robot_id)`: the site the robot registered at, or None (the
-    registry, in the app). Pins a device's writes to that site."""
+    registry, in the app). Pins a device's writes to that site.
+    `moving_to(robot_id)`: the site a SET_SITE this backend sent is moving it
+    to, or None (robots/site_moves.py); writes there are allowed too."""
     router = APIRouter()
 
     def _is_service(username: str, password: Optional[str] = None) -> bool:
@@ -181,7 +197,7 @@ def build_mqtt_hooks_router(auth: Auth, site_of: Optional[Callable[[str], Option
     @router.post("/mqtt/acl")
     def mqtt_acl(body: AclRequest):
         if body.username in auth.device_keys:
-            allowed = _bridge_allowed(auth, body.username, body.topic, body.acc, site_of)
+            allowed = _bridge_allowed(auth, body.username, body.topic, body.acc, site_of, moving_to)
         else:
             allowed = _browser_allowed(auth, body.username, body.topic, body.acc)
         if not allowed:

@@ -79,7 +79,7 @@ def _bad_fields(exc: ValidationError) -> str:
 
 
 def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lookup=None,
-                 site_known=None) -> APIRouter:
+                 site_known=None, site_moves=None) -> APIRouter:
     """`registry` lets an unknown robot be refused before the command is even
     recorded. Without it the MQTT client still refuses to publish one
     (UnknownRobotError), so the answer is the same 404, just after the store.
@@ -87,7 +87,10 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
     REPROCESS_SURVEY, FIND_MOVING or USE_NAV_MAP names. Without it that is not
     checked here (the robot's own upload is still held to its site).
     `site_known(site_id)` -> bool: whether a SET_SITE names a site the backend
-    knows. Without it any well-formed site id is sent."""
+    knows. Without it any well-formed site id is sent.
+    `site_moves` (robots/site_moves.SiteMoves): told of every SET_SITE sent,
+    so the broker lets the robot's key write at the site it moves to before
+    its registration there arrives."""
     router = APIRouter()
 
     def _map_at_robot_site(robot, map_id: str):
@@ -371,9 +374,15 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
             ttl_s=command_ttl_s(request.type, request.params),
         )
         command_store.add(command)
+        moving = site_moves is not None and request.type == "SET_SITE"
+        if moving:
+            # Before the publish: the bridge acks and restarts within seconds.
+            site_moves.begin(robot_id, request.params["site_id"], command.command_id)
         try:
             mqtt_client.publish_command(robot_id, command)
         except CommandPublishError as exc:
+            if moving:
+                site_moves.cancel(robot_id, command.command_id)
             # The command never reached the broker, so no bridge will ever ack it.
             # Record that terminally and fail the request rather than returning a
             # command that will sit at "Sending..." until the operator gives up.
