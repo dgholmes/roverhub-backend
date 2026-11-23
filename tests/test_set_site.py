@@ -104,7 +104,7 @@ def test_once_registered_at_the_new_site_the_old_one_is_closed(moving):
     assert moving.target("rover-a") is None
 
 
-@pytest.mark.parametrize("stage", ["execution_failed", "timed_out"])
+@pytest.mark.parametrize("stage", ["execution_failed", "timed_out", "cancelled"])
 def test_a_refused_move_withdraws_the_new_site(moving, stage):
     client = TestClient(backend.app)
     command = _move(client)

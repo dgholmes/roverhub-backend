@@ -9,12 +9,15 @@ registration does not back. A moved bridge restarts under the new site and
 writes there before the backend has its new registration: paho's online
 heartbeat goes out on CONNACK, ahead of the registration. Refused, and the
 broker (mosquitto-go-auth) caches the refusal for 30 s, dropping the robot's
-heartbeat and retained state at the new site for that long.
+heartbeat and retained state at the new site for that long. (The cache is
+infra/mosquitto.auth.conf `auth_opt_acl_cache_seconds 30`: it caches denials
+as well as grants, per username, topic and access.)
 
 So once SET_SITE is sent, the robot's key may write at the site it is moving
 to as well. The allowance ends when:
   - the robot registers there (`site_of` says so: nothing left to allow);
-  - the bridge refuses the move, or the command times out (`settle`);
+  - the bridge refuses the move, the command times out or is cancelled
+    (`settle`);
   - SITE_MOVE_TTL_S passes (a bridge run by hand does not restart itself).
 A newer SET_SITE for the same robot replaces it.
 
@@ -35,7 +38,7 @@ from typing import Callable, Dict, Optional
 SITE_MOVE_TTL_S = 300.0
 
 # The stages that end a SET_SITE without a move.
-_UNMOVED_STAGES = frozenset({"execution_failed", "timed_out"})
+_UNMOVED_STAGES = frozenset({"execution_failed", "timed_out", "cancelled"})
 
 
 @dataclass(frozen=True)
