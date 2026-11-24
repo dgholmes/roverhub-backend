@@ -226,3 +226,69 @@ def test_capability_names_the_configured_services(monkeypatch, service):
 
     assert engine is not None
     assert "melotts" in engine and "kokoro" in engine
+
+
+# --- numbers stay in the announcement's language ----------------------------
+#
+# The rule: once an announcement is routed to a language, its numbers and units
+# are spoken in that language too, never handed to the other voice. Measured on
+# 2026-11-23, neither engine manages this alone: MeloTTS's g2pkk reads
+# "15 퍼센트" digit by digit (일오) and "3m" as English letters inside Korean,
+# and Kokoro's misaki reads "3m" as "three em". So the router spells numbers
+# and units out in the routed language before either engine sees them.
+
+
+def _both(monkeypatch, service):
+    korean, english = service(), service()
+    monkeypatch.setenv("TTS_KO_URL", korean.url)
+    monkeypatch.setenv("TTS_EN_URL", english.url)
+    return korean, english
+
+
+def test_a_korean_number_reaches_the_korean_voice_already_in_korean(monkeypatch, service):
+    korean, english = _both(monkeypatch, service)
+
+    synthesize_wav("배터리 잔량은 15 퍼센트입니다.", use_cache=False)
+
+    assert korean.requests[0]["text"] == "배터리 잔량은 십오 퍼센트입니다."
+    assert english.requests == []
+
+
+def test_a_unit_inside_a_korean_sentence_is_spoken_in_korean(monkeypatch, service):
+    korean, _ = _both(monkeypatch, service)
+
+    synthesize_wav("3m 앞에 장애물이 있습니다.", use_cache=False)
+
+    assert korean.requests[0]["text"] == "삼 미터 앞에 장애물이 있습니다."
+
+
+def test_an_english_unit_reaches_the_english_voice_as_a_word(monkeypatch, service):
+    korean, english = _both(monkeypatch, service)
+
+    synthesize_wav("Obstacle 3m ahead.", use_cache=False)
+
+    assert english.requests[0]["text"] == "Obstacle 3 meters ahead."
+    assert korean.requests == []
+
+
+def test_digits_never_decide_the_language_the_words_around_them_do(monkeypatch, service):
+    korean, english = _both(monkeypatch, service)
+
+    synthesize_wav("Battery at 15%.", use_cache=False)
+    synthesize_wav("배터리 15%", use_cache=False)
+
+    assert [r["text"] for r in english.requests] == ["Battery at 15%."]
+    assert [r["text"] for r in korean.requests] == ["배터리 십오 퍼센트"]
+
+
+def test_one_announcement_written_two_ways_is_synthesised_once(monkeypatch, service):
+    # The cache keys on what is actually spoken, so "15" and "십오" share an
+    # entry -- and a later fix to the normaliser misses the old, wrong audio
+    # instead of replaying it from the cache.
+    korean, _ = _both(monkeypatch, service)
+
+    first = synthesize_wav("배터리 15%")
+    second = synthesize_wav("배터리 십오 퍼센트")
+
+    assert len(korean.requests) == 1
+    assert first == second

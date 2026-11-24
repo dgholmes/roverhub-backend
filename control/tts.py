@@ -59,6 +59,8 @@ from pathlib import Path
 import httpx
 
 from control.tts_cache import TtsCache, cache_key
+from control.tts_numbers_en import normalize_en
+from control.tts_numbers_ko import normalize_ko
 
 logger = logging.getLogger("backend.control.tts")
 
@@ -150,6 +152,21 @@ def _cache() -> TtsCache:
     return TtsCache(directory, max_entries) if max_entries > 0 else TtsCache(directory)
 
 
+_SPELL_OUT = {"ko": normalize_ko, "en": normalize_en}
+
+
+def spoken_text(text: str, language: str) -> str:
+    """What is actually said: `text` with its numbers and units in `language`.
+
+    The rule is that an announcement's numbers stay in the language it was
+    routed to -- a Korean sentence never hands "15" to the English voice, and
+    an English one never reads "3m" as a letter. Neither engine manages that
+    alone (control/tts_numbers_ko.py and _en.py record how each fails), so the
+    router spells them out before either engine sees the text.
+    """
+    return _SPELL_OUT[language](text)
+
+
 def synthesize_wav(text: str, *, use_cache: bool = True) -> bytes:
     """Synthesises `text` and returns WAV bytes.
 
@@ -168,13 +185,16 @@ def synthesize_wav(text: str, *, use_cache: bool = True) -> bytes:
         raise TtsError(f"text exceeds {MAX_TTS_CHARS} characters")
 
     language = detect_language(text)
+    # Routing is decided on the text as written -- digits carry no script --
+    # and everything after it uses what will actually be said.
+    spoken = spoken_text(text, language)
     url = _service_url(language)
 
     if url is not None:
         engine = SERVICE_ENGINE[language]
 
         def produce() -> bytes:
-            return _synthesize_remote(url, text, language)
+            return _synthesize_remote(url, spoken, language)
     else:
         local = _local_engine()
         if local is None:
@@ -187,11 +207,13 @@ def synthesize_wav(text: str, *, use_cache: bool = True) -> bytes:
         engine = local
 
         def produce() -> bytes:
-            return _synthesize_local(engine, text)
+            return _synthesize_local(engine, spoken)
 
     if not use_cache:
         return produce()
-    return _cache().get_or_create(cache_key(text, engine), produce)
+    # Keyed on what is spoken, so one announcement written two ways shares an
+    # entry, and a fix to the spelling-out misses the old audio.
+    return _cache().get_or_create(cache_key(spoken, engine), produce)
 
 
 def _synthesize_remote(url: str, text: str, language: str) -> bytes:
