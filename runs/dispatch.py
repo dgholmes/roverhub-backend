@@ -137,7 +137,7 @@ class RunDispatcher:
         if self._is_running(robot, robot_id, exclude_run_id):
             raise StartRefused(f"{robot_id} is already running a mission")
         if robot.control_owner:
-            raise StartRefused(f"someone has control of {robot_id}; release control first")
+            raise StartRefused(f"{robot.control_owner} has control of {robot_id}; release control first")
         return robot
 
     def _prepare(

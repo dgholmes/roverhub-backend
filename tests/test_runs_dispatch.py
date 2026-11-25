@@ -107,7 +107,7 @@ def _state(e, sdk_state="stand", **kw):
     (lambda e: _state(e, "passive"), "the robot is in E-Stop; release it first"),
     (lambda e: _state(e, active_run={"run_id": "x"}), "rover-pi is already running a mission"),
     (lambda e: _state(e, control_owner="operator-dev"),
-     "someone has control of rover-pi; release control first"),
+     "operator-dev has control of rover-pi; release control first"),
 ])
 def test_refusals(env, setup, phrase):
     setup(env)
@@ -250,7 +250,7 @@ def test_scheduled_start_publishes_when_the_checks_pass(env):
     (lambda e: _version(e, "0.0.10"), "missions need 0.0.11"),
     (lambda e: _state(e, "passive"), "the robot is in E-Stop"),
     (lambda e: _state(e, active_run={"run_id": "other"}), "already running a mission"),
-    (lambda e: _state(e, control_owner="operator-dev"), "someone has control"),
+    (lambda e: _state(e, control_owner="operator-dev"), "operator-dev has control"),
 ])
 def test_scheduled_start_applies_the_same_checks_and_publishes_nothing(env, setup, phrase):
     from runs.dispatch import StartRefused
