@@ -17,6 +17,7 @@ from shared.schemas.commands import (
     ResetPositionParams, ResumeParams, SetNavStuckPolicyParams, SetSiteParams, SyncMapParams, UseNavMapParams,
     command_ttl_s,
 )
+from shared.schemas.detection import SetDetectionParams
 from shared.schemas.sensors import SetCalibrationModeParams, SetLidarMountParams
 from shared.schemas.survey import (
     FindMovingParams, ReprocessSurveyParams, SetSurveyKeepParams, StartSurveyParams, StopSurveyParams,
@@ -72,6 +73,11 @@ _MAP_READY_PARAMS = {
     "USE_NAV_MAP": (UseNavMapParams, "a map to use", "using a map"),
     "SET_SITE": (SetSiteParams, "a site to move to", "moving a robot to another site"),
 }
+
+# Switching AI detection from the console (schema 0.0.31). It moves nothing:
+# the bridge writes the setting to a file and perception restarts into it. A
+# bridge older than that refuses the type as unknown.
+DETECTION_SCHEMA_VERSION = "0.0.31"
 
 
 def _bad_fields(exc: ValidationError) -> str:
@@ -213,6 +219,24 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
                     detail=(f"update the edge device: it runs schema {robot.schema_version or 'unknown'}, "
                             f"stuck walks need {NAV_STUCK_SCHEMA_VERSION}"))
 
+    def _check_detection(robot_id: str, params) -> None:
+        """422 / 409 for a SET_DETECTION the robot would refuse anyway. Whether
+        a survey holds detection off is the robot's to say (off_reason)."""
+        try:
+            SetDetectionParams.model_validate(params or {})
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"SET_DETECTION params are not a detection setting ({_bad_fields(exc)})") from exc
+        robot = registry.get(robot_id) if registry is not None else None
+        if robot is not None:
+            version = _parse_version(robot.schema_version)
+            if version is None or version < _parse_version(DETECTION_SCHEMA_VERSION):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"update the edge device: it runs schema {robot.schema_version or 'unknown'}, "
+                            f"switching AI detection needs {DETECTION_SCHEMA_VERSION}"))
+
     def _check_map_ready(http: Request, robot_id: str, command_type: str, params) -> None:
         """422 / 409 / 404 / 403 for a map ready checklist command (0.0.29)
         the robot would refuse anyway, or that names what this caller may not
@@ -350,6 +374,8 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
             _check_nav_stuck(robot_id, request.type, request.params)
         elif request.type in _MAP_READY_PARAMS:
             _check_map_ready(http, robot_id, request.type, request.params)
+        elif request.type == "SET_DETECTION":
+            _check_detection(robot_id, request.params)
         elif request.type == "RESUME":
             # The run_id is what stops a late Retry restarting some other paused run.
             try:

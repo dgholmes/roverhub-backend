@@ -113,6 +113,48 @@ def test_perception_status_writes_on_change_only():
     assert tracker.on_status("site-a", "rover-a", {**status, "source_state": "unavailable"}) is not None
 
 
+def _switchable(enabled, off_reason, selected=("base.person",), detectors=()):
+    # A 0.0.31 status: the operator's setting (SET_DETECTION) and why nothing runs.
+    return {"robot_id": "rover-a", "site_id": "site-a", "at": "t", "camera": "front", "source_state": "live",
+            "fps": None, "detectors": [dict(d) for d in detectors], "enabled": enabled,
+            "selected": list(selected), "off_reason": off_reason}
+
+
+def test_a_status_carrying_the_detection_setting_is_kept_as_sent():
+    tracker = PerceptionTracker(clock=lambda: T0)
+    status = _switchable(False, "switched_off")
+    record = tracker.on_status("site-a", "rover-a", status)
+    assert record is not None
+    assert (record.payload["enabled"], record.payload["selected"], record.payload["off_reason"]) == (
+        False, ["base.person"], "switched_off")
+
+
+def test_why_detection_is_off_is_a_change():
+    # On -> switched off -> held off by a survey: three rows. The last two
+    # differ only in off_reason (no detector runs in either), and an operator
+    # reading the timeline needs to tell them apart.
+    tracker = PerceptionTracker(clock=lambda: T0)
+    running = [{"detector_id": "base.person", "kind": "model", "version": "1", "labels": ["person"],
+                "status": "running"}]
+    assert tracker.on_status("site-a", "rover-a", _switchable(True, None, detectors=running)) is not None
+    assert tracker.on_status("site-a", "rover-a", _switchable(False, "switched_off")) is not None
+    assert tracker.on_status("site-a", "rover-a", _switchable(False, "survey")) is not None
+    assert tracker.on_status("site-a", "rover-a", _switchable(False, "survey")) is None
+
+
+def test_the_operator_setting_alone_is_a_change():
+    # A survey holds detection off whatever the setting says; the setting
+    # changing underneath it (enabled, or the chosen detectors) is still news.
+    tracker = PerceptionTracker(clock=lambda: T0)
+    assert tracker.on_status("site-a", "rover-a", _switchable(False, "survey")) is not None
+    assert tracker.on_status("site-a", "rover-a", _switchable(True, "survey")) is not None
+    assert tracker.on_status("site-a", "rover-a",
+                             _switchable(True, "survey", selected=("base.person", "base.pose"))) is not None
+    # The same set listed in another order is not.
+    assert tracker.on_status("site-a", "rover-a",
+                             _switchable(True, "survey", selected=("base.pose", "base.person"))) is None
+
+
 def test_an_incident_takes_its_robot_and_site_from_the_topic():
     payload = {"incident_id": "i-1", "robot_id": "someone-else", "site_id": "site-z", "rule_id": "r",
                "label": "fallen_person", "severity": "critical", "opened_at": "2026-11-11T06:00:00Z",
