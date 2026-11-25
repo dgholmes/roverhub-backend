@@ -113,6 +113,14 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     "SKIP_MOVING_SEARCH": ("configure",),
     "USE_NAV_MAP": ("configure",),
     "SET_SITE": ("configure",),
+    # Switching AI detection on or off, and which detectors run (schema
+    # 0.0.31). Listed although it is the `drive` default, so the choice is
+    # visible: it is the operator's switch, as SET_OBSTACLE_AVOIDANCE (which
+    # takes the default) is -- both are flipped mid-run from LiveOps
+    # (MISSION_SHARED_COMMAND_TYPES) and move nothing. Not `configure`: the
+    # setting is kept on the device, but it is what the operator watching
+    # wants now, not how the robot is set up.
+    "SET_DETECTION": ("drive",),
 }
 
 

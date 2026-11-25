@@ -114,8 +114,12 @@ class TelemetryDecimator:
 
 
 class PerceptionTracker:
-    """A row when a robot's perception status changes: the source state, or a
-    detector's status. fps moves on every message and is not a change."""
+    """A row when a robot's perception status changes: the source state, a
+    detector's status, or (0.0.31) the operator's detection setting --
+    enabled, the selected detectors -- and why nothing runs (off_reason:
+    switched off, or held off by a survey). fps moves on every message and is
+    not a change. A status older than 0.0.31 has none of the three; they read
+    as None and the payload is kept as sent either way."""
 
     def __init__(self, clock: Callable[[], float] = time.time):
         self._clock = clock
@@ -124,8 +128,13 @@ class PerceptionTracker:
 
     def on_status(self, site_id: str, robot_id: str, data: Dict[str, Any]) -> Optional[PerceptionRecord]:
         detectors = [d for d in (data.get("detectors") or []) if isinstance(d, dict)]
+        enabled = data.get("enabled")
+        selected = data.get("selected")
         key = (_str(data.get("source_state")), _str(data.get("camera")),
-               tuple(sorted((str(d.get("detector_id")), str(d.get("status"))) for d in detectors)))
+               tuple(sorted((str(d.get("detector_id")), str(d.get("status"))) for d in detectors)),
+               enabled if isinstance(enabled, bool) else None,
+               tuple(sorted(str(s) for s in selected)) if isinstance(selected, list) else None,
+               _str(data.get("off_reason")))
         with self._lock:
             if self._last.get(robot_id) == key:
                 return None
