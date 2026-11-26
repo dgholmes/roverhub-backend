@@ -238,11 +238,11 @@ def test_an_announcement_with_no_clip_is_refused():
         "record, type or pick a clip in the mission editor")
 
 
-def test_a_leg_with_another_gait_is_refused():
-    mission = route(segments=[Segment(from_waypoint_id="wp-1", to_waypoint_id="wp-2", gait="flying_trot")])
+def test_a_leg_in_the_wheel_gait_is_refused():
+    mission = route(segments=[Segment(from_waypoint_id="wp-1", to_waypoint_id="wp-2", gait="wheel_loco")])
     assert _refusal(mission) == (
-        "the leg into waypoint Lobby uses the flying_trot gait, and routes can only walk for now; "
-        "set its gait back to walk in the mission editor")
+        "the leg into waypoint Lobby uses the wheel_loco gait, which only a wheeled robot has; "
+        "set its gait to walk in the mission editor")
 
 
 def test_a_leg_with_a_posture_is_refused():
@@ -348,19 +348,11 @@ def test_a_held_move_with_no_seconds_is_held_for_five():
     assert steps[2].seconds == 5.0
 
 
-@pytest.mark.parametrize("gait", ["flying_trot", "rl"])
-def test_a_gait_from_the_menu_is_held_then_ended_with_walk(gait):
-    # The legs that follow walk, so the robot must not be left in another gait.
-    steps = compiled(route([wp("wp-1", 0, 0, actions=[_quick(gait, seconds=4)])])).steps
-    assert [(s.kind, getattr(s, "params", getattr(s, "seconds", None))) for s in steps[1:]] == [
-        ("command", {"state": gait}), ("wait", 4), ("command", {"state": "walk"})]
-
-
 def test_every_quad_quick_action_compiles():
     from missions.route_steps import QUICK_ACTIONS
     assert set(QUICK_ACTIONS) == {
         "wave", "gongxi", "dance0", "jump", "backflip", "twirl_jump", "diag_step", "hop_step",
-        "groove", "bounce", "body_wave", "hip_circle", "head_circle", "flying_trot", "rl"}
+        "groove", "bounce", "body_wave", "hip_circle", "head_circle"}
     for state in QUICK_ACTIONS:
         compiled(route([wp("wp-1", 0, 0, actions=[_quick(state)])]))
 
@@ -368,6 +360,8 @@ def test_every_quad_quick_action_compiles():
 @pytest.mark.parametrize("params, move", [
     ({"state": "moonwalk"}, "moonwalk"),
     ({"state": "drift"}, "drift"),               # a wheel mode; routes are quad-only
+    ({"state": "flying_trot"}, "flying_trot"),   # a gait: a leg setting, not a move
+    ({"state": "rl"}, "rl"),
     ({"state": "passive"}, "passive"),           # a state, but never a quick action
     ({"state": "Back Flip"}, "Back Flip"),       # not a well-formed target at all
     ({}, "x"),                                   # no state: named by its label
@@ -385,3 +379,85 @@ def test_a_moves_length_is_in_the_run_cap():
     assert plain == pytest.approx(300 * 1.5)
     assert timed == pytest.approx((300 + 126.5) * 1.5)
     assert held == pytest.approx((300 + 20 + 3) * 1.5)
+
+
+# -- a leg's gait (schema 0.0.35) -------------------------------------------------------
+
+@pytest.mark.parametrize("gait", ["flying_trot", "rl"])
+def test_a_leg_in_a_gait_nav_cannot_walk_yet_is_refused(gait):
+    mission = route(segments=[Segment(from_waypoint_id="wp-1", to_waypoint_id="wp-2", gait=gait)])
+    assert _refusal(mission) == (
+        f"the leg into waypoint Lobby uses the {gait} gait; the robot can only navigate "
+        "while walking for now, so set its gait to walk in the mission editor")
+
+
+@pytest.fixture
+def all_gaits(monkeypatch):
+    """The compiler as it will be once nav walks in every quad gait: ROUTE_GAITS
+    is the one switch, and the gait-change path behind it stays covered."""
+    import missions.route_steps as rs
+    monkeypatch.setattr(rs, "ROUTE_GAITS", rs.QUAD_LEG_GAITS)
+
+def _gait_route(*gaits):
+    """Four waypoints along x; gaits[i] is the leg into waypoint i+2 (None: unset)."""
+    waypoints = [wp(f"wp-{i}", i, 0) for i in range(1, 5)]
+    segments = [Segment(from_waypoint_id=f"wp-{i}", to_waypoint_id=f"wp-{i + 1}", gait=g)
+                for i, g in enumerate(gaits, start=1)]
+    return route(waypoints, segments)
+
+
+def _plan(steps):
+    return [(s.blockId, s.params["state"]) if s.kind == "command" else s.blockId for s in steps]
+
+
+def test_a_route_with_no_gait_sends_no_gait_change():
+    assert all(s.kind == "navigate" for s in compiled(_gait_route(None, None, None)).steps)
+    assert all(s.kind == "navigate" for s in compiled(_gait_route("walk", None, "walk")).steps)
+
+
+def test_a_gait_holds_for_later_legs_until_one_sets_another(all_gaits):
+    steps = compiled(_gait_route("flying_trot", None, "rl")).steps
+    assert _plan(steps) == [
+        "wp:wp-1:go",
+        ("wp:wp-2:gait", "flying_trot"), "wp:wp-2:go",
+        "wp:wp-3:go",                                   # unset: still flying trot
+        ("wp:wp-4:gait", "rl"), "wp:wp-4:go",
+    ]
+    change = steps[1]
+    assert (change.type, change.label) == ("SET_STATE", "WP-2")
+
+
+def test_going_back_to_walk_is_a_change_and_setting_the_same_gait_is_not(all_gaits):
+    steps = compiled(_gait_route("rl", "rl", "walk")).steps
+    assert _plan(steps) == [
+        "wp:wp-1:go",
+        ("wp:wp-2:gait", "rl"), "wp:wp-2:go",
+        "wp:wp-3:go",
+        ("wp:wp-4:gait", "walk"), "wp:wp-4:go",
+    ]
+
+
+def test_the_gait_change_comes_after_the_previous_waypoints_actions(all_gaits):
+    mission = route([wp("wp-1", 0, 0, actions=[{"type": "snapshot", "label": "P"}]), wp("wp-2", 1, 0)],
+                    [Segment(from_waypoint_id="wp-1", to_waypoint_id="wp-2", gait="flying_trot")])
+    assert [s.blockId for s in compiled(mission).steps] == [
+        "wp:wp-1:go", "wp:wp-1:a0", "wp:wp-2:gait", "wp:wp-2:go"]
+
+
+def test_a_legs_speed_cap_still_applies_in_another_gait(all_gaits):
+    mission = route([wp(f"wp-{i}", i, 0) for i in range(1, 5)], [
+        Segment(from_waypoint_id="wp-1", to_waypoint_id="wp-2", gait="flying_trot", speed_mps=0.6)])
+    legs = [s for s in compiled(mission).steps if s.kind == "navigate"]
+    assert [leg.maxSpeedMps for leg in legs] == [None, 0.6, None, None]
+
+
+def test_each_gait_change_adds_its_settle_to_the_run_cap(all_gaits):
+    plain = compiled(_gait_route(None, None, None)).cap_s
+    two = compiled(_gait_route("flying_trot", None, "walk")).cap_s
+    assert two == pytest.approx(plain + 2 * 2.0 * 1.5)
+
+
+def test_the_wheel_gait_is_refused_even_after_another_gait(all_gaits):
+    with pytest.raises(RouteNotRunnable) as caught:
+        compiled(_gait_route("rl", "wheel_loco", None))
+    assert caught.value.message.startswith("the leg into waypoint WP-3 uses the wheel_loco gait")

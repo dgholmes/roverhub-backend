@@ -15,6 +15,9 @@ Design: docs/superpowers/specs/2026-11-11-route-missions-on-nav-design.md.
       a held one, also   -> WaitStep(seconds)                    "wp:<id>:a<k>:hold"
                             CommandStep SET_STATE {state: stop}  "wp:<id>:a<k>:stop"
     segment into a waypoint: speed_mps -> that leg's maxSpeedMps
+                             gait      -> CommandStep SET_STATE {state: gait}
+                                          "wp:<id>:gait", before the leg, when
+                                          it changes the route's gait
 
 Everything the robot cannot do yet is refused with one sentence that names the
 thing and what to do; the console shows it verbatim. Those sentences are the
@@ -102,15 +105,33 @@ QUICK_ACTIONS = {
     "body_wave": QuickMove(8.0),
     "hip_circle": QuickMove(8.0),
     "head_circle": QuickMove(8.0),
-    # Gaits the menu also offers (Flying Trot, RL Gait). The robot stays in a
-    # gait, and a route's legs walk, so each is held and then ended with
-    # `walk`. Not in gestures.ts (the console has no card for them), and that
-    # stop is not verified on hardware.
-    "flying_trot": QuickMove(None, stop="walk"),
-    "rl": QuickMove(None, stop="walk"),
+    # Not here: flying_trot and rl, which the menu also offers. They are gaits
+    # the robot stays in, so on a route they are a leg's gait (Segment.gait,
+    # 0.0.35), not a move (operator's decision, 2026-11-26).
 }
 # How long a held move is held when the action does not say.
 QUICK_HELD_DEFAULT_S = 5.0
+
+# A leg's gait (0.0.35). The route starts in walk; a leg that sets a gait walks
+# in it, and so does every later leg until one sets another. A change is sent
+# as SET_STATE {state: gait} before the leg, as LiveOps' gait control does.
+# wheel_loco is a wheel robot's, and routes are quad-only.
+ROUTE_START_GAIT = "walk"
+# The gaits a route may use right now: walk only. Every other gait is refused
+# (R_GAIT_NOT_YET) rather than sent, because today's bridge would silently walk
+# the leg anyway: nav drives over /joy in walk (nav_supervisor.NAV_GAIT), and
+# may_drive refuses a robot in any other state (joy_driver.JOY_SDK_STATES), so
+# the runner's warm-up retry puts the robot back in walk. Widening this to
+# flying_trot and rl -- the gait-change steps below are already built and
+# tested -- needs nav to drive over gRPC in the leg's gait, as drive_channel
+# does for a manual DRIVE, and that verified on hardware.
+ROUTE_GAITS = frozenset({"walk"})
+# Every gait a leg may name that a route will one day use; the rest
+# (wheel_loco) is never a route's.
+QUAD_LEG_GAITS = frozenset({"walk", "flying_trot", "rl"})
+# What the bridge's SET_STATE waits after a transition to one of these
+# (dobot_adapter DEFAULT_STATE_SETTLE_S; none has its own STATE_SETTLE_S).
+GAIT_CHANGE_S = 2.0
 
 # Mission cameras are front/rear; the bridge's SNAPSHOT names front/back
 # (robot_bridge/snapshots.py CAMERAS).
@@ -151,8 +172,10 @@ R_NO_CLIP = ("the announcement at waypoint {waypoint} has nothing to say yet; "
              "record, type or pick a clip in the mission editor")
 R_QUICK_ACTION = ("the quick action {move} at waypoint {waypoint} is not a move this robot has; "
                   "pick one from the list in the mission editor")
-R_GAIT = ("the leg into waypoint {waypoint} uses the {gait} gait, and routes can only walk for now; "
-          "set its gait back to walk in the mission editor")
+R_GAIT = ("the leg into waypoint {waypoint} uses the {gait} gait, which only a wheeled robot has; "
+          "set its gait to walk in the mission editor")
+R_GAIT_NOT_YET = ("the leg into waypoint {waypoint} uses the {gait} gait; the robot can only navigate "
+                  "while walking for now, so set its gait to walk in the mission editor")
 R_POSTURE = ("the leg into waypoint {waypoint} sets a posture, which routes cannot do yet; "
              "clear it in the mission editor")
 R_WHEEL_LEG = ("the leg into waypoint {waypoint} sets a wheel-leg mode, which routes cannot do yet; "
@@ -296,11 +319,21 @@ def _segment_into(segments: List[Segment], previous: Optional[Waypoint], waypoin
     return None
 
 
+def _leg_gait(segment: Optional[Segment], waypoint: Waypoint, current: str) -> str:
+    """The gait the leg into `waypoint` walks in: its own when set, else the
+    route's current one. Raises RouteNotRunnable for a gait routes cannot use."""
+    if segment is None or segment.gait is None:
+        return current
+    if segment.gait not in QUAD_LEG_GAITS:
+        raise RouteNotRunnable(R_GAIT.format(waypoint=_name(waypoint), gait=segment.gait))
+    if segment.gait not in ROUTE_GAITS:
+        raise RouteNotRunnable(R_GAIT_NOT_YET.format(waypoint=_name(waypoint), gait=segment.gait))
+    return segment.gait
+
+
 def _speed_cap(segment: Optional[Segment], waypoint: Waypoint) -> Optional[float]:
     if segment is None:
         return None
-    if segment.gait not in (None, "walk"):
-        raise RouteNotRunnable(R_GAIT.format(waypoint=_name(waypoint), gait=segment.gait))
     if segment.posture:
         raise RouteNotRunnable(R_POSTURE.format(waypoint=_name(waypoint)))
     if segment.wheel_leg_mode is not None:
@@ -395,6 +428,7 @@ def compile_route(mission: MissionLibraryEntry, site_map: SiteMap, robot_type: O
     steps: List[ProgramStep] = []
     total_s = 0.0
     previous: Optional[Waypoint] = None
+    gait = ROUTE_START_GAIT
     for waypoint in mission.waypoints:
         floor = _floor_for(waypoint, site_map.floors)
         if not _on_grid(waypoint, floor):
@@ -402,7 +436,14 @@ def compile_route(mission: MissionLibraryEntry, site_map: SiteMap, robot_type: O
         refusal = _zone_refusal(waypoint, site_map.zones)
         if refusal is not None:
             raise RouteNotRunnable(refusal)
-        speed = _speed_cap(_segment_into(mission.segments, previous, waypoint), waypoint)
+        segment = _segment_into(mission.segments, previous, waypoint)
+        leg_gait = _leg_gait(segment, waypoint, gait)
+        if leg_gait != gait:
+            steps.append(CommandStep(kind="command", blockId=f"wp:{waypoint.waypoint_id}:gait",
+                                     label=waypoint.label, type="SET_STATE", params={"state": leg_gait}))
+            total_s += GAIT_CHANGE_S
+            gait = leg_gait
+        speed = _speed_cap(segment, waypoint)
         leg_s = _leg_seconds(previous, waypoint)
         steps.append(NavStep(
             kind="navigate", blockId=f"wp:{waypoint.waypoint_id}:go", label=waypoint.label,

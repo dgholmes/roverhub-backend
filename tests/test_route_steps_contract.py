@@ -211,7 +211,6 @@ def _quick_route():
             {"type": "quick_action", "label": "Gongxi", "params": {"state": "gongxi"}},
             {"type": "quick_action", "label": "Wave", "params": {"state": "wave", "seconds": 3}},
             {"type": "quick_action", "label": "Groove", "params": {"state": "groove"}},
-            {"type": "quick_action", "label": "Flying Trot", "params": {"state": "flying_trot"}},
         ]),
         wp("wp-2", 3, 0, "Lobby"),
     ])
@@ -246,7 +245,11 @@ def test_the_bridge_gate_approves_every_quick_action_state_from_the_running_miss
     gate = sm.SafetyManager(config)
     owner = "mission:run-1"
     gate.acquire_control(owner)
-    states = set(QUICK_ACTIONS) | {m.stop for m in QUICK_ACTIONS.values() if m.stop}
+    from missions.route_steps import QUAD_LEG_GAITS
+    # Every move, every held move's stop, and every gait a leg may set (0.0.35),
+    # including those ROUTE_GAITS holds back for now.
+    states = set(QUICK_ACTIONS) | {m.stop for m in QUICK_ACTIONS.values() if m.stop} | set(QUAD_LEG_GAITS)
+    assert {"walk", "flying_trot", "rl"} <= states
     for state in sorted(states):
         verdict = gate.check("SET_STATE", sdk_connected=True, battery_percent=80.0, robot_type="quad",
                              state=state, initiated_by=owner, sdk_state="walk", params={"state": state})
@@ -269,6 +272,37 @@ def test_the_bridge_runs_a_route_with_quick_actions_in_order():
     outcome = asyncio.run(pr.run_program(_quick_steps(), fx, gate))
     assert outcome.result == "completed", outcome
     assert fx.navigated == ["wp-1", "wp-2"]
-    assert sent_params == ["gongxi", "wave", "wave", "groove", "flying_trot", "walk"]
-    # The held moves were held: the wave's 3 s and the gait's default 5 s.
-    assert clock.t >= 3 + 5
+    assert sent_params == ["gongxi", "wave", "wave", "groove"]
+    # The wave was held for its 3 s.
+    assert clock.t >= 3
+
+
+def test_the_bridge_runs_a_route_whose_legs_change_gait_in_order(monkeypatch):
+    import missions.route_steps as rs
+    from shared.schemas.missions import Segment
+    # The steps the compiler will send once ROUTE_GAITS is widened.
+    monkeypatch.setattr(rs, "ROUTE_GAITS", rs.QUAD_LEG_GAITS)
+    pr = _load("program_runner")
+    mission = route([wp("wp-1", 0, 0), wp("wp-2", 1, 0), wp("wp-3", 2, 0), wp("wp-4", 3, 0)], [
+        Segment(from_waypoint_id="wp-1", to_waypoint_id="wp-2", gait="flying_trot"),
+        Segment(from_waypoint_id="wp-3", to_waypoint_id="wp-4", gait="rl"),
+    ])
+    steps = compile_route(mission, site_map(), "quad").steps
+    clock = _Clock()
+    gate = pr.RunGate(clock, sleep=clock.sleep)
+    fx = _Effects(pr, gate)
+    order = []
+    send, navigate = fx.send, fx.navigate
+
+    async def recording_send(step):
+        order.append(step.params.get("state"))
+        return await send(step)
+
+    async def recording_navigate(step):
+        order.append(step.waypointId)
+        return await navigate(step)
+
+    fx.send, fx.navigate = recording_send, recording_navigate
+    outcome = asyncio.run(pr.run_program(steps, fx, gate))
+    assert outcome.result == "completed", outcome
+    assert order == ["wp-1", "flying_trot", "wp-2", "wp-3", "rl", "wp-4"]
