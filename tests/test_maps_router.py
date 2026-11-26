@@ -277,8 +277,9 @@ def test_a_part_that_is_not_a_file_is_a_400(client, tmp_path):
 def test_every_maps_route_has_an_auth_policy_rule(router):
     routes = [(m, r.path) for r in router.routes if isinstance(r, APIRoute) for m in r.methods]
     # 18, plus the map editor's PUT .../moved and POST .../cloud-edits (2026-11-16),
-    # plus the map ready checklist's POST .../trim and PATCH /maps/{id} (0.0.29).
-    assert len(routes) == 22
+    # plus the map ready checklist's POST .../trim and PATCH /maps/{id} (0.0.29),
+    # plus a floor's home, PUT and DELETE .../home (0.0.33).
+    assert len(routes) == 24
     for key in routes:
         assert key in ROUTES, key
 

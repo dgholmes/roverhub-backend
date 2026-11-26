@@ -483,8 +483,9 @@ def test_state_message_stores_nav_goal():
     client.handle_message("roverhub/site-dev/robot-dev-01/state", _state_payload(nav_goal=_NAV_GOAL))
 
     # Stored as the schema dumps it: `stuck` (0.0.27) is None for a goal that
-    # never got stuck, and from a bridge older than 0.0.27.
-    assert registry.get("robot-dev-01").nav_goal == {**_NAV_GOAL, "stuck": None}
+    # never got stuck, and from a bridge older than 0.0.27. `purpose` (0.0.33)
+    # reads "goto" from a bridge that does not send it.
+    assert registry.get("robot-dev-01").nav_goal == {**_NAV_GOAL, "stuck": None, "purpose": "goto"}
 
 
 def test_state_message_keeps_a_stuck_walks_options():

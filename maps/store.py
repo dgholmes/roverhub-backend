@@ -80,7 +80,7 @@ from typing import Callable, Dict, List, Optional, Tuple, get_args
 from pydantic import ValidationError
 
 from shared.schemas.map_hash import MapHashError, content_hash, grid_entry, zone_entries
-from shared.schemas.maps import MapFloor, MapStatus, MapZone, PlanningGrid, SiteMap
+from shared.schemas.maps import MapFloor, MapHome, MapStatus, MapZone, PlanningGrid, SiteMap
 
 logger = logging.getLogger("roverhub.maps")
 
@@ -597,12 +597,16 @@ class MapStore:
                     # original floor name), and PATCH /maps/{id} may have
                     # renamed them since. A floor the map did not have takes
                     # the bundle's label.
-                    labels = {f.index: f.label for f in existing.floors}
+                    # A floor's home (0.0.33) is kept like its zones: work a
+                    # person did, outside the bundle. It may now sit off the new
+                    # survey's walked area; the robot's planner says so if it
+                    # does, and the home can be moved.
+                    kept = {f.index: {"label": f.label, "home": f.home} for f in existing.floors}
                     site_map = site_map.model_copy(update={
                         "created_at": existing.created_at,
                         "zones": existing.zones,
                         "name": existing.name,
-                        "floors": [f.model_copy(update={"label": labels[f.index]}) if f.index in labels else f
+                        "floors": [f.model_copy(update=kept[f.index]) if f.index in kept else f
                                    for f in site_map.floors],
                     })
                 # From the files just copied and the zones just kept; whatever
@@ -1134,6 +1138,37 @@ class MapStore:
             if name is not None:
                 fields["name"] = name
             return fields
+
+        return self._update(map_id, change)
+
+    def set_home(self, map_id: str, floor_index: int, home: Optional[MapHome],
+                 check: Optional[Callable[[MapFloor, Optional[bytes], List[MapZone]], None]] = None) -> SiteMap:
+        """Set (or, `home` None, clear) floor `floor_index`'s home (0.0.33).
+
+        Not a new version and not a drop to draft: home is outside the content
+        hash (RETURN carries the pose, so the robot's map files never change
+        with it), as names are. `check(floor, planning_pgm or None, zones)`
+        runs under the lock on what is stored now, so a planning grid replaced
+        at the same moment cannot slip a home past it; whatever it raises
+        aborts with nothing stored. Raises MapNotFound / FloorNotFound."""
+        directory = self._dir(map_id)
+        if directory is None:
+            raise MapNotFound(map_id)
+
+        def change(current: SiteMap) -> dict:
+            floor = next((f for f in current.floors if f.index == floor_index), None)
+            if floor is None:
+                raise FloorNotFound("map %s has no floor %r" % (map_id, floor_index))
+            if home is not None and check is not None:
+                planning = None
+                if floor.planning is not None:
+                    try:
+                        planning = (directory / ("floor%d" % floor.index) / PLANNING_FILE).read_bytes()
+                    except OSError:
+                        planning = None
+                check(floor, planning, list(current.zones))
+            return {"updated_at": _now(), "floors": [
+                f.model_copy(update={"home": home}) if f.index == floor_index else f for f in current.floors]}
 
         return self._update(map_id, change)
 

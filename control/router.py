@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import datetime, timezone
 
@@ -7,14 +8,14 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import ValidationError
 
 from auth.deps import acting_user_id, principal_of, require_site_capability, site_visible
-from auth.policy import command_capabilities
+from auth.policy import RESUME_ESTOP_CAPABILITIES, command_capabilities
 
 from control.commands import CommandStore
 from realtime.mqtt_client import CommandPublishError, UnknownRobotError
 from realtime.mqtt_client import _parse_version
 from shared.schemas.commands import (
     WIRED_COMMAND_TYPES, Command, CommandRequest, CommandStageEvent, NavGotoParams, NavResolveParams,
-    ResetPositionParams, ResumeParams, SetNavStuckPolicyParams, SetSiteParams, SyncMapParams, UseNavMapParams,
+    ResetPositionParams, ResumeParams, ReturnParams, SetNavStuckPolicyParams, SetSiteParams, SyncMapParams, UseNavMapParams,
     command_ttl_s,
 )
 from shared.schemas.detection import SetDetectionParams
@@ -78,6 +79,14 @@ _MAP_READY_PARAMS = {
 # the bridge writes the setting to a file and perception restarts into it. A
 # bridge older than that refuses the type as unknown.
 DETECTION_SCHEMA_VERSION = "0.0.31"
+
+# Return home (schema 0.0.33): RETURN carries the floor's home pose. A bridge
+# older than that refuses the type as unknown.
+RETURN_SCHEMA_VERSION = "0.0.33"
+# How far a RETURN's pose may sit from the stored home and still be it: the
+# console copies the stored floats, so anything more is a home that moved.
+HOME_MATCH_M = 0.001
+HOME_MATCH_RAD = 0.001
 
 
 def _bad_fields(exc: ValidationError) -> str:
@@ -237,6 +246,60 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
                     detail=(f"update the edge device: it runs schema {robot.schema_version or 'unknown'}, "
                             f"switching AI detection needs {DETECTION_SCHEMA_VERSION}"))
 
+    def _check_return(robot_id: str, params) -> None:
+        """422 / 409 / 404 for a RETURN (0.0.33). Its pose must be the home
+        stored for that floor now, so a console tab holding a home since moved
+        or removed cannot walk the robot to the old spot (409 home_moved /
+        home_missing; the console reloads the map). Whether the robot can get
+        there -- map hash, zones, localisation, a run in progress -- is the
+        bridge's to judge, as for NAV_GOTO."""
+        try:
+            parsed = ReturnParams.model_validate(params or {})
+        except ValidationError as exc:
+            raise HTTPException(status_code=422,
+                                detail=f"RETURN params are not a home to walk to ({_bad_fields(exc)})") from exc
+        robot = registry.get(robot_id) if registry is not None else None
+        if robot is not None:
+            version = _parse_version(robot.schema_version)
+            if version is None or version < _parse_version(RETURN_SCHEMA_VERSION):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"update the edge device: it runs schema {robot.schema_version or 'unknown'}, "
+                            f"returning home needs {RETURN_SCHEMA_VERSION}"))
+        if map_lookup is None:
+            return
+        site_map = _map_at_robot_site(robot, parsed.map_id)
+        # A floor's id on the wire is its index as text (NavGotoParams.floor_id).
+        floor = next((f for f in site_map.floors if str(f.index) == parsed.floor_id), None)
+        if floor is None:
+            raise HTTPException(status_code=404, detail=f"map {parsed.map_id} has no floor {parsed.floor_id}")
+        home = floor.home
+        if home is None:
+            raise HTTPException(status_code=409, detail={
+                "code": "home_missing",
+                "message": f"floor {parsed.floor_id} of map {parsed.map_id} has no home; set one on the map page"})
+        # Headings compared round the circle: pi and -pi are one heading.
+        turn = math.remainder(parsed.yaw_rad - home.yaw_rad, math.tau)
+        if (abs(parsed.x_m - home.x_m) > HOME_MATCH_M or abs(parsed.y_m - home.y_m) > HOME_MATCH_M
+                or abs(turn) > HOME_MATCH_RAD):
+            raise HTTPException(status_code=409, detail={
+                "code": "home_moved",
+                "message": f"home on floor {parsed.floor_id} of map {parsed.map_id} has moved since this page "
+                           "read it; reload the map and press Return home again"})
+
+    def _resume_capabilities(robot_id: str, params) -> tuple:
+        """What a RESUME needs (0.0.33): `drive` when the robot's latest state
+        says this very run is paused by an E-Stop, else RESUME's own
+        (dispatchPatrols). No state, a malformed run_id or any other pause
+        falls back: refuse rather than widen (auth/policy.py)."""
+        record = registry.get(robot_id) if registry is not None else None
+        run = record.active_run if record is not None else None
+        run_id = params.get("run_id") if isinstance(params, dict) else None
+        if (isinstance(run, dict) and isinstance(run_id, str) and run_id and run.get("run_id") == run_id
+                and run.get("status") == "paused" and run.get("paused_for") == "estop"):
+            return RESUME_ESTOP_CAPABILITIES
+        return command_capabilities("RESUME")
+
     def _check_map_ready(http: Request, robot_id: str, command_type: str, params) -> None:
         """422 / 409 / 404 / 403 for a map ready checklist command (0.0.29)
         the robot would refuse anyway, or that names what this caller may not
@@ -340,7 +403,10 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
                 status_code=409, detail=f"use POST /robots/{robot_id}/runs to start a mission")
 
         principal = principal_of(http)
-        needed = command_capabilities(request.type)
+        if request.type == "RESUME":
+            needed = _resume_capabilities(robot_id, request.params)
+        else:
+            needed = command_capabilities(request.type)
         site_id = getattr(http.state, "site_id", None)
         if principal is not None and not any(principal.can(c, site_id) for c in needed):
             raise HTTPException(status_code=403, detail=f"your role does not allow {request.type}")
@@ -376,6 +442,8 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
             _check_map_ready(http, robot_id, request.type, request.params)
         elif request.type == "SET_DETECTION":
             _check_detection(robot_id, request.params)
+        elif request.type == "RETURN":
+            _check_return(robot_id, request.params)
         elif request.type == "RESUME":
             # The run_id is what stops a late Retry restarting some other paused run.
             try:

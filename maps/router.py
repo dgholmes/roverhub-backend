@@ -62,6 +62,15 @@
 - PUT    /maps/{map_id}/zones                   -> SiteMap; body {"zones": [MapZone, ...]}
                                                    replaces the map's zones; 404 if unknown,
                                                    400 if a zone cannot be stored
+- PUT    /maps/{map_id}/floors/{index}/home     -> SiteMap; body {"x_m", "y_m", "yaw_rad"} sets the
+                                                   floor's home (0.0.33) with set_at / set_by
+                                                   from the server. In place: status and
+                                                   content hash kept. 422 {code, message}:
+                                                   `home_not_clear` (off the walked area, no
+                                                   room to turn, in a zone -- maps/home.py) or
+                                                   `home_no_planning_grid`; 404 unknown map or
+                                                   floor
+- DELETE /maps/{map_id}/floors/{index}/home     -> SiteMap without it (none already: the same)
 - PUT    /maps/{map_id}/status                  -> SiteMap; body {"status": "draft" | "active"
                                                    | "archived"}; 400 to activate a map with no
                                                    floors
@@ -163,6 +172,7 @@ import os
 import re
 import shutil
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 import logging
 from typing import Callable, Dict, List, Optional
@@ -176,8 +186,9 @@ from starlette.datastructures import UploadFile
 from api.common import read_bounded_body
 from auth.deps import principal_of, require_site_capability, site_visible
 from history.audit import AuditFn
-from shared.schemas.maps import MapStatus, MapZone, SiteMap
+from shared.schemas.maps import MapHome, MapStatus, MapZone, SiteMap
 
+from .home import HomeRefused, check_home
 from .jobs import JobRunner
 from .quality import is_current, run_quality
 from .store import (
@@ -200,6 +211,8 @@ MAX_UPLOAD_BYTES = 128 * 1024 * 1024
 # The zone list as the console sends it. A zone is a label and a few dozen
 # points, so this is room for hundreds of them.
 MAX_ZONES_BODY_BYTES = 1024 * 1024
+# A home is three numbers.
+MAX_HOME_BODY_BYTES = 4 * 1024
 
 PART_NAME_RE = re.compile(
     r"site_map\.json|floor[0-9]{1,3}/(?:grid\.pgm|grid\.png|cloud\.bin|planning\.pgm|track\.csv"
@@ -235,6 +248,13 @@ class _StatusBody(BaseModel):
     # (the freeze dialog's "Activate anyway"). Without it that is a 409
     # `zones_unreviewed`. Who said so is the signed-in user, never the body.
     zones_reviewed: bool = False
+
+
+class _HomeBody(BaseModel):
+    """PUT .../home: a pose in the map frame. Where it may be is maps/home.py's."""
+    x_m: float = Field(allow_inf_nan=False)
+    y_m: float = Field(allow_inf_nan=False)
+    yaw_rad: float = Field(allow_inf_nan=False)
 
 
 class _FloorLabel(BaseModel):
@@ -508,6 +528,57 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
         saved = _planning(lambda: store.delete_planning(map_id, index))
         _audit("map.planning.delete", saved, map_id, {"floor": index})
         _queue_quality_quietly(saved, request)
+        return saved
+
+    # --- a floor's home (0.0.33, maps/home.py) -----------------------------
+
+    def _home(write):
+        try:
+            return write()
+        except HomeRefused as exc:
+            raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message}) from None
+        except FloorNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        except MapNotFound:
+            raise HTTPException(status_code=404, detail="map not found") from None
+
+    def _check_home(x_m: float, y_m: float):
+        def check(floor, planning, zones) -> None:
+            refusal = check_home(floor, planning, zones, x_m, y_m)
+            if refusal is not None:
+                raise HomeRefused(*refusal)
+        return check
+
+    # In place, like a rename: home is outside the content hash, so an active
+    # map stays active and no robot's copy goes out of date. When and by whom
+    # are the server's, never the body's (extra fields are ignored).
+    # The body is read by hand, as for zones: FastAPI's own 422 echoes the
+    # input, and a NaN in it cannot be written back as JSON (a 500 instead).
+    @router.put("/maps/{map_id}/floors/{index}/home")
+    async def put_home(map_id: str, index: int, request: Request):
+        raw = await read_bounded_body(request, MAX_HOME_BODY_BYTES, "home")
+        try:
+            body = _HomeBody.model_validate(json.loads(raw))
+        except ValidationError as exc:
+            fields = ", ".join(".".join(str(p) for p in e["loc"]) or "body" for e in exc.errors())
+            raise HTTPException(status_code=422,
+                                detail="home must be finite x_m, y_m and yaw_rad (%s)" % fields) from None
+        except ValueError:
+            raise HTTPException(status_code=422, detail='body must be {"x_m", "y_m", "yaw_rad"}') from None
+        home = MapHome(x_m=body.x_m, y_m=body.y_m, yaw_rad=body.yaw_rad,
+                       set_at=datetime.now(timezone.utc).isoformat(), set_by=_requested_by(request))
+        saved = await run_in_threadpool(
+            _home, lambda: store.set_home(map_id, index, home, check=_check_home(body.x_m, body.y_m)))
+        _audit("map.home", saved, map_id,
+               {"floor": index, "x_m": body.x_m, "y_m": body.y_m, "yaw_rad": body.yaw_rad, "cleared": False},
+               request=request)
+        return saved
+
+    # Clearing a floor with no home is not an error: two tabs may both press Remove.
+    @router.delete("/maps/{map_id}/floors/{index}/home")
+    def delete_home(map_id: str, index: int, request: Request):
+        saved = _home(lambda: store.set_home(map_id, index, None))
+        _audit("map.home", saved, map_id, {"floor": index, "cleared": True}, request=request)
         return saved
 
     # --- the map editor: the moved layer and cloud edits (maps/cloud_edit.py) -

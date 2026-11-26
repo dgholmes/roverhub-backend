@@ -65,7 +65,9 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     "SNAPSHOT": ("estop",),
     "START_MISSION": ("dispatchPatrols",),
     # Retry a run the robot paused as blocked (0.0.16): it sets a patrol going
-    # again, so it is the same capability as starting one.
+    # again, so it is the same capability as starting one. Resuming a run an
+    # E-Stop paused (0.0.33) is RESUME_ESTOP_CAPABILITIES instead, decided per
+    # request in control/router.py from the robot's latest state.
     "RESUME": ("dispatchPatrols",),
     # Surveying from the console (schema 0.0.23, shared/schemas/survey.py).
     # A survey ends in a draft map the robot uploads with its own device key
@@ -126,6 +128,16 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
 
 def command_capabilities(command_type: str) -> Tuple[str, ...]:
     return COMMAND_CAPABILITIES.get(command_type, ("drive",))
+
+
+# RESUME for a run an E-Stop paused (0.0.33, the operator's ruling): anyone
+# who may drive, because the person at the console after an E-Stop need not
+# be the one who pressed it, and the pause was a safety stop rather than a
+# patrol decision. Only when the robot's latest /state says that very run is
+# paused for "estop"; with no state, or any other pause, RESUME stays
+# COMMAND_CAPABILITIES' (refuse rather than widen). Mirrored in the console's
+# role check (roverhub-frontend org/roles.ts / commandPolicy).
+RESUME_ESTOP_CAPABILITIES: Tuple[str, ...] = ("drive",)
 
 
 # --- Routes -----------------------------------------------------------------
@@ -260,6 +272,10 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("GET", "/maps/{map_id}/floors/{index}/{kind}"): _READ_OR_OWN_DEVICE,
     ("POST", "/maps"): Rule(capabilities=("configure",)),
     ("PUT", "/maps/{map_id}/zones"): Rule(capabilities=("editZones",)),
+    # A floor's home (0.0.33): where Return home sends the robot, so the same
+    # judgement as where it may walk -- the supervisor's, like zones.
+    ("PUT", "/maps/{map_id}/floors/{index}/home"): Rule(capabilities=("editZones",)),
+    ("DELETE", "/maps/{map_id}/floors/{index}/home"): Rule(capabilities=("editZones",)),
     # A floor's planning grid (the map Nav2 plans on) is read like its survey
     # grid. Removing one is like drawing zones: both say where the robot may
     # walk. The map editor's saves -- the brushed planning grid, the "probably
