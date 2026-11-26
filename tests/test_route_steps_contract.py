@@ -201,3 +201,74 @@ def test_a_robot_on_another_map_ends_the_run_as_nav_unavailable_without_retrying
     assert fx.navigated == ["wp-1"]
     assert fx.blocked == []
     assert (outcome.result, outcome.reason) == ("aborted", "navUnavailable")
+
+
+# -- quick actions (schema 0.0.34) ---------------------------------------------------
+
+def _quick_route():
+    return route([
+        wp("wp-1", 0, 0, "Gate A", actions=[
+            {"type": "quick_action", "label": "Gongxi", "params": {"state": "gongxi"}},
+            {"type": "quick_action", "label": "Wave", "params": {"state": "wave", "seconds": 3}},
+            {"type": "quick_action", "label": "Groove", "params": {"state": "groove"}},
+            {"type": "quick_action", "label": "Flying Trot", "params": {"state": "flying_trot"}},
+        ]),
+        wp("wp-2", 3, 0, "Lobby"),
+    ])
+
+
+def _quick_steps():
+    return compile_route(_quick_route(), site_map(), "quad").steps
+
+
+def test_a_quick_action_is_a_set_state_the_bridge_lets_a_mission_carry():
+    sm = _load("safety_manager")
+    for step in _quick_steps():
+        if isinstance(step, CommandStep):
+            assert step.type == "SET_STATE"
+            assert sm.mission_step_allowed(step.type)
+            assert sm.mission_command_allowed(step.type)
+
+
+def test_the_bridge_gate_approves_every_quick_action_state_from_the_running_mission(tmp_path, monkeypatch):
+    from missions.route_steps import QUICK_ACTIONS
+    monkeypatch.setenv("NAV_MAP_CHOICE_FILE", str(tmp_path / "nav_map.json"))
+    monkeypatch.setenv("SITE_CHOICE_FILE", str(tmp_path / "site.json"))
+    sm = _load("safety_manager")
+    # The very BridgeConfig the gate imports (`robot_bridge/` is on sys.path now).
+    config = sys.modules["config"].BridgeConfig(
+        robot_ip="192.168.5.2:50051", cloud_mqtt_url="mqtt://localhost:1883",
+        bridge_id="bridge-test", site_id="site-a", robot_id="robot-1",
+        telemetry_poll_hz=10, heartbeat_interval_s=5.0,
+        safety_max_speed_ratio=80, safety_min_battery_pct=15.0,
+        stale_telemetry_threshold_s=3.0, cmd_timeout_s=10.0,
+    )
+    gate = sm.SafetyManager(config)
+    owner = "mission:run-1"
+    gate.acquire_control(owner)
+    states = set(QUICK_ACTIONS) | {m.stop for m in QUICK_ACTIONS.values() if m.stop}
+    for state in sorted(states):
+        verdict = gate.check("SET_STATE", sdk_connected=True, battery_percent=80.0, robot_type="quad",
+                             state=state, initiated_by=owner, sdk_state="walk", params={"state": state})
+        assert verdict.approved, (state, verdict.rejection_code)
+
+
+def test_the_bridge_runs_a_route_with_quick_actions_in_order():
+    pr = _load("program_runner")
+    clock = _Clock()
+    gate = pr.RunGate(clock, sleep=clock.sleep)
+    fx = _Effects(pr, gate)
+    sent_params = []
+    send = fx.send
+
+    async def recording_send(step):
+        sent_params.append(step.params.get("state"))
+        return await send(step)
+
+    fx.send = recording_send
+    outcome = asyncio.run(pr.run_program(_quick_steps(), fx, gate))
+    assert outcome.result == "completed", outcome
+    assert fx.navigated == ["wp-1", "wp-2"]
+    assert sent_params == ["gongxi", "wave", "wave", "groove", "flying_trot", "walk"]
+    # The held moves were held: the wave's 3 s and the gait's default 5 s.
+    assert clock.t >= 3 + 5

@@ -301,3 +301,87 @@ def test_a_leg_carries_the_floors_content_hash():
     assert {s.goal.map_hash for s in steps if isinstance(s, NavStep)} == {"c" * 64}
     # A map stored before 0.0.20 sends none, which the bridge accepts with a warning.
     assert {s.goal.map_hash for s in compiled().steps if isinstance(s, NavStep)} == {None}
+
+
+# -- quick actions (schema 0.0.34) ----------------------------------------------------
+
+def _quick(state, label="Move", **params):
+    return {"type": "quick_action", "label": label, "params": {"state": state, **params}}
+
+
+def test_a_quick_action_runs_in_order_with_the_waypoints_other_actions():
+    mission = route([wp("wp-1", 0, 0, "Gate A", actions=[
+        {"type": "snapshot", "label": "Photo"},
+        _quick("gongxi", "Gongxi"),
+        {"type": "wait", "label": "Hold", "params": {"seconds": 3}},
+    ])])
+    steps = compiled(mission).steps
+    assert [(s.kind, s.blockId) for s in steps] == [
+        ("navigate", "wp:wp-1:go"),
+        ("command", "wp:wp-1:a0"),
+        ("command", "wp:wp-1:a1"),
+        ("wait", "wp:wp-1:a2"),
+    ]
+    move = steps[2]
+    # The very command LiveOps' Quick actions menu sends: SET_STATE {state}.
+    assert (move.type, move.params, move.label) == ("SET_STATE", {"state": "gongxi"}, "Gongxi")
+    wire = [s.model_dump(by_alias=True) for s in steps]
+    assert STEPS.validate_python(wire) == steps
+
+
+def test_a_timed_move_is_one_command_and_ignores_seconds():
+    steps = compiled(route([wp("wp-1", 0, 0, actions=[_quick("backflip", seconds=30)])])).steps
+    assert [(s.kind, getattr(s, "params", None)) for s in steps[1:]] == [("command", {"state": "backflip"})]
+
+
+def test_a_held_move_is_held_then_stopped_by_sending_it_again():
+    steps = compiled(route([wp("wp-1", 0, 0, actions=[_quick("wave", "Wave", seconds=12)])])).steps
+    go, start, hold, stop = steps
+    assert (start.blockId, start.type, start.params) == ("wp:wp-1:a0", "SET_STATE", {"state": "wave"})
+    assert (hold.kind, hold.blockId, hold.seconds) == ("wait", "wp:wp-1:a0:hold", 12)
+    assert (stop.blockId, stop.type, stop.params, stop.label) == (
+        "wp:wp-1:a0:stop", "SET_STATE", {"state": "wave"}, "Wave")
+
+
+def test_a_held_move_with_no_seconds_is_held_for_five():
+    steps = compiled(route([wp("wp-1", 0, 0, actions=[_quick("wave")])])).steps
+    assert steps[2].seconds == 5.0
+
+
+@pytest.mark.parametrize("gait", ["flying_trot", "rl"])
+def test_a_gait_from_the_menu_is_held_then_ended_with_walk(gait):
+    # The legs that follow walk, so the robot must not be left in another gait.
+    steps = compiled(route([wp("wp-1", 0, 0, actions=[_quick(gait, seconds=4)])])).steps
+    assert [(s.kind, getattr(s, "params", getattr(s, "seconds", None))) for s in steps[1:]] == [
+        ("command", {"state": gait}), ("wait", 4), ("command", {"state": "walk"})]
+
+
+def test_every_quad_quick_action_compiles():
+    from missions.route_steps import QUICK_ACTIONS
+    assert set(QUICK_ACTIONS) == {
+        "wave", "gongxi", "dance0", "jump", "backflip", "twirl_jump", "diag_step", "hop_step",
+        "groove", "bounce", "body_wave", "hip_circle", "head_circle", "flying_trot", "rl"}
+    for state in QUICK_ACTIONS:
+        compiled(route([wp("wp-1", 0, 0, actions=[_quick(state)])]))
+
+
+@pytest.mark.parametrize("params, move", [
+    ({"state": "moonwalk"}, "moonwalk"),
+    ({"state": "drift"}, "drift"),               # a wheel mode; routes are quad-only
+    ({"state": "passive"}, "passive"),           # a state, but never a quick action
+    ({"state": "Back Flip"}, "Back Flip"),       # not a well-formed target at all
+    ({}, "x"),                                   # no state: named by its label
+])
+def test_a_quick_action_the_table_does_not_know_is_refused(params, move):
+    assert _refusal(_with_action("quick_action", params)) == (
+        f"the quick action {move} at waypoint Gate A is not a move this robot has; "
+        "pick one from the list in the mission editor")
+
+
+def test_a_moves_length_is_in_the_run_cap():
+    plain = compiled(route([wp("wp-1", 0, 0)])).cap_s
+    timed = compiled(route([wp("wp-1", 0, 0, actions=[_quick("dance0")])])).cap_s
+    held = compiled(route([wp("wp-1", 0, 0, actions=[_quick("wave", seconds=20), _quick("jump")])])).cap_s
+    assert plain == pytest.approx(300 * 1.5)
+    assert timed == pytest.approx((300 + 126.5) * 1.5)
+    assert held == pytest.approx((300 + 20 + 3) * 1.5)

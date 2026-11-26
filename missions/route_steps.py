@@ -11,6 +11,9 @@ Design: docs/superpowers/specs/2026-11-11-route-missions-on-nav-design.md.
     snapshot             -> CommandStep SNAPSHOT {camera}        "wp:<id>:a<k>"
     voice_prompt         -> CommandStep SPEAK {clip_id, volume}  "wp:<id>:a<k>"
     wait                 -> WaitStep(seconds)                    "wp:<id>:a<k>"
+    quick_action         -> CommandStep SET_STATE {state}        "wp:<id>:a<k>"
+      a held one, also   -> WaitStep(seconds)                    "wp:<id>:a<k>:hold"
+                            CommandStep SET_STATE {state: stop}  "wp:<id>:a<k>:stop"
     segment into a waypoint: speed_mps -> that leg's maxSpeedMps
 
 Everything the robot cannot do yet is refused with one sentence that names the
@@ -31,11 +34,14 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional
 
+from pydantic import ValidationError
+
 from shared.schemas.commands import NavGotoParams
 from shared.schemas.maps import MapFloor, MapZone, SiteMap
 from shared.schemas.missions import (
     NAV_MIN_TOLERANCE_M, AnnouncementParams, CommandStep, MissionLibraryEntry, NavStep,
-    ProgramStep, Segment, SnapshotParams, WaitParams, WaitStep, Waypoint,
+    ProgramStep, QuickActionParams, Segment, SnapshotParams, WaitParams, WaitStep, Waypoint,
+    WaypointAction,
 )
 
 # The bridge's NAV_ZONE_MARGIN_M default (robot_bridge/nav_zones.py, config.py):
@@ -58,6 +64,53 @@ RUN_CAP_FACTOR = 1.5
 # What an action is allowed for in that sum. A clip's length is not known here.
 SNAPSHOT_S = 5.0
 SPEAK_S = 30.0
+
+
+@dataclass(frozen=True)
+class QuickMove:
+    """One of LiveOps' Quick actions, as a route performs it (schema 0.0.34).
+
+    `seconds` is a timed move's own length; None for a held move, which runs
+    until `stop` is sent (the action's `seconds` later, QUICK_HELD_DEFAULT_S
+    when it gives none). A timed move needs no stop: the bridge's SET_STATE
+    waits it out (dobot_adapter STATE_SETTLE_S / ATOMIC_ACTION_SETTLE_S), and
+    the robot walks again by itself."""
+    seconds: Optional[float]
+    stop: Optional[str] = None
+
+
+# The quad's Quick actions: the SET_STATE targets LiveOps' Quick actions menu
+# sends (roverhub-frontend/src/liveops/postureModel.ts GESTURE_IDS, sent by
+# useLiveOpsStore.startGesture as {state: id}), with the lengths of
+# roverhub-frontend/src/liveops/gestures.ts GESTURES. Keep the three equal.
+# The vendored SDK's lengths; none is reported by the robot, so each is an
+# estimate. Routes are quad-only, so the wheel modes (drift, climb, handstand)
+# are not here.
+QUICK_ACTIONS = {
+    # Held: waves until `wave` is sent again (verified on rover-pi 2026-10-29).
+    "wave": QuickMove(None, stop="wave"),
+    "gongxi": QuickMove(11.5),
+    "dance0": QuickMove(126.5),
+    "jump": QuickMove(3.0),
+    "backflip": QuickMove(2.0),
+    # SDK v1.3.0 choreography (atomic actions, not states).
+    "twirl_jump": QuickMove(0.7),
+    "diag_step": QuickMove(5.9),
+    "hop_step": QuickMove(3.0),
+    "groove": QuickMove(8.0),
+    "bounce": QuickMove(6.0),
+    "body_wave": QuickMove(8.0),
+    "hip_circle": QuickMove(8.0),
+    "head_circle": QuickMove(8.0),
+    # Gaits the menu also offers (Flying Trot, RL Gait). The robot stays in a
+    # gait, and a route's legs walk, so each is held and then ended with
+    # `walk`. Not in gestures.ts (the console has no card for them), and that
+    # stop is not verified on hardware.
+    "flying_trot": QuickMove(None, stop="walk"),
+    "rl": QuickMove(None, stop="walk"),
+}
+# How long a held move is held when the action does not say.
+QUICK_HELD_DEFAULT_S = 5.0
 
 # Mission cameras are front/rear; the bridge's SNAPSHOT names front/back
 # (robot_bridge/snapshots.py CAMERAS).
@@ -96,6 +149,8 @@ R_ACTION = ("the {action} action at waypoint {waypoint} cannot run on the robot 
             "remove it from the route to run this mission")
 R_NO_CLIP = ("the announcement at waypoint {waypoint} has nothing to say yet; "
              "record, type or pick a clip in the mission editor")
+R_QUICK_ACTION = ("the quick action {move} at waypoint {waypoint} is not a move this robot has; "
+                  "pick one from the list in the mission editor")
 R_GAIT = ("the leg into waypoint {waypoint} uses the {gait} gait, and routes can only walk for now; "
           "set its gait back to walk in the mission editor")
 R_POSTURE = ("the leg into waypoint {waypoint} sets a posture, which routes cannot do yet; "
@@ -258,6 +313,31 @@ def _speed_cap(segment: Optional[Segment], waypoint: Waypoint) -> Optional[float
     return min(speed, MAX_SPEED_MPS)
 
 
+def _quick_action(waypoint: Waypoint, action: WaypointAction, block_id: str) -> tuple[List[ProgramStep], float]:
+    """One Quick action (0.0.34): SET_STATE {state}, the way LiveOps' menu sends
+    it, and for a held move a hold then the state that stops it. Refused when
+    the state is not one the table knows, so a typo never reaches the robot."""
+    try:
+        params = action.typed_params()
+    except ValidationError:
+        params = None
+    move = QUICK_ACTIONS.get(params.state) if isinstance(params, QuickActionParams) else None
+    if move is None:
+        raw = action.params.get("state")
+        name = raw.strip() if isinstance(raw, str) and raw.strip() else (action.label.strip() or "?")
+        raise RouteNotRunnable(R_QUICK_ACTION.format(move=name, waypoint=_name(waypoint)))
+    assert isinstance(params, QuickActionParams)
+    steps: List[ProgramStep] = [CommandStep(kind="command", blockId=block_id, label=action.label,
+                                            type="SET_STATE", params={"state": params.state})]
+    if move.seconds is not None:
+        return steps, move.seconds
+    held_s = params.seconds if params.seconds is not None else QUICK_HELD_DEFAULT_S
+    steps.append(WaitStep(kind="wait", blockId=f"{block_id}:hold", label=action.label, seconds=held_s))
+    steps.append(CommandStep(kind="command", blockId=f"{block_id}:stop", label=action.label,
+                             type="SET_STATE", params={"state": move.stop}))
+    return steps, held_s
+
+
 def _actions(waypoint: Waypoint) -> tuple[List[ProgramStep], float]:
     steps: List[ProgramStep] = []
     seconds = 0.0
@@ -282,6 +362,10 @@ def _actions(waypoint: Waypoint) -> tuple[List[ProgramStep], float]:
             assert isinstance(params, WaitParams)
             steps.append(WaitStep(kind="wait", blockId=block_id, label=action.label, seconds=params.seconds))
             seconds += params.seconds
+        elif action.type == "quick_action":
+            move_steps, move_s = _quick_action(waypoint, action, block_id)
+            steps.extend(move_steps)
+            seconds += move_s
         else:
             name = ACTION_NAMES.get(action.type, action.type)
             raise RouteNotRunnable(R_ACTION.format(action=name, waypoint=_name(waypoint)))
