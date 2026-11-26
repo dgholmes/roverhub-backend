@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from dataclasses import dataclass, field
@@ -39,6 +40,8 @@ AcceptanceMode = Literal["auto", "manual"]
 #   operator -- set via POST /robots/{id}/accept or /reject
 #   None     -- pending, nobody has decided yet
 AcceptanceSource = Literal["auto", "config", "operator"]
+
+logger = logging.getLogger("roverhub.robots")
 
 
 def _now() -> datetime:
@@ -130,6 +133,7 @@ class RobotRegistry:
         preaccepted: Iterable[str] = (),
         clock: Callable[[], datetime] = _now,
         offline_after_s: Optional[float] = DEFAULT_OFFLINE_AFTER_S,
+        on_site: Optional[Callable[[str], object]] = None,
     ):
         if acceptance_mode not in ("auto", "manual"):
             raise ValueError(f"acceptance_mode must be 'auto' or 'manual', not {acceptance_mode!r}")
@@ -147,6 +151,12 @@ class RobotRegistry:
         )
         # paho's network thread writes; FastAPI's threadpool reads and decides.
         self._lock = threading.RLock()
+        # Told the site of a robot that registers for the first time or at
+        # another site than before (api/app.py: the site store's `ensure`, so a
+        # site nobody has made gets a record, 2026-11-26). Called after the
+        # registry is updated, outside its lock; what it raises is logged and
+        # never costs the registration. Settable, for a store built later.
+        self.on_site = on_site
 
     @property
     def acceptance_mode(self) -> AcceptanceMode:
@@ -159,7 +169,21 @@ class RobotRegistry:
             return "accepted", "auto"
         return "pending", None
 
-    def upsert_from_registration(
+    def upsert_from_registration(self, robot_id: str, site_id: str, robot_type: str, *args, **fields) -> None:
+        """A bridge registration (realtime/mqtt_client.py); `args` and
+        `fields` are `_upsert`'s. Then, for a robot new to the registry or at
+        another site than before, `on_site(site_id)`."""
+        with self._lock:
+            existing = self._robots.get(robot_id)
+            new_site = existing is None or existing.site_id != site_id
+            self._upsert(robot_id, site_id, robot_type, *args, **fields)
+        if new_site and self.on_site is not None:
+            try:
+                self.on_site(site_id)
+            except Exception:
+                logger.exception("could not note site %r of robot %s", site_id, robot_id)
+
+    def _upsert(
         self,
         robot_id: str,
         site_id: str,

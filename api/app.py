@@ -36,6 +36,8 @@ from runs.reaper import RunReaper
 from runs.reconcile import make_state_hook
 from runs.router import build_runs_router
 from runs.store import DEFAULT_RUNS_DIR
+from sites.router import build_sites_router
+from sites.store import DEFAULT_SITES_DIR, SiteStore
 from surveys.router import build_surveys_router
 from surveys.store import DEFAULT_SURVEYS_DIR
 from tasks.router import build_tasks_router
@@ -49,6 +51,10 @@ logger = logging.getLogger("roverhub.tasks")
 
 load_dotenv()  # loads .env in the working directory, if present; real env vars still win
 
+# Sites (2026-11-26): one JSON record per site (sites/). Built first, because the
+# robot registry below makes a record for a site the first time a robot
+# registers at it (`_note_robot_site`).
+site_store = SiteStore(os.environ.get("SITES_DIR", DEFAULT_SITES_DIR))
 # Device acceptance is informational and defaults to "auto" -- every bridge
 # that registers is accepted, as before. See robots/registry.py for why it is
 # not (and cannot yet be) a gate. DEVICE_ACCEPTANCE=manual makes unknown
@@ -59,6 +65,8 @@ registry = RobotRegistry(
     # A robot unheard from for ROBOT_OFFLINE_AFTER_S (default 15 s, three
     # heartbeats) reads as offline; dispatch and the scheduler refuse it.
     offline_after_s=offline_after_s_from_env(),
+    # Late-bound: it writes to the audit log, which is built below.
+    on_site=lambda site_id: _note_robot_site(site_id),
 )
 command_store = CommandStore()
 # The backend's memory (history/): incidents, decimated telemetry, perception
@@ -68,6 +76,20 @@ command_store = CommandStore()
 history = History.from_env()
 _reconcile_hook = None  # bound below, once the run and task stores exist
 orphan_settler = None  # bound below, once the run and task stores exist
+
+
+def _note_robot_site(site_id: str) -> None:
+    """A robot registered at `site_id` for the first time (or moved there).
+    Robots register over MQTT after startup, so the startup backfill cannot
+    know their sites: a site with no record gets one here, named after its ID,
+    for an admin to rename. On paho's thread; the registry logs a failure."""
+    made = site_store.ensure(site_id)
+    if made is not None:
+        logger.warning("a robot registered at site %s, which had no record: made one (name %r, timezone %s)",
+                       site_id, made.name, made.timezone)
+        history.audit.record("site.create", site_id, "ok",
+                             {"name": made.name, "timezone": made.timezone, "from": "robot registration"},
+                             site_id=site_id)
 
 
 def _on_state(robot_id, previous_boot_id, boot_id):
@@ -135,6 +157,8 @@ def _resolve_site(params):
     """The (site_id, robot_id) a request's path refers to, for role checks.
     Bound late: the stores it reads are built further down this module."""
     try:
+        if "site_id" in params:  # /sites/{site_id}
+            return params["site_id"], None
         if "robot_id" in params:
             return _robot_site(params["robot_id"]), params["robot_id"]
         if "clip_id" in params:
@@ -200,9 +224,17 @@ site_moves = SiteMoves(site_of=lambda robot_id: _site_for(robot_id))
 app.include_router(build_mqtt_hooks_router(auth, site_of=lambda robot_id: _site_for(robot_id),
                                            moving_to=site_moves.target))
 def _site_known(site_id: str) -> bool:
-    """Whether a SET_SITE names a site this backend knows. There is no site
-    store (OD-8): a site exists here once a robot registers at it, a map is
-    kept for it, or someone has a role there (a '*' role names no site)."""
+    """Whether a SET_SITE names a site this backend knows: one with a record
+    in the site store (sites/, 2026-11-26) first. Then, as before there was a
+    store, a site a robot registers at, a map is kept for, or someone holds a
+    role at (a '*' role names no site) -- the startup backfill gives those a
+    record too, but one that appeared since (a role granted, a map uploaded)
+    may not have one yet."""
+    try:
+        if site_store.get(site_id) is not None:
+            return True
+    except Exception:
+        logger.exception("could not read site %s from the site store", site_id)
     if any(r.site_id == site_id for r in registry.list_all()):
         return True
     if any(site_id in u.site_roles for u in auth.users.list()):
@@ -250,6 +282,56 @@ maps_router = build_maps_router(
     robot_site_of=_site_for,
 )
 app.include_router(maps_router)
+
+
+def _site_in_use(site_id: str) -> list:
+    """Why site `site_id` cannot be deleted, one clause per kind of thing that
+    still names it; empty when nothing does. Robots and maps (the spec's
+    rule), and people's roles: a role names the site, so the startup backfill
+    would make it again on the next start, and the site would look undeleted."""
+    reasons = []
+    robots = sorted(r.robot_id for r in registry.list_all() if r.site_id == site_id)
+    if robots:
+        reasons.append(("robot " if len(robots) == 1 else "robots ") + ", ".join(robots)
+                       + (" is" if len(robots) == 1 else " are") + " registered there (move or remove them first)")
+    maps = [m for m in maps_router.store.list() if m.site_id == site_id]
+    if maps:
+        names = ", ".join(f"{m.name} ({m.map_id})" if m.name and m.name != m.map_id else m.map_id for m in maps)
+        reasons.append(("map " if len(maps) == 1 else "maps ") + names
+                       + (" belongs" if len(maps) == 1 else " belong") + " to it (delete them first)")
+    people = sorted(u.username for u in auth.users.list() if site_id in u.site_roles)
+    if people:
+        reasons.append(("person " if len(people) == 1 else "people ") + ", ".join(people)
+                       + (" holds" if len(people) == 1 else " hold") + " a role there (remove it on the Team page first)")
+    return reasons
+
+
+# Sites: GET for anyone signed in (what they may see), changes for org admins
+# (auth/policy.py). After the maps router, whose store says which maps a site has.
+app.include_router(build_sites_router(site_store, in_use=_site_in_use, audit=history.audit.record))
+
+
+def known_site_ids() -> list:
+    """Every site ID the backend knows of without a site record: robots
+    registered since start, maps, and people's roles ('*' names no site)."""
+    ids = [r.site_id for r in registry.list_all()]
+    ids += [m.site_id for m in maps_router.store.list()]
+    ids += [site for u in auth.users.list() for site in u.site_roles if site != "*"]
+    return ids
+
+
+def backfill_sites() -> list:
+    """Startup: a record for each known site ID that has none (name = the ID,
+    timezone UTC), so every site that worked before the store existed is still
+    a site, and an admin renames it. Returns what it made."""
+    made = site_store.backfill(known_site_ids())
+    for site in made:
+        logger.warning("site %s had no record: made one (name %r, timezone %s); rename it in "
+                       "Organization > Sites", site.site_id, site.name, site.timezone)
+        history.audit.record("site.create", site.site_id, "ok",
+                             {"name": site.name, "timezone": site.timezone, "from": "startup backfill"},
+                             site_id=site.site_id)
+    return made
 _tasks_dir = os.environ.get("TASKS_DIR", DEFAULT_TASKS_DIR)
 # Missions authored in the console, stored as one JSON file each so they
 # survive a refresh and are shared between browsers. See missions/router.py.
@@ -464,6 +546,13 @@ async def _on_startup() -> None:
     except Exception:
         # A bad record must not keep the backend (and E-Stop) from starting.
         logger.exception("could not settle what the previous process left in flight")
+    # Before MQTT, so a site named by a map or a role has its record before
+    # robots start registering. File I/O, so on a worker thread; a failure is
+    # logged, never a backend that does not start.
+    try:
+        await asyncio.to_thread(backfill_sites)
+    except Exception:
+        logger.exception("could not backfill site records")
     history.start()
     mqtt_client.connect()
     app.state.run_watch_task = asyncio.create_task(_run_watchdog())

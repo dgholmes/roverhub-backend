@@ -192,6 +192,18 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("POST", "/users/{user_id}/password"): Rule(org_admin=True),
     ("POST", "/users/{user_id}/sign-out"): Rule(org_admin=True),
 
+    # Sites (sites/, 2026-11-26). Anyone signed in may list and read sites;
+    # the handler shows each person only the sites they may see (every site
+    # for org owners and admins, else where they hold a role -- sites/router.py
+    # `may_see_site`) and answers 404 for any other. Making, editing and
+    # deleting a site is organisation management, like users: org owners and
+    # admins only (the operator's call, recorded in the design spec).
+    ("GET", "/sites"): Rule(signed_in=True),
+    ("GET", "/sites/{site_id}"): Rule(signed_in=True),
+    ("POST", "/sites"): Rule(org_admin=True),
+    ("PATCH", "/sites/{site_id}"): Rule(org_admin=True),
+    ("DELETE", "/sites/{site_id}"): Rule(org_admin=True),
+
     # Robots
     ("GET", "/robots"): _READ,
     ("GET", "/robots/pending"): _READ,

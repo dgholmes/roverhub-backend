@@ -21,7 +21,7 @@ atexit.register(shutil.rmtree, _DATA, ignore_errors=True)
 # anything imports it. The per-test fixture below narrows it further.
 for _name in (
     "RUNS_DIR", "TASKS_DIR", "MISSIONS_DIR", "MAPS_DIR", "SNAPSHOTS_DIR",
-    "AUDIO_CLIPS_DIR", "TTS_CACHE_DIR",
+    "AUDIO_CLIPS_DIR", "TTS_CACHE_DIR", "SITES_DIR",
 ):
     os.environ[_name] = os.path.join(_DATA, _name.lower())
 os.environ["USERS_FILE"] = os.path.join(_DATA, "users.json")
