@@ -35,6 +35,16 @@ FINAL_STAGES = frozenset({"execution_completed", "execution_failed", "timed_out"
 # How many published commands are remembered until their final ack.
 MAX_PENDING = 4096
 
+# Commands that also get a row of their own, named for what they do, beside
+# command.publish: so "who made the robot greet / turned Greeter mode on" is
+# one filter on `action`, not a search through command.publish params
+# (docs/superpowers/specs/2026-11-26-greet-and-greeter-mode-design.md, 0.0.36).
+# The named row carries the same outcome (sent / not_sent) and the params.
+NAMED_COMMAND_ACTIONS: Dict[str, str] = {
+    "GREET": "greet",
+    "SET_GREETER": "greeter.set",
+}
+
 
 def bind_actor(actor: Optional[str]) -> Token:
     return _ACTOR.set(actor)
@@ -83,6 +93,11 @@ class AuditRecorder:
                     self._pending.popitem(last=False)
         self.record("command.publish", robot_id, "not_sent" if error else "sent", detail,
                     actor=actor, site_id=site_id, robot_id=robot_id)
+        named = NAMED_COMMAND_ACTIONS.get(command.type)
+        if named is not None:
+            self.record(named, robot_id, "not_sent" if error else "sent",
+                        {"command_id": command.command_id, "params": command.params},
+                        actor=actor, site_id=site_id, robot_id=robot_id)
 
     def command_acked(self, command) -> None:
         if command.current_stage not in FINAL_STAGES:

@@ -123,6 +123,14 @@ COMMAND_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
     # setting is kept on the device, but it is what the operator watching
     # wants now, not how the robot is set up.
     "SET_DETECTION": ("drive",),
+    # The Greet button and Greeter mode (schema 0.0.36). GREET waves, speaks
+    # and may dance in place, now, with the operator watching: like a gesture,
+    # the `drive` default, listed so the choice is visible. SET_GREETER turns
+    # on an autonomous behaviour near people -- the robot greets by itself
+    # with nobody pressing anything -- which is a supervisor's call, as
+    # starting a patrol is.
+    "GREET": ("drive",),
+    "SET_GREETER": ("dispatchPatrols",),
 }
 
 

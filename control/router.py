@@ -19,6 +19,7 @@ from shared.schemas.commands import (
     command_ttl_s,
 )
 from shared.schemas.detection import SetDetectionParams
+from shared.schemas.greeter import GreetParams, SetGreeterParams
 from shared.schemas.sensors import SetCalibrationModeParams, SetLidarMountParams
 from shared.schemas.survey import (
     FindMovingParams, ReprocessSurveyParams, SetSurveyKeepParams, StartSurveyParams, StopSurveyParams,
@@ -79,6 +80,15 @@ _MAP_READY_PARAMS = {
 # the bridge writes the setting to a file and perception restarts into it. A
 # bridge older than that refuses the type as unknown.
 DETECTION_SCHEMA_VERSION = "0.0.31"
+
+# The Greet button and Greeter mode (schema 0.0.36). A bridge older than that
+# refuses both as unknown. Per type: its params, what they are in the 422's
+# words, and what needs the version in the 409's.
+GREETER_SCHEMA_VERSION = "0.0.36"
+_GREETER_PARAMS = {
+    "GREET": (GreetParams, "a greeting", "greeting"),
+    "SET_GREETER": (SetGreeterParams, "a Greeter setting", "Greeter mode"),
+}
 
 # Return home (schema 0.0.33): RETURN carries the floor's home pose. A bridge
 # older than that refuses the type as unknown.
@@ -245,6 +255,26 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
                     status_code=409,
                     detail=(f"update the edge device: it runs schema {robot.schema_version or 'unknown'}, "
                             f"switching AI detection needs {DETECTION_SCHEMA_VERSION}"))
+
+    def _check_greeter(robot_id: str, command_type: str, params) -> None:
+        """422 / 409 for a GREET or SET_GREETER the robot would refuse anyway.
+        Whether the robot may greet now (standing, no run, battery, control)
+        is the bridge's to say: it is the safety authority."""
+        model, noun, what = _GREETER_PARAMS[command_type]
+        try:
+            model.model_validate(params or {})
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{command_type} params are not {noun} ({_bad_fields(exc)})") from exc
+        robot = registry.get(robot_id) if registry is not None else None
+        if robot is not None:
+            version = _parse_version(robot.schema_version)
+            if version is None or version < _parse_version(GREETER_SCHEMA_VERSION):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"update the edge device: it runs schema {robot.schema_version or 'unknown'}, "
+                            f"{what} needs {GREETER_SCHEMA_VERSION}"))
 
     def _check_return(robot_id: str, params) -> None:
         """422 / 409 / 404 for a RETURN (0.0.33). Its pose must be the home
@@ -442,6 +472,8 @@ def build_router(command_store: CommandStore, mqtt_client, registry=None, map_lo
             _check_map_ready(http, robot_id, request.type, request.params)
         elif request.type == "SET_DETECTION":
             _check_detection(robot_id, request.params)
+        elif request.type in _GREETER_PARAMS:
+            _check_greeter(robot_id, request.type, request.params)
         elif request.type == "RETURN":
             _check_return(robot_id, request.params)
         elif request.type == "RESUME":
