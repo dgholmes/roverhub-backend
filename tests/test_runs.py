@@ -304,3 +304,19 @@ def test_the_run_ended_hook_never_moves_a_settled_occurrence(tmp_path, status):
 
     occ = tasks.get_occurrence(RID)
     assert (occ.status, occ.message) == (status, "first")
+
+
+def test_list_counts_a_missions_snapshot_photos_not_only_files_in_the_run_folder(tmp_path):
+    """A Snapshot step's picture lives in the shared snapshot store and is only
+    named in the run's events; the run list showed 0 photos for such runs."""
+    client = _client(tmp_path)
+    rid = "20261016-060000-m-1-rvr-01"
+    assert client.put(f"/runs/{rid}", json=_run()).status_code == 200
+    events = [_event(1, "step_done"), _event(2, "step_done"), _event(3, "step_done"), _event(4, "step_done")]
+    events[0]["snapshot_id"] = "rvr-01-a.jpg"
+    events[1]["snapshot_id"] = "rvr-01-b.jpg"
+    events[2]["snapshot_id"] = "rvr-01-b.jpg"  # the same picture twice counts once
+    assert client.post(f"/runs/{rid}/events", json={"events": events}).status_code in (200, 201, 204)
+    item = client.get("/runs").json()["items"][0]
+    assert item["photo_count"] == 2
+    assert item["video_count"] == 0 and item["detection_count"] == 0

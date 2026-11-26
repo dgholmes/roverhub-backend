@@ -34,7 +34,13 @@ class EventBatch(BaseModel):
 def _summary(store: RunStore, run: MissionRun) -> dict:
     files = store.files(run.run_id)
     count = lambda prefix: sum(1 for f in files if f["path"].startswith(prefix))  # noqa: E731
-    return {**run.model_dump(mode="json"), "photo_count": count("photos/"),
+    # A mission's Snapshot steps save their picture in the shared snapshot store
+    # and name it in the run's events (`snapshot_id`); nothing is copied into
+    # the run's own photos/ folder. Counting only that folder showed 0 photos
+    # for runs that took several (operator, 2026-11-26). A picture is counted
+    # once, whether it is a file in the folder or an event's snapshot.
+    snapshots = {e.snapshot_id for e in store.events(run.run_id) if e.snapshot_id}
+    return {**run.model_dump(mode="json"), "photo_count": count("photos/") + len(snapshots),
             "video_count": count("video/"), "detection_count": count("detections/")}
 
 
