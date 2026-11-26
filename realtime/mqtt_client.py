@@ -51,6 +51,13 @@ class UnknownRobotError(CommandPublishError):
     """
 
 
+def is_video_base_url(value: object) -> bool:
+    """Schema 0.0.34: the base URL the bridge serves its video on. Only an
+    http(s) URL is believed -- the console uses it as a media/fetch source, so
+    a `javascript:` or a bare host:port is dropped, never the registration."""
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+
 def _iso(epoch: Optional[float]) -> Optional[str]:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat() if epoch is not None else None
 
@@ -506,6 +513,9 @@ class BackendMqttClient:
             nav_map_id=data.get("nav_map_id") if isinstance(data.get("nav_map_id"), str) else None,
             # 0.0.20. Anything but a well-formed hash reads as "not reported".
             nav_map_hash=data.get("nav_map_hash") if is_map_hash(data.get("nav_map_hash")) else None,
+            # 0.0.34. Where its video is served; anything but an http(s) URL
+            # reads as "not reported".
+            video_base_url=data.get("video_base_url") if is_video_base_url(data.get("video_base_url")) else None,
             # 0.0.29. Display data like `host`: a bad item is dropped, never
             # the registration.
             recordings=self._recordings(data.get("recordings"), robot_id),

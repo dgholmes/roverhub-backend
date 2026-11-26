@@ -108,6 +108,10 @@ class RobotRecord:
     # off, from an older bridge, or when the device could not hash its files.
     # Compared with the floor's MapFloor.content_hash before a route starts.
     nav_map_hash: Optional[str] = None
+    # From the registration (schema 0.0.34): the base URL the bridge serves
+    # its video on (http(s) only, checked in realtime/mqtt_client.py). None
+    # from an older bridge, which leaves the console to its own config.
+    video_base_url: Optional[str] = None
     # From the registration (schema 0.0.29): the survey recordings still on
     # the device, newest first, as validated KeptRecording dicts; free disk
     # where they are kept, in GB; whether the nav stack is localised now.
@@ -193,6 +197,7 @@ class RobotRegistry:
         host: Optional[dict] = None,
         nav_map_id: Optional[str] = None,
         nav_map_hash: Optional[str] = None,
+        video_base_url: Optional[str] = None,
         recordings: Optional[List[dict]] = None,
         disk_free_gb: Optional[float] = None,
         nav_localised: Optional[bool] = None,
@@ -210,6 +215,7 @@ class RobotRegistry:
                     name=robot_id, last_seen=now, online=True,
                     bridge_id=bridge_id, schema_version=schema_version,
                     first_seen=now, host=host, nav_map_id=nav_map_id, nav_map_hash=nav_map_hash,
+                    video_base_url=video_base_url,
                     recordings=recordings, disk_free_gb=disk_free_gb, nav_localised=nav_localised,
                     stabilised_cameras=stabilised_cameras,
                     acceptance=acceptance, acceptance_source=source,
@@ -230,6 +236,8 @@ class RobotRegistry:
             # nav is off (or older than 0.0.16), which is on no map.
             existing.nav_map_id = nav_map_id
             existing.nav_map_hash = nav_map_hash
+            # Replaced too: absent means an older bridge, or one whose URL was junk.
+            existing.video_base_url = video_base_url
             # Replaced too: the registration carries the whole list each time.
             existing.recordings = recordings
             existing.disk_free_gb = disk_free_gb

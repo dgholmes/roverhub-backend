@@ -755,3 +755,45 @@ def test_a_last_will_for_an_unregistered_robot_is_a_no_op():
     client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
     client.handle_message("roverhub/site-dev/robot-dev-01/heartbeat", _heartbeat("offline"))
     assert registry.list_all() == []
+
+
+def test_accepts_an_http_video_base_url():
+    from realtime.mqtt_client import is_video_base_url
+
+    assert is_video_base_url("http://10.0.12.101:8090")
+    assert is_video_base_url("https://rover.example:8090")
+
+
+def test_rejects_anything_else_as_a_video_base_url():
+    from realtime.mqtt_client import is_video_base_url
+
+    for bad in (None, 42, {}, "", "javascript:alert(1)", "10.0.12.101:8090", "ftp://x"):
+        assert not is_video_base_url(bad)
+
+
+def test_registration_stores_the_video_base_url():
+    # Schema 0.0.34: where the bridge serves its video, so the console needs no .env per device.
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    base = {"robot_id": "rover-j", "site_id": "site-a", "robot_type": "quad", "schema_version": "0.0.34"}
+
+    client.handle_message("roverhub/admin/rover-j/register",
+                          json.dumps({**base, "video_base_url": "http://10.0.12.101:8090"}).encode())
+    assert registry.get("rover-j").video_base_url == "http://10.0.12.101:8090"
+
+    # Not said (an older bridge): not reported, not kept from before.
+    client.handle_message("roverhub/admin/rover-j/register", json.dumps(base).encode())
+    assert registry.get("rover-j").video_base_url is None
+
+
+def test_a_junk_video_base_url_is_dropped_not_stored():
+    registry = RobotRegistry()
+    client = BackendMqttClient("mqtt://localhost:1883", registry, _FakeMqttClient)
+    base = {"robot_id": "rover-j", "site_id": "site-a", "robot_type": "quad", "schema_version": "0.0.34"}
+
+    for junk in (42, {"x": 1}, "", "javascript:alert(1)", "10.0.12.101:8090"):
+        client.handle_message("roverhub/admin/rover-j/register",
+                              json.dumps({**base, "video_base_url": junk}).encode())
+        record = registry.get("rover-j")
+        assert record is not None  # the registration still counts
+        assert record.video_base_url is None
