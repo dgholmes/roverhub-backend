@@ -280,6 +280,9 @@ maps_router = build_maps_router(
     audit=history.audit.record,
     # A survey upload's robot_id must be a robot at the survey's site.
     robot_site_of=_site_for,
+    # What keeps a map from being deleted. Late-bound: the mission and task
+    # stores it reads are made further down.
+    in_use=lambda site_map: _map_in_use(site_map),
 )
 app.include_router(maps_router)
 
@@ -443,6 +446,35 @@ scheduler_loop = SchedulerLoop(
     unattended_enabled=_unattended_runs_enabled(),
 )
 _reconcile_task_store = TaskStore(_tasks_dir)
+
+
+def _map_in_use(site_map) -> list:
+    """Why `site_map` cannot be deleted, one clause per kind of thing that still
+    names it; empty when nothing does. A mission drawn on it would lose the map
+    it plans against, a task would run that mission against nothing, and a
+    robot running it would be left localised on a map the console no longer
+    has. Read from the same directories as the routers', re-read per call."""
+    map_id = site_map.map_id
+    reasons = []
+    missions = [m for m in _scheduler_missions.list() if m.map_id == map_id]
+    if missions:
+        names = ", ".join(m.name or m.mission_id for m in missions)
+        reasons.append(("mission " if len(missions) == 1 else "missions ") + names
+                       + (" is" if len(missions) == 1 else " are") + " drawn on it (move or delete "
+                       + ("it" if len(missions) == 1 else "them") + " first)")
+    on_map = {m.mission_id: m.name or m.mission_id for m in missions}
+    tasks = [t for t in _reconcile_task_store.list_tasks() if t.mission_id in on_map]
+    if tasks:
+        names = ", ".join(f"{t.name or t.task_id} ({on_map[t.mission_id]})" for t in tasks)
+        reasons.append(("task " if len(tasks) == 1 else "tasks ") + names
+                       + (" runs" if len(tasks) == 1 else " run") + " a mission on it (delete "
+                       + ("it" if len(tasks) == 1 else "them") + " first)")
+    robots = sorted(r.robot_id for r in registry.list_all() if r.nav_map_id == map_id)
+    if robots:
+        reasons.append(("robot " if len(robots) == 1 else "robots ") + ", ".join(robots)
+                       + (" runs" if len(robots) == 1 else " run") + " it (switch "
+                       + ("it" if len(robots) == 1 else "them") + " to another map first)")
+    return reasons
 
 
 _reconcile_hook = make_state_hook(

@@ -289,7 +289,8 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
                       jobs_dir: Optional[str] = None,
                       start_jobs: bool = True,
                       max_survey_bytes: int = MAX_SURVEY_BYTES,
-                      robot_site_of: Optional[Callable[[str], Optional[str]]] = None) -> APIRouter:
+                      robot_site_of: Optional[Callable[[str], Optional[str]]] = None,
+                      in_use: Optional[Callable[[SiteMap], List[str]]] = None) -> APIRouter:
     """`on_status(map)` after a status change is stored (the audit log).
     `audit` (history/audit.py AuditRecorder.record) is told every upload,
     zone edit, planning-grid change, delete, restore and quality override.
@@ -301,7 +302,12 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
 
     `robot_site_of(robot_id)` -> the site a robot registered at, or None: a
     survey upload's `robot_id` field must name a robot at the survey's site.
-    Without it (unit tests) the field is taken as sent."""
+    Without it (unit tests) the field is taken as sent.
+
+    `in_use(map)` names what keeps a map from being deleted, one clause per
+    thing (missions drawn on it, tasks that run them, robots that run it);
+    empty when nothing does. With None, nothing does. Injected from api/app.py,
+    like the sites router's, so this router imports none of those stores."""
     router = APIRouter()
     store = MapStore(maps_dir)
     router.store = store  # type: ignore[attr-defined]  # tests and the app share it
@@ -1069,6 +1075,12 @@ def build_maps_router(maps_dir: str = DEFAULT_MAPS_DIR,
     @router.delete("/maps/{map_id}", status_code=204)
     def delete_map(map_id: str):
         existing = store.get(map_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="map not found")
+        reasons = in_use(existing) if in_use is not None else []
+        if reasons:
+            raise HTTPException(status_code=409,
+                                detail=f"map {existing.name or map_id} is in use: {'; '.join(reasons)}")
         if not store.delete(map_id):
             raise HTTPException(status_code=404, detail="map not found")
         _audit("map.delete", existing, map_id, {"name": existing.name if existing is not None else None})
