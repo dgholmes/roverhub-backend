@@ -433,8 +433,10 @@ def test_reading_is_like_the_grid_and_writing_is_the_supervisors_or_the_engineer
         assert any(role_can(role, c) for c in capabilities), role
     for role in ("viewer", "operator", "technician"):
         assert not any(role_can(role, c) for c in capabilities), role
-    for role in ("viewer", "operator", "technician", "engineer"):
+    for role in ("viewer", "operator", "technician"):
         assert not any(role_can(role, c) for c in ROUTES[("DELETE", PLANNING_ROUTE)].capabilities), role
+    # The engineer holds every capability since 2026-11-27.
+    assert any(role_can("engineer", c) for c in ROUTES[("DELETE", PLANNING_ROUTE)].capabilities)
 
 
 PASSWORD = "correct horse"
@@ -492,7 +494,7 @@ def test_with_sign_in_on_everyone_reads_it_and_a_supervisor_or_engineer_sets_it(
     for who in (vic, ana, eve, sue):
         assert client.get(url, headers=who).content == PLANNING
 
-    for who in (vic, ana, eve):
+    for who in (vic, ana):
         assert client.delete(url, headers=who).status_code == 403
     assert anonymous.delete(url).status_code == 401
     assert client.delete(url, headers=sue).status_code == 200

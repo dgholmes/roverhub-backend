@@ -298,15 +298,17 @@ def test_the_new_routes_have_policy_rules(router):
         assert key in ROUTES, key
 
 
-def test_supervisors_edit_zones_and_freeze_but_operators_and_engineers_do_not():
+def test_supervisors_and_engineers_edit_zones_and_freeze_but_operators_do_not():
     # Drawing a zone and freezing the map are one judgement -- somebody has
     # looked at it -- and the people who plan patrols against it are supervisors.
     # An engineer uploads the survey (`configure`); a supervisor reviews it.
     for key in [("PUT", "/maps/{map_id}/zones"), ("PUT", "/maps/{map_id}/status")]:
         capabilities = ROUTES[key].capabilities
         assert capabilities == ("editZones",), key
-        assert any(role_can("supervisor", c) for c in capabilities)
-        for role in ("viewer", "operator", "technician", "engineer"):
+        # The engineer holds every capability since 2026-11-27.
+        for role in ("supervisor", "engineer"):
+            assert any(role_can(role, c) for c in capabilities), (key, role)
+        for role in ("viewer", "operator", "technician"):
             assert not any(role_can(role, c) for c in capabilities), (key, role)
 
 

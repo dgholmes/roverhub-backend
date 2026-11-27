@@ -448,3 +448,13 @@ def test_resume_needs_dispatch_patrols(auth_on):
     params = {"run_id": "run-1"}
     assert _command(client, _bearer(client, "ana"), type_="RESUME", params=params).status_code == 403
     assert _command(client, _bearer(client, "sue"), type_="RESUME", params=params).status_code == 200
+
+
+def test_the_engineer_holds_every_capability():
+    """2026-11-27, the operator's call: an owner or admin with Engineer tools on
+    gets the engineer's capabilities, so with the switch on they can use every
+    feature. The console's roles.test.ts pins the same."""
+    from auth.policy import role_can
+    for capability in CAPABILITIES:
+        assert role_can("engineer", capability), capability
+

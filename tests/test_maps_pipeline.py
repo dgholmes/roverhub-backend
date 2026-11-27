@@ -599,9 +599,10 @@ def test_only_a_supervisor_at_the_maps_site_may_override(auth_on, tmp_path):
             return {"Authorization": "Bearer " + token}
 
         body = {"status": "active", "override_quality": True, "zones_reviewed": True}
-        assert client.put("/maps/%s/status" % map_id, json=body, headers=bearer("eve")).status_code == 403
         assert client.put("/maps/%s/status" % map_id, json=body, headers=bearer("sam")).status_code == 403
         assert client.put("/maps/%s/status" % map_id, json=body, headers=bearer("sue")).status_code == 200
+        # The engineer holds every capability since 2026-11-27.
+        assert client.put("/maps/%s/status" % map_id, json=body, headers=bearer("eve")).status_code == 200
         # Engineers start a quality check; supervisors too.
         assert client.post("/maps/%s/quality" % map_id, headers=bearer("eve")).status_code == 202
     finally:

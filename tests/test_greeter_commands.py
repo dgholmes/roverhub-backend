@@ -62,8 +62,8 @@ def test_a_greeting_expires_like_a_gesture(world):
 
 
 @pytest.mark.parametrize("user, greet, setting", [
-    ("eve", True, False),     # engineer: drives, but an autonomous behaviour is not theirs
-    ("sue", True, True),      # supervisor: the only role with dispatchPatrols
+    ("eve", True, True),      # engineer: every capability since 2026-11-27
+    ("sue", True, True),      # supervisor: dispatchPatrols
     ("ann", True, False),     # operator: may press Greet, may not turn Greeter mode on
     ("tom", False, False),    # technician: does not drive
     ("vic", False, False),    # viewer

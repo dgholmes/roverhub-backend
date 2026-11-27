@@ -16,22 +16,26 @@ from typing import Dict, FrozenSet, Optional, Tuple
 
 ALL_ROLES = ("viewer", "operator", "supervisor", "technician", "engineer")
 
+# The engineer holds EVERY capability (operator's call, 2026-11-27): an org
+# owner or admin who turns Engineer tools on gets the engineer's capabilities
+# on top of their own role (deps.Principal), so with the switch on they can
+# use every feature. tests/test_auth.py pins it.
 CAPABILITIES: Dict[str, FrozenSet[str]] = {
     # LiveOps
     "watchLive": frozenset(ALL_ROLES),
     "estop": frozenset({"operator", "supervisor", "technician", "engineer"}),
     "drive": frozenset({"operator", "supervisor", "engineer"}),
     "getUp": frozenset({"operator", "supervisor", "technician", "engineer"}),
-    "override": frozenset({"supervisor"}),
+    "override": frozenset({"supervisor", "engineer"}),
     # Missions
-    "planPatrols": frozenset({"supervisor"}),
-    "dispatchPatrols": frozenset({"supervisor"}),
+    "planPatrols": frozenset({"supervisor", "engineer"}),
+    "dispatchPatrols": frozenset({"supervisor", "engineer"}),
     # Fleet
     "seeHealth": frozenset(ALL_ROLES),
     "runTests": frozenset({"technician", "engineer"}),
     "edgeTools": frozenset({"engineer"}),
     # Site
-    "editZones": frozenset({"supervisor"}),
+    "editZones": frozenset({"supervisor", "engineer"}),
     "configure": frozenset({"engineer"}),
 }
 

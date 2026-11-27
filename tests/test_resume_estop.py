@@ -59,7 +59,8 @@ def test_anyone_who_may_drive_may_resume_an_estop_pause(auth_on, world, user, al
     assert response.status_code == (200 if allowed else 403), (user, response.text)
 
 
-@pytest.mark.parametrize("user, allowed", [("ann", False), ("eve", False), ("sue", True)])
+# eve (engineer) holds every capability since 2026-11-27.
+@pytest.mark.parametrize("user, allowed", [("ann", False), ("eve", True), ("sue", True)])
 def test_a_blocked_retry_is_still_the_supervisors(auth_on, world, user, allowed):
     _state(_paused("blocked"))
     assert _resume(TestClient(backend.app), user).status_code == (200 if allowed else 403), user

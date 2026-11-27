@@ -441,7 +441,7 @@ def signed_in(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("user, allowed", [
     ("sue", True),      # supervisor: editZones
-    ("eve", False),     # engineer: makes maps, does not sign off where the robot goes
+    ("eve", True),      # engineer: every capability since 2026-11-27
     ("ann", False), ("tom", False), ("vic", False),
 ])
 def test_who_may_set_and_remove_home(signed_in, user, allowed):
