@@ -303,3 +303,16 @@ def test_stabilised_cameras_are_kept_from_registration_and_listed():
     # Replaced, not kept: a registration without it is a bridge not steadying.
     registry.upsert_from_registration("rover-j", "site-a", "quad")
     assert registry.get("rover-j").stabilised_cameras == []
+
+
+def test_video_base_url_is_kept_from_registration_and_listed():
+    # GET /robots carries it as a top-level key beside nav_map_hash.
+    from robots.router import robot_json
+
+    registry = RobotRegistry()
+    registry.upsert_from_registration("rover-j", "site-a", "quad", video_base_url="http://10.0.12.101:8090")
+    assert registry.get("rover-j").video_base_url == "http://10.0.12.101:8090"
+    assert robot_json(registry.get("rover-j"))["video_base_url"] == "http://10.0.12.101:8090"
+    registry.upsert_from_registration("rover-j", "site-a", "quad")
+    assert registry.get("rover-j").video_base_url is None
+    assert robot_json(registry.get("rover-j"))["video_base_url"] is None
