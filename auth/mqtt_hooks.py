@@ -47,8 +47,10 @@ ACC_READ, ACC_WRITE, ACC_READWRITE, ACC_SUBSCRIBE = 1, 2, 3, 4
 # other here; the broker checks its delivery (ACC_READ) per reader as usual.
 # nav/path is the route Nav2 is planning, edge -> browser (schema 0.0.24,
 # shared/schemas/nav_path.py), read like scan.
+# perception/people is the people perception sees, edge -> browser (schema
+# 0.0.38, shared/schemas/detection.py PeopleFrame), for boxes on the video.
 _ROBOT_TOPICS = {"telemetry", "state", "heartbeat", "lower_state", "commands", "ack", "run", "scan",
-                 "incidents", "perception/status", "logs", "logs/request",
+                 "incidents", "perception/status", "perception/people", "logs", "logs/request",
                  "survey/status", "survey/map", "sensors/lidar_mount", "nav/path"}
 # What a bridge receives rather than sends. Only the backend (superuser) writes
 # these, and browsers may not even read them: commands go through REST, where

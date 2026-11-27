@@ -237,7 +237,8 @@ def _acl(client, username, topic, acc):
                                           "acc": acc}).status_code
 
 
-@pytest.mark.parametrize("suffix", ["survey/status", "survey/map", "sensors/lidar_mount", "nav/path"])
+@pytest.mark.parametrize("suffix", ["survey/status", "survey/map", "sensors/lidar_mount", "nav/path",
+                                    "perception/people"])
 def test_a_device_publishes_its_own_survey_and_sensor_topics(auth_on, suffix):
     client = TestClient(backend.app)
     assert _acl(client, "rover-a", "roverhub/%s/rover-a/%s" % (SITE, suffix), ACC_WRITE) == 200
@@ -248,7 +249,8 @@ def test_a_device_publishes_its_own_survey_and_sensor_topics(auth_on, suffix):
     assert _acl(client, "rover-a", "roverhub/%s/rover-a/%s" % (OTHER_SITE, suffix), ACC_WRITE) == 403
 
 
-@pytest.mark.parametrize("suffix", ["survey/status", "survey/map", "sensors/lidar_mount", "nav/path"])
+@pytest.mark.parametrize("suffix", ["survey/status", "survey/map", "sensors/lidar_mount", "nav/path",
+                                    "perception/people"])
 def test_people_read_them_at_their_sites_and_never_write(auth_on, suffix):
     client = TestClient(backend.app)
     uid = auth_on.users.check_credentials("vic", PASSWORD).user_id
@@ -260,7 +262,8 @@ def test_people_read_them_at_their_sites_and_never_write(auth_on, suffix):
 
 def test_neighbouring_topic_names_stay_closed(auth_on):
     client = TestClient(backend.app)
-    for suffix in ("survey", "survey/other", "sensors", "sensors/other", "survey/#", "sensors/+", "nav", "nav/other", "nav/#"):
+    for suffix in ("survey", "survey/other", "sensors", "sensors/other", "survey/#", "sensors/+", "nav", "nav/other", "nav/#",
+                   "perception", "perception/other", "perception/#"):
         assert _acl(client, "rover-a", "roverhub/%s/rover-a/%s" % (SITE, suffix), ACC_WRITE) == 403
 
 
