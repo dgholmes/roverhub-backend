@@ -23,17 +23,21 @@ logger = logging.getLogger("roverhub.runs")
 DEFAULT_RUNS_DIR = str(Path(__file__).resolve().parents[1] / "data" / "runs")
 RUN_FILE = "run.json"
 EVENTS_FILE = "events.jsonl"
-MEDIA_DIRS = ("photos", "video", "audio", "detections")
+# trace/: the bridge's run log (shared/schemas/run_trace.py), one folder per run.
+MEDIA_DIRS = ("photos", "video", "audio", "detections", "trace")
 FILE_NAME_RE = re.compile(r"^(?!\.)[A-Za-z0-9_.-]{1,160}\Z")
 MAX_FILE_BYTES = {
     "photos": 20 * 1024 * 1024,
     "detections": 20 * 1024 * 1024,
     "audio": 50 * 1024 * 1024,
     "video": 2 * 1024 * 1024 * 1024,
+    "trace": 200 * 1024 * 1024,
 }
 CONTENT_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
                  ".mp4": "video/mp4", ".wav": "audio/wav", ".webm": "audio/webm",
-                 ".ogg": "audio/ogg", ".mp3": "audio/mpeg"}
+                 ".ogg": "audio/ogg", ".mp3": "audio/mpeg",
+                 ".csv": "text/csv", ".jsonl": "application/x-ndjson", ".json": "application/json",
+                 ".txt": "text/plain; charset=utf-8", ".svg": "image/svg+xml"}
 
 
 def _atomic_write(path: str, text: str) -> None:

@@ -355,6 +355,12 @@ runs_router = build_runs_router(
     runs_dir=os.environ.get("RUNS_DIR", DEFAULT_RUNS_DIR),
     on_change=lambda run_id, path: _copier.on_change(run_id, path) if _copier else None,
     on_run_ended=lambda run: _run_ended(run) if _run_ended else None,
+    # The run log (runs/track.py, runs/figure.py): the mission's map, the 5 s
+    # history samples for a run with no trace, and the site's timezone.
+    map_store=maps_router.store,
+    history_samples=lambda robot_id, since, until: (
+        history.store.history(robot_id, since, until, 100_000) if history.available else []),
+    site_timezone=lambda site_id: (lambda site: site.timezone if site else None)(site_store.get(site_id)),
 )
 _copier = bucket_from_env(runs_router.store)
 # Every start and end of a run is a write of its record: the audit log's hook.

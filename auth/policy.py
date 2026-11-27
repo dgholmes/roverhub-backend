@@ -340,6 +340,10 @@ ROUTES: Dict[Tuple[str, str], Rule] = {
     ("PUT", "/runs/{run_id}/files/{rel:path}"): Rule(capabilities=("dispatchPatrols",), device=True),
     ("GET", "/runs/{run_id}/files/{rel:path}"): _READ,
     ("GET", "/runs/{run_id}/zip"): _READ,
+    # The run log (runs/track.py, runs/figure.py): read as the run is read.
+    ("GET", "/runs/{run_id}/track"): _READ,
+    ("GET", "/runs/{run_id}/figure.svg"): _READ,
+    ("GET", "/runs/{run_id}/figure.png"): _READ,
 
     # Survey replay (surveys/, schema 0.0.28). The robot's survey pipeline
     # writes a survey's record, its takes and their files with its own device

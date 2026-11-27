@@ -19,8 +19,9 @@ from starlette.concurrency import run_in_threadpool
 from shared.schemas.runs import MissionRun, RunEvent, StartRunRequest
 
 from .dispatch import RunDispatcher, StartRefused
-
+from .figure import NoFigure, build_scene, render_png, render_svg
 from .store import CONTENT_TYPES, EVENTS_FILE, RUN_FILE, RunStore
+from .track import HistorySamples, build_track
 
 logger = logging.getLogger("roverhub.runs")
 
@@ -46,7 +47,12 @@ def _summary(store: RunStore, run: MissionRun) -> dict:
 
 def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: None,
                       dispatcher: Optional[RunDispatcher] = None,
-                      on_run_ended: Callable[[MissionRun], None] = lambda run: None) -> APIRouter:
+                      on_run_ended: Callable[[MissionRun], None] = lambda run: None,
+                      map_store=None, history_samples: Optional[HistorySamples] = None,
+                      site_timezone: Optional[Callable[[str], Optional[str]]] = None) -> APIRouter:
+    """`map_store` (maps/store.py MapStore), `history_samples` and
+    `site_timezone` feed the run log (/track, the figure); each may be None,
+    and the run log then does without: no map, no history fallback, UTC."""
     router = APIRouter()
     # The dispatcher needs this router's store, so the app may also set the
     # attribute after building both; the route reads it per request.
@@ -203,10 +209,59 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
             headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         return StreamingResponse(_iter(), status_code=status, media_type=media_type, headers=headers)
 
+    def _track(run: MissionRun) -> dict:
+        return build_track(run, store.events(run.run_id), store.run_dir(run.run_id),
+                           history_samples=history_samples, map_store=map_store)
+
+    def _timezone(run: MissionRun) -> Optional[str]:
+        if site_timezone is None or not run.site_id:
+            return None
+        try:
+            return site_timezone(run.site_id)
+        except Exception:
+            logger.exception("could not read the timezone of site %s", run.site_id)
+            return None
+
+    def _scene(run: MissionRun):
+        return build_scene(run, _track(run), map_store, _timezone(run))
+
+    @router.get("/runs/{run_id}/track")
+    def get_track(run_id: str):
+        return _track(_require(run_id))
+
+    @router.get("/runs/{run_id}/figure.svg")
+    def get_figure_svg(run_id: str):
+        try:
+            scene = _scene(_require(run_id))
+        except NoFigure as missing:
+            raise HTTPException(status_code=404, detail=str(missing)) from None
+        return Response(render_svg(scene), media_type="image/svg+xml")
+
+    @router.get("/runs/{run_id}/figure.png")
+    def get_figure_png(run_id: str):
+        try:
+            scene = _scene(_require(run_id))
+        except NoFigure as missing:
+            raise HTTPException(status_code=404, detail=str(missing)) from None
+        return Response(render_png(scene), media_type="image/png")
+
+    def _figures(run: MissionRun) -> List[tuple]:
+        """(name, bytes) of the figure files for the zip; none when the run
+        has no map, or drawing fails -- the zip must still download."""
+        try:
+            scene = _scene(run)
+            return [("figure.svg", render_svg(scene).encode("utf-8")), ("figure.png", render_png(scene))]
+        except NoFigure:
+            return []
+        except Exception:
+            logger.exception("could not draw the figure of run %s for its zip", run.run_id)
+            return []
+
     @router.get("/runs/{run_id}/zip")
     def get_zip(run_id: str):
-        _require(run_id)
+        run = _require(run_id)
         base = store.run_dir(run_id)
+        figures = _figures(run)
         # Built into a temp file, not memory: a run can hold gigabytes of video.
         fd, tmp = tempfile.mkstemp(suffix=".zip")
         os.close(fd)
@@ -219,6 +274,8 @@ def build_runs_router(runs_dir: str, on_change: OnChange = lambda run_id, path: 
                 for f in store.files(run_id):
                     kind = zipfile.ZIP_STORED if f["path"].startswith("video/") else zipfile.ZIP_DEFLATED
                     z.write(os.path.join(base, *f["path"].split("/")), f"{run_id}/{f['path']}", compress_type=kind)
+                for name, data in figures:
+                    z.writestr(f"{run_id}/{name}", data, compress_type=zipfile.ZIP_DEFLATED)
         except BaseException:
             try:
                 os.unlink(tmp)
